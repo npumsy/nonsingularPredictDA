@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "debug",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/test",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "MIMode": "gdb",
+            // "miDebuggerPath": "/usr/share/bash-completion/completions/gdb"
+            "miDebuggerPath": "/usr/bin/gdb"
+        },
+        {
+            "name": "调试qoe",
+            "type": "debugpy",
+            "request": "launch",
+            "cwd": "/mnt/d/Docker/shared/TZ/nonsingularPredict",
+            "program": "${workspaceFolder}/script/testode.py",
+            "console": "integratedTerminal"
+        },
+    ]
+}
