@@ -1091,7 +1091,7 @@ Eigen::Matrix3d PQW2GCRF(double Omega, double omega, double i) {
 
     return T;
 }
-Eigen::MatrixXd Jacobian_RV2OscElems(const Eigen::VectorXd OE, const Eigen::VectorXd &RV,  double mu){
+Eigen::MatrixXd Jacobian_RV2OscElems(const Eigen::VectorXd OE, const Eigen::VectorXd &RV,  double mu, double tol){
 
     // Constants (these should be defined or calculated appropriately)
     double a=OE(0);

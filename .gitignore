@@ -3,3 +3,5 @@
 !/build/libdastate.so
 include/dace
 lib
+build
+*.pyc

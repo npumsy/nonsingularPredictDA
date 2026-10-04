@@ -35,7 +35,7 @@ int basicTest(){
     
     double tf =10.0;
     mat66 p0;
-    // DensityInterpolator aeroDensity("/mnt/d/Docker/shared/TZ/nonsingularPredict/src/AtmosphericDensity1976.csv");
+    // DensityInterpolator aeroDensity("/home/msy/Documents/TianZhi2/nonsingularPredict/src/AtmosphericDensity1976.csv");
     // double rho = aeroDensity.getRho(530);
     Vector6d drv0,drv0_da;
     drv0 = EigenwarpIntOrbitJ234DragODE(rv0/1e3,tf);
@@ -85,7 +85,7 @@ int testErrorState(){
     
     double tf =10.0;
     mat66 p0;
-    // DensityInterpolator aeroDensity("/mnt/d/Docker/shared/TZ/nonsingularPredict/src/AtmosphericDensity1976.csv");
+    // DensityInterpolator aeroDensity("/home/msy/Documents/TianZhi2/nonsingularPredict/src/AtmosphericDensity1976.csv");
     // double rho = aeroDensity.getRho(530);
 
     AlgebraicVector<double> Deltax0(6);

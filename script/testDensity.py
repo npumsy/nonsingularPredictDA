@@ -1,5 +1,5 @@
 import sys
-sys.path.insert(0, '/mnt/d/Docker/shared/TZ/nonsingularPredict/build')
+sys.path.insert(0, '/home/msy/Documents/TianZhi2/nonsingularPredict/build')
 import qoe
 
 
@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import math
 
 # csv_file = "/mnt/d/Develop/OrbitUQ/SpaceDSL/nonsingularPredict/src/AtmosphericDensity1976.csv"
-csv_file = "/mnt/d/Docker/shared/TZ/nonsingularPredict/src/AtmosphericDensity1976.csv"
+csv_file = "/home/msy/Documents/TianZhi2/nonsingularPredict/src/AtmosphericDensity1976.csv"
 # 创建 DensityInterpolator 实例
 interpolator = qoe.DensityInterpolator(csv_file)
 def test_density_interpolator():

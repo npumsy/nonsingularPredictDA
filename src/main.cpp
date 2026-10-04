@@ -224,6 +224,28 @@ PYBIND11_MODULE(qoe, m)
                   RVf :
                         Array of position and velocity (6x1).
           )pbdoc");
+       // 增广状态 DA 传播：把阻力参数 kappa 升为第 7 个 DA 变量，导出 6 个输出状态的密集泰勒系数，
+       // 用于可微 Learning（系数对展开中心的导数由更高一阶系数给出，不改 DACE 内核）。
+       m.def("daJ234DragAugCoeffs", [](const Vector6d &rv0, double kappa0, double tf, int order, double step){
+            std::vector<double> coeffs;
+            std::vector<std::vector<unsigned int>> mons;
+            Vector6d rvf = daJ234DragAugCoeffs(rv0, kappa0, tf, order, step, coeffs, mons);
+            return py::make_tuple(rvf, coeffs, mons);
+       }, py::arg("rv0"), py::arg("kappa0"), py::arg("tf"), py::arg("order")=2, py::arg("step")=1.0,
+          R"pbdoc(
+               增广状态 (x, kappa) 的 DA 传播，导出密集泰勒系数。
+               Parameters
+                   rv0 : 初始位置速度 (6x1), 单位 m。
+                   kappa0 : 阻力缩放参数 (标量)。
+                   tf : 传播时长 (s)。
+                   order : DA 阶数。
+                   step : RK4 步长 (s)。
+               Returns:
+                   (rvf, coeffs, mons):
+                     rvf    : 终端状态 (6x1), 单位 m。
+                     coeffs : 长度 6*nmono，按 [输出状态 i][单项式 k] 展平。
+                     mons   : nmono 个 7 维指数向量。
+          )pbdoc");
        m.def("OscElemsLongpropagate", &osculating::OscElemsLongpropagate, py::arg("tf"), py::arg("OEm"), 
             py::arg("RE") = osculating::RE, 
             py::arg("mu") = osculating::MU, 

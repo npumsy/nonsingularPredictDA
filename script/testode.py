@@ -1,12 +1,12 @@
 import sys
-sys.path.insert(0, '/mnt/d/Docker/shared/TZ/nonsingularPredict/build')
+sys.path.insert(0, '/home/msy/Documents/TianZhi2/nonsingularPredict/build')
 
-sys.path.append("/mnt/d/Docker/shared/TZ")
+sys.path.append("/home/msy/Documents/TianZhi2")
 # from SatOrbitProp.orbit_propagation import satOrbit_PROP
 
 import qoe 
 import numpy as np
-csv_file = "/mnt/d/Docker/shared/TZ/nonsingularPredict/src/AtmosphericDensity1976.csv"
+csv_file = "/home/msy/Documents/TianZhi2/nonsingularPredict/src/AtmosphericDensity1976.csv"
 # 创建 DensityInterpolator 实例
 aeroDensity = qoe.DensityInterpolator(csv_file)
 def test_propagate_lagrangian():

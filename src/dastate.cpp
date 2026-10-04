@@ -1,13 +1,15 @@
 #include "dastates.h"
 #include <Eigen/Core>
 // #include <Eigen/Dense>
+#include <functional>
+#include <vector>
 using namespace std; 
 using namespace DACE;
 
 
 template<typename T>
 AlgebraicVector<T> TBPfullwarp(AlgebraicVector<T> x, double t, double arg1){
-    return TBPfull(x,t ,arg1);
+    return TBPfull(x,t ,T(arg1));
 }
 // Exercise 6.2.1: 3/8 rule RK4 integrator
 template<typename T> T rk4( T x0, double t0, double t1, T (*f)(T,double,double) ,double arg1, double hmax)
@@ -157,7 +159,7 @@ template<typename T> AlgebraicVector<T> TBP( AlgebraicVector<T> x, double t )
 }
 
 template<typename T>
-AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,double beta, double mu, double Re, double rhoCdA_m,double h0,double H0) {
+AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,T beta, double mu, double Re, double rhoCdA_m,double h0,double H0) {
     AlgebraicVector<T> pos(3),vel(3), res(6);
     
     pos[0] = x[0]; pos[1] = x[1]; pos[2] = x[2];
@@ -216,6 +218,59 @@ AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,double beta, double mu
     return res;
 }
 
+
+// 增广状态 RHS：x = [r(3), v(3), kappa]，kappa 为第 7 个状态（导数恒为 0）。
+template<typename T>
+AlgebraicVector<T> TBPfull_param(AlgebraicVector<T> x, double t, double arg1){
+    AlgebraicVector<T> x6(6);
+    for(int i=0;i<6;i++) x6[i]=x[i];
+    AlgebraicVector<T> r6 = TBPfull(x6, t, x[6]);
+    AlgebraicVector<T> r(7);
+    for(int i=0;i<6;i++) r[i]=r6[i];
+    r[6] = T(0.0);
+    return r;
+}
+
+namespace {
+void enumerate_monomials_uv(unsigned int nv, unsigned int order,
+                            std::vector<std::vector<unsigned int>> &out){
+    out.clear();
+    std::vector<unsigned int> e(nv, 0u);
+    std::function<void(unsigned int, unsigned int)> rec =
+        [&](unsigned int idx, unsigned int rem){
+            if(idx == nv-1){ e[idx]=rem; out.push_back(e); return; }
+            for(unsigned int k=0;k<=rem;k++){ e[idx]=k; rec(idx+1, rem-k); }
+        };
+    for(unsigned int tot=0; tot<=order; ++tot) rec(0, tot);
+}
+} // namespace
+
+Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
+                             int order, double step,
+                             std::vector<double> &coeffs,
+                             std::vector<std::vector<unsigned int>> &mons){
+    const int N = 7;
+    DA::init(order, N);
+    DA::setEps(0.0);   // 不做 fabs(c)<=eps 的系数丢弃，否则阻力等小灵敏度会被截掉
+    AlgebraicVector<DA> x(7);
+    for(int i=0;i<6;i++) x[i] = rv0(i)/1e3 + DA(i+1);
+    x[6] = kappa0 + DA(7);
+
+    // 保留 order 阶（不做 pushTO(1)），以便用更高一阶系数得到中心敏感度。
+    x = rk4(x, 0, tf, TBPfull_param, 0.0, step);
+
+    enumerate_monomials_uv(7u, (unsigned int)order, mons);
+    const std::size_t nmono = mons.size();
+    coeffs.assign(6*nmono, 0.0);
+    for(int i=0;i<6;i++){
+        for(std::size_t k=0;k<nmono;k++){
+            coeffs[(std::size_t)i*nmono + k] = x[i].getCoefficient(mons[k]);
+        }
+    }
+    Vector6d rvf;
+    for(int i=0;i<6;i++) rvf[i]=cons(x[i])*1e3;
+    return rvf;
+}
 
 Vector6d EigenwarpDAOrbitJ234DragODE(const Vector6d &rv0, double t, double arg1,bool J234){
     AlgebraicVector<double> x(6),dx(6);

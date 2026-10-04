@@ -30,8 +30,24 @@ namespace bddd{
 // m 1000
 // km-1, 改成单位m，需要乘1e3
 template<typename T>
-AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,double beta, 
+AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,T beta, 
                             double mu = bddd::MU/1e9, double Re =bddd::RE/1e3, double rhoCdA_m = 1.42812824E-12,double h0 = 530,double H0=65.18534) ;
+
+// 增广状态版 RHS：x = [r(3), v(3), kappa]，kappa 为阻力缩放参数（第 7 个状态，导数恒为 0），
+// 阻力项用 x[6] 代替 TBPfull 的 double beta 参数。返回 7 维时间导数。
+template<typename T>
+AlgebraicVector<T> TBPfull_param(AlgebraicVector<T> x, double t, double arg1);
+
+// 增广状态 DA 传播：把阻力参数 kappa 升为第 7 个 DA 变量（kappa' = 0），
+// 在 7 个变量上积分到 order 阶，导出 6 个输出状态的密集泰勒系数。
+// 系数对展开中心（x0, kappa）的导数由更高一阶系数给出（移位恒等式），
+// 故不需反向 tape / 伴随，也不改 DACE 内核。
+// coeffs: 长度 6*nmono，按 [输出状态 i][单项式 k] 排布；
+// mons:   nmono 个指数向量，每个长度 7（与 dadiff 单调一致：按总阶递增、同阶字典序）。
+Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
+                             int order, double step,
+                             std::vector<double> &coeffs,
+                             std::vector<std::vector<unsigned int>> &mons);
 // 内部运算单位为km，和大气密度*面积的单位一样，
 Vector6d EigenwarpDAOrbitJ234DragODE(const Vector6d &rv0, double t, double arg1,bool J234);
 // Exercise 6.2.1: 3/8 rule RK4 integrator
