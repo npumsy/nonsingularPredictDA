@@ -4,6 +4,9 @@
 #include <dace/dace.h>
 #include <cmath>
 #include <fstream>
+#include <array>
+#include <memory>
+#include "RecordingScalar.h"
 // #include "kepler.h"
 #include <Eigen/Core>
 #define printEachStepPertub_da false
@@ -48,6 +51,109 @@ Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
                              int order, double step,
                              std::vector<double> &coeffs,
                              std::vector<std::vector<unsigned int>> &mons);
+
+// 通用增广状态版：x = [r(3), v(3), theta(1..m)]，每个 theta_k 都是阻力项的独立乘性因子
+// （如大气密度倍率、阻力系数 Cd、面质比 A/m），RK4 时 theta_k' = 0。
+// 用于多参数（较大 m）的可微 Learning：pybind 接口 daAugCoeffs 暴露。
+template<typename T>
+AlgebraicVector<T> TBPfull_aug(AlgebraicVector<T> x, double t, double arg1);
+
+Vector6d daAugCoeffs(const Vector6d &rv0, const std::vector<double> &params,
+                     double tf, int order, double step,
+                     std::vector<double> &coeffs,
+                     std::vector<std::vector<unsigned int>> &mons);
+
+// 位置相关引力异常场（RBF 势）：势 U(r)=sum_k theta_k exp(-|r-c_k|^2/(2 s^2))，
+// 异常加速度 = -grad U。theta(1..m) 为待学习系数（m=中心数），中心 c_k 与宽度 s 固定。
+template<typename T>
+AlgebraicVector<T> TBPfull_rbf(AlgebraicVector<T> x, double t, double arg1);
+
+Vector6d daAugRBFCoeffs(const Vector6d &rv0, const std::vector<double> &thetas,
+                        const std::vector<std::array<double,3>> &centers, double s,
+                        double tf, int order, double step,
+                        std::vector<double> &coeffs,
+                        std::vector<std::vector<unsigned int>> &mons);
+
+// 位置相关引力异常场（低阶非带谐球谐势）：用笛卡尔实球谐(regular solid harmonics)表示，
+// 只学非带谐系数 C_lm,S_lm (m>=1)；带谐 J_l 已由 TBPfull 显式处理。
+// 势 U = mu * sum_{l=2}^{L} sum_{m=1}^{l} Re^l / r^{2l+1} * (C_lm A_lm + S_lm B_lm)，
+// A_lm=r^l P_lm(sin phi)cos(m lambda)、B_lm=...sin...，异常加速度 a = grad U。
+// 参数顺序：l=2..L、m=1..l、每个 (C_lm,S_lm)；个数 = L(L+1)-2（L=2→4，L=3→10）。
+template<typename T>
+AlgebraicVector<T> TBPfull_sh(AlgebraicVector<T> x, double t, double arg1);
+
+Vector6d daAugSHCoeffs(const Vector6d &rv0, const std::vector<double> &thetas,
+                       int lmax, double tf, int order, double step,
+                       std::vector<double> &coeffs,
+                       std::vector<std::vector<unsigned int>> &mons);
+
+// 设定统一力场（RBF / 球谐），供下列多历元算子使用。
+void setRBFParams(const std::vector<std::array<double,3>> &centers, double s);
+void setSHParams(int lmax);
+
+// 多历元一阶可微算子：一次积分到各 tf，取状态与一阶 Jacobian [∂x/∂x0 (6) | ∂x/∂θ (m)]。
+// 只需 order=1（对 m 线性，无二项式爆炸），供 PyTorch 训练一次前向、backward 仅做矩阵乘。
+// rvf[k] : 第 k 个历元末态（m）；Jflat 按 [k][输出 i][列 (6+m)] 行主序（∂x_f(m)/∂x0(m)、∂x_f(m)/∂θ）。
+void daFieldMultiEpoch(const Vector6d &rv0_m, const std::vector<double> &thetas,
+                       const std::vector<double> &tfs, int order, double step,
+                       std::vector<Vector6d> &rvf, std::vector<double> &Jflat);
+
+// 变分灵敏度多历元算子：DA 只作用于状态（N=6）求 A=∂f/∂x；积分增广 [x, Φ=∂x/∂x0, S=∂x/∂θ]，
+// θ **不进 DA**，代价对 m 线性。一次前向到各 tf；Jflat 同 daFieldMultiEpoch 排布。
+void daVarMultiEpoch(const Vector6d &rv0_m, const std::vector<double> &thetas,
+                     const std::vector<double> &tfs, double step,
+                     std::vector<Vector6d> &rvf, std::vector<double> &Jflat);
+
+// 残差加速度 a_res(r;θ)（m/s^2，前 3 维）——供 fieldBasisJacobian 的 FD 自检。
+Vector6d fieldResidualAccel(const Vector6d &rv_m, const std::vector<double> &thetas);
+
+// ∂b_k/∂x（6x6，每个 k）——A_{,θ_k} = ∂²f/∂x∂θ_k（力场基对状态的 Jacobian）。
+// 力场由 setRBFParams/setSHParams 设定；dBdx 长度 m*36，排布 [k][i*6+j]。
+void fieldBasisJacobian(const double r_km[6], int m, std::vector<double>& dBdx);
+
+// 数值求低阶球谐异常场的残差加速度（仅位置相关部分，供物理自检）：输入位置 m、系数、lmax，
+// 返回 m/s^2 的 6 维向量（前 3 为加速度，后 3 为 0）。
+Vector6d shResidualAccel(const Vector6d &rv_m, const std::vector<double> &thetas, int lmax);
+
+// 积分伴随（大 m deep Learning）：扩展系统 z=[x(6); Φ(36)]，θ 不进 DA（N=6）。
+// 前向用与 rk4 相同的 3/8 RK4 并记录各阶段；反向为离散 RK4 的转置，给出
+// ∂L/∂θ（含 deep ∂Φ/∂θ）与 ∂L/∂x0=λ(0)。力场由 setRBFParams/setSHParams 设定。
+struct DeepFlow {
+    int m = 0;
+    std::vector<double> thetas;
+    std::vector<double> xs;      // [nsteps][4][6] 各 RK4 阶段的 x (km)
+    std::vector<double> Phis;    // [nsteps][4][36] 各阶段的 Φ
+    std::vector<double> hs;      // [nsteps]
+    std::vector<double> tend;    // [nsteps]
+    std::vector<int> epoch_step; // [K] 每个历元所在步（步末时刻=历元时刻）
+    std::vector<Vector6d> rvf;   // [K] 历元末态 (km)
+    std::vector<double> PhiEpoch;// [K*36]
+    std::vector<double> tfs;     // [K]
+};
+void daDeepForward(const Vector6d &rv0_km, const std::vector<double> &thetas,
+                   const std::vector<double> &tfs, double step, DeepFlow &fl);
+// gx_epoch: [K] 对 x_f 的种子；gPhi_epoch: [K*36] 对 Φ 的种子。
+void daDeepBackward(const DeepFlow &fl, const std::vector<Vector6d> &gx_epoch,
+                    const std::vector<double> &gPhi_epoch,
+                    Vector6d &gx0, std::vector<double> &gtheta);
+
+// 路径 A：记录型标量（DACE::Scalar + DACE::RecordTape）的流传播（RBF 力场）。
+// 以 Scalar 实例化既有 template<T> RHS 即自动记录整条积分图；正向返回 xf(m) 与 tape/叶节点/输出节点，
+// 反向用 RecordTape 得到 ∂L/∂x0、∂L/∂θ（代价 ~ 图规模，与 m 无关）。
+struct RecordFlow {
+    Vector6d xf;
+    std::shared_ptr<DACE::RecordTape> tape;
+    std::vector<int> leaf_x0;
+    std::vector<int> leaf_p;
+    std::vector<int> out;
+};
+RecordFlow daRecordFlowRBF(const Vector6d &rv0, const std::vector<double> &thetas,
+                           const std::vector<std::array<double,3>> &centers, double s,
+                           double tf, double step);
+RecordFlow daRecordFlowSH(const Vector6d &rv0, const std::vector<double> &thetas,
+                          int lmax, double tf, double step);
+void daRecordFlowBackward(const RecordFlow &rf, const std::vector<double> &grad,
+                          Vector6d &gx, std::vector<double> &gp);
 // 内部运算单位为km，和大气密度*面积的单位一样，
 Vector6d EigenwarpDAOrbitJ234DragODE(const Vector6d &rv0, double t, double arg1,bool J234);
 // Exercise 6.2.1: 3/8 rule RK4 integrator

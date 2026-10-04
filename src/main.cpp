@@ -246,6 +246,172 @@ PYBIND11_MODULE(qoe, m)
                      coeffs : 长度 6*nmono，按 [输出状态 i][单项式 k] 展平。
                      mons   : nmono 个 7 维指数向量。
           )pbdoc");
+       // 通用多参数增广状态 DA 传播：theta(1..m) 为阻力项的独立乘性因子（多参数可微 Learning）。
+       m.def("daAugCoeffs", [](const Vector6d &rv0, const std::vector<double> &params,
+                               double tf, int order, double step){
+            std::vector<double> coeffs;
+            std::vector<std::vector<unsigned int>> mons;
+            Vector6d rvf = daAugCoeffs(rv0, params, tf, order, step, coeffs, mons);
+            return py::make_tuple(rvf, coeffs, mons);
+       }, py::arg("rv0"), py::arg("params"), py::arg("tf"), py::arg("order")=2, py::arg("step")=1.0,
+          R"pbdoc(
+               通用增广状态 (x, theta) 的 DA 传播，theta 为阻力项独立乘性因子，导出密集泰勒系数。
+               Returns: (rvf, coeffs, mons)，coeffs 长度 6*nmono，mons 为 nmono 个 (6+m) 维指数向量。
+          )pbdoc");
+       // 位置相关 RBF 引力异常场：theta(1..m) 为可学习势系数，centers/s 固定。
+       m.def("daAugRBFCoeffs", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                  const std::vector<std::array<double,3>> &centers, double s,
+                                  double tf, int order, double step){
+            std::vector<double> coeffs;
+            std::vector<std::vector<unsigned int>> mons;
+            Vector6d rvf = daAugRBFCoeffs(rv0, thetas, centers, s, tf, order, step, coeffs, mons);
+            return py::make_tuple(rvf, coeffs, mons);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tf"), py::arg("order")=2, py::arg("step")=1.0,
+           R"pbdoc(
+               位置相关 RBF 引力异常场的增广 DA 传播。
+               Returns: (rvf, coeffs, mons)，mons 为 nmono 个 (6+m) 维指数向量。
+          )pbdoc");
+       // 低阶非带谐球谐引力异常场（笛卡尔实球谐）：theta 为 C_lm,S_lm（l=2..lmax, m=1..l）。
+       m.def("daAugSHCoeffs", [](const Vector6d &rv0, const std::vector<double> &thetas, int lmax,
+                                 double tf, int order, double step){
+            std::vector<double> coeffs;
+            std::vector<std::vector<unsigned int>> mons;
+            Vector6d rvf = daAugSHCoeffs(rv0, thetas, lmax, tf, order, step, coeffs, mons);
+            return py::make_tuple(rvf, coeffs, mons);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"), py::arg("tf"),
+          py::arg("order")=2, py::arg("step")=1.0,
+          R"pbdoc(
+               低阶非带谐球谐（笛卡尔实球谐）引力异常场的增广 DA 传播。
+               thetas 顺序：l=2..lmax, m=1..l, 每个 (C_lm,S_lm)；个数 = lmax(lmax+1)-2。
+               Returns: (rvf, coeffs, mons)。
+          )pbdoc");
+       // 球谐异常场数值自检：给定位置(m)、系数、lmax，返回残差加速度(m/s^2)。
+       m.def("shResidualAccel", [](const Vector6d &rv_m, const std::vector<double> &thetas, int lmax){
+            return shResidualAccel(rv_m, thetas, lmax);
+       }, py::arg("rv_m"), py::arg("thetas"), py::arg("lmax"),
+          "低阶球谐异常场的残差加速度（数值，m/s^2），供物理自检。");
+       // 残差加速度（m/s^2）访问器，供 A_{,θ} 的 FD 自检。
+       m.def("fieldResidualAccelRBF", [](const Vector6d &rv_m, const std::vector<double> &thetas,
+                                         const std::vector<std::array<double,3>> &centers, double s){
+            setRBFParams(centers, s);
+            return fieldResidualAccel(rv_m, thetas);
+       }, py::arg("rv_m"), py::arg("thetas"), py::arg("centers"), py::arg("s"));
+       m.def("fieldResidualAccelSH", [](const Vector6d &rv_m, const std::vector<double> &thetas, int lmax){
+            setSHParams(lmax);
+            return fieldResidualAccel(rv_m, thetas);
+       }, py::arg("rv_m"), py::arg("thetas"), py::arg("lmax"));
+       // A_{,θ_k} = ∂²f/∂x∂θ_k（力场基对状态的 Jacobian），供积分伴随使用与 FD 自检。
+       m.def("fieldBasisJacobianRBF", [](const Vector6d &rv_km, const std::vector<double> &thetas,
+                                         const std::vector<std::array<double,3>> &centers, double s){
+            setRBFParams(centers, s);
+            std::vector<double> dBdx;
+            fieldBasisJacobian(rv_km.data(), (int)thetas.size(), dBdx);
+            return dBdx;
+       }, py::arg("rv_km"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          "RBF 力场的 A_{,θ_k}=∂b_k/∂x（长度 m*36，[k][i*6+j]）。");
+       m.def("fieldBasisJacobianSH", [](const Vector6d &rv_km, int m, int lmax){
+            setSHParams(lmax);
+            std::vector<double> dBdx;
+            fieldBasisJacobian(rv_km.data(), m, dBdx);
+            return dBdx;
+       }, py::arg("rv_km"), py::arg("m"), py::arg("lmax"),
+          "球谐力场的 A_{,θ_k}=∂b_k/∂x（长度 m*36，[k][i*6+j]）。");
+       // 路径 A：记录型标量 + tape 的 RBF 流传播与反向。
+       py::class_<RecordFlow>(m, "RecordFlow").def_readonly("xf", &RecordFlow::xf);
+       m.def("daRecordFlowRBF", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                   const std::vector<std::array<double,3>> &centers, double s,
+                                   double tf, double step){
+            return daRecordFlowRBF(rv0, thetas, centers, s, tf, step);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tf"), py::arg("step"),
+          "路径 A：以记录型标量实例化 TBPfull_rbf<Scalar> 并积分，返回 xf(m) 与 tape 句柄。");
+       m.def("daRecordFlowSH", [](const Vector6d &rv0, const std::vector<double> &thetas, int lmax,
+                                  double tf, double step){
+            return daRecordFlowSH(rv0, thetas, lmax, tf, step);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"), py::arg("tf"), py::arg("step"),
+          "路径 A（球谐力场）：记录型标量实例化 TBPfull_field<Scalar> 并积分。");
+       // 多历元一阶算子：一次积分出各历元状态与一阶 Jacobian（order=1，对 m 线性）。
+       m.def("daFieldMultiEpochRBF", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                        const std::vector<std::array<double,3>> &centers, double s,
+                                        const std::vector<double> &tfs, int order, double step){
+            setRBFParams(centers, s);
+            std::vector<Vector6d> rvf; std::vector<double> J;
+            daFieldMultiEpoch(rv0, thetas, tfs, order, step, rvf, J);
+            return py::make_tuple(rvf, J);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tfs"), py::arg("order")=1, py::arg("step")=10.0,
+          "多历元 RBF 一阶算子：返回 ([x_f^(k)], Jflat[k,6,6+m])。");
+       m.def("daFieldMultiEpochSH", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                       int lmax, const std::vector<double> &tfs, int order, double step){
+            setSHParams(lmax);
+            std::vector<Vector6d> rvf; std::vector<double> J;
+            daFieldMultiEpoch(rv0, thetas, tfs, order, step, rvf, J);
+            return py::make_tuple(rvf, J);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tfs"), py::arg("order")=1, py::arg("step")=10.0,
+          "多历元球谐一阶算子：返回 ([x_f^(k)], Jflat[k,6,6+m])。");
+       // 变分灵敏度多历元算子：DA 只管状态(N=6)给 A，θ 用变分矩阵（不进 DA，对 m 线性）。
+       m.def("daVarMultiEpochRBF", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                      const std::vector<std::array<double,3>> &centers, double s,
+                                      const std::vector<double> &tfs, double step){
+            setRBFParams(centers, s);
+            std::vector<Vector6d> rvf; std::vector<double> J;
+            daVarMultiEpoch(rv0, thetas, tfs, step, rvf, J);
+            return py::make_tuple(rvf, J);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tfs"), py::arg("step")=10.0, "变分灵敏度多历元 RBF 算子。");
+       m.def("daVarMultiEpochSH", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                     int lmax, const std::vector<double> &tfs, double step){
+            setSHParams(lmax);
+            std::vector<Vector6d> rvf; std::vector<double> J;
+            daVarMultiEpoch(rv0, thetas, tfs, step, rvf, J);
+            return py::make_tuple(rvf, J);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tfs"), py::arg("step")=10.0, "变分灵敏度多历元球谐算子。");
+       m.def("daRecordFlowBackward", [](const RecordFlow &rf, const std::vector<double> &grad){
+            Vector6d gx; std::vector<double> gp;
+            daRecordFlowBackward(rf, grad, gx, gp);
+            return py::make_tuple(gx, gp);
+       }, py::arg("flow"), py::arg("grad"),
+          "路径 A 反向：给定 ∂L/∂xf(m)，返回 (∂L/∂x0(m), ∂L/∂θ)。");
+       // 积分伴随：前向出各历元 (x_f, Φ) 并缓存阶段；反向为离散 RK4 转置（含 deep）。
+       py::class_<DeepFlow>(m, "DeepFlow")
+            .def_readonly("rvf", &DeepFlow::rvf)
+            .def_readonly("PhiEpoch", &DeepFlow::PhiEpoch)
+            .def_readonly("tfs", &DeepFlow::tfs);
+       m.def("daDeepForwardRBF", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                    const std::vector<std::array<double,3>> &centers, double s,
+                                    const std::vector<double> &tfs, double step){
+            setRBFParams(centers, s);
+            DeepFlow fl; daDeepForward(rv0, thetas, tfs, step, fl);
+            return fl;
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tfs"), py::arg("step")=10.0, "积分伴随前向（RBF）：返回 DeepFlow。");
+       m.def("daDeepForwardSH", [](const Vector6d &rv0, const std::vector<double> &thetas, int lmax,
+                                   const std::vector<double> &tfs, double step){
+            setSHParams(lmax);
+            DeepFlow fl; daDeepForward(rv0, thetas, tfs, step, fl);
+            return fl;
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tfs"), py::arg("step")=10.0, "积分伴随前向（球谐）：返回 DeepFlow。");
+       m.def("daDeepBackwardRBF", [](const DeepFlow &fl, const std::vector<Vector6d> &gx,
+                                     const std::vector<double> &gP,
+                                     const std::vector<std::array<double,3>> &centers, double s){
+            setRBFParams(centers, s);
+            Vector6d gx0; std::vector<double> gt;
+            daDeepBackward(fl, gx, gP, gx0, gt);
+            return py::make_tuple(gx0, gt);
+       }, py::arg("flow"), py::arg("gx_epoch"), py::arg("gPhi_epoch"),
+          py::arg("centers"), py::arg("s"), "积分伴随反向（RBF）：返回 (∂L/∂x0, ∂L/∂θ)。");
+       m.def("daDeepBackwardSH", [](const DeepFlow &fl, const std::vector<Vector6d> &gx,
+                                    const std::vector<double> &gP, int lmax){
+            setSHParams(lmax);
+            Vector6d gx0; std::vector<double> gt;
+            daDeepBackward(fl, gx, gP, gx0, gt);
+            return py::make_tuple(gx0, gt);
+       }, py::arg("flow"), py::arg("gx_epoch"), py::arg("gPhi_epoch"), py::arg("lmax"),
+          "积分伴随反向（球谐）：返回 (∂L/∂x0, ∂L/∂θ)。");
        m.def("OscElemsLongpropagate", &osculating::OscElemsLongpropagate, py::arg("tf"), py::arg("OEm"), 
             py::arg("RE") = osculating::RE, 
             py::arg("mu") = osculating::MU, 
