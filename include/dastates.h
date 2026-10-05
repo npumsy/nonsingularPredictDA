@@ -52,6 +52,14 @@ Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
                              std::vector<double> &coeffs,
                              std::vector<std::vector<unsigned int>> &mons);
 
+// 整星座批处理（线程安全，无 DACE）：每星 2 次 double 传播（κ、κ+dk），FD 出 ∂x_f/∂κ。
+// kappas 长度 1（广播）或 N（每星一个）。返回终端状态 xf；sens 写入 ∂x_f/∂κ。
+// nthreads<=0 用默认线程数。可 OpenMP 并行。
+std::vector<Vector6d> daJ234DragBatchD(const std::vector<Vector6d> &rv0s,
+                                       const std::vector<double> &kappas,
+                                       double tf, double step, double dk,
+                                       std::vector<Vector6d> &sens, int nthreads);
+
 // 通用增广状态版：x = [r(3), v(3), theta(1..m)]，每个 theta_k 都是阻力项的独立乘性因子
 // （如大气密度倍率、阻力系数 Cd、面质比 A/m），RK4 时 theta_k' = 0。
 // 用于多参数（较大 m）的可微 Learning：pybind 接口 daAugCoeffs 暴露。

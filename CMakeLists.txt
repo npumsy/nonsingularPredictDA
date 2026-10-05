@@ -30,6 +30,7 @@ set(pybind11_DIR /home/msy/miniconda3/envs/rover_slam/lib/python3.10/site-packag
 # set(pybind11_DIR  /home/msy/miniconda3/lib/python3.12/site-packages/pybind11/share/cmake/pybind11)
 find_package(pybind11 REQUIRED)
 find_package(dace REQUIRED)
+find_package(OpenMP REQUIRED)
 # 查找 dace 库
 find_library(DACE_LIB dace PATHS /usr/local/lib)
 
@@ -58,14 +59,15 @@ set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/build)
 
 # Add pybind11 module
 pybind11_add_module(${PROJECT_NAME} ${SRC_LIST})
-# 链接 dace 库到 qoe 模块
-target_link_libraries(${PROJECT_NAME} PRIVATE ${DACE_LIB})
+# 链接 dace 库与 OpenMP 到 qoe 模块
+target_link_libraries(${PROJECT_NAME} PRIVATE ${DACE_LIB} OpenMP::OpenMP_CXX)
 target_include_directories(${PROJECT_NAME} PRIVATE /usr/local/include/dace)
 # 设置编译目标
 # add_executable(da src/dastate.cpp)
 # target_link_libraries(da dace)
 
-set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Release)
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=native -funroll-loops")
 add_library(dastate SHARED src/dastate.cpp)
 target_link_libraries(dastate ${DACE_LIB})
 add_executable(test src/test.cpp src/kepler.cpp src/elements.cpp src/integrater.cpp)

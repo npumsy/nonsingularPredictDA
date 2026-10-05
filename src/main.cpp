@@ -246,6 +246,22 @@ PYBIND11_MODULE(qoe, m)
                      coeffs : 长度 6*nmono，按 [输出状态 i][单项式 k] 展平。
                      mons   : nmono 个 7 维指数向量。
           )pbdoc");
+       // 整星座批处理（线程安全 double 传播 + OpenMP，释放 GIL）：返回 (xf, sens=∂x_f/∂κ)。
+       m.def("daJ234DragBatchD", [](const std::vector<Vector6d> &rv0s,
+                                    const std::vector<double> &kappas, double tf, double step, double dk, int nthreads){
+            std::vector<Vector6d> sens;
+            std::vector<Vector6d> xf;
+            {
+                py::gil_scoped_release release;
+                xf = daJ234DragBatchD(rv0s, kappas, tf, step, dk, sens, nthreads);
+            }
+            return py::make_tuple(xf, sens);
+       }, py::arg("rv0s"), py::arg("kappas"), py::arg("tf"), py::arg("step")=10.0,
+          py::arg("dk")=1e-4, py::arg("nthreads")=0,
+          R"pbdoc(
+               整星座 J234+阻力 double 批传播（线程安全、OpenMP、释放 GIL）。
+               Returns: (xf, sens)，sens=∂x_f/∂κ（有限差分）。
+          )pbdoc");
        // 通用多参数增广状态 DA 传播：theta(1..m) 为阻力项的独立乘性因子（多参数可微 Learning）。
        m.def("daAugCoeffs", [](const Vector6d &rv0, const std::vector<double> &params,
                                double tf, int order, double step){

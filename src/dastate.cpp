@@ -198,7 +198,7 @@ AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,T beta, double mu, dou
     T Re3_r3 = Re2_r2 * Re_r;
     T Re4_r4 = Re3_r3 * Re_r;
 
-    T common_factor = -mu /pow(r,3);
+    T common_factor = -mu /(r*r*r);   // 避免 DA pow(r,3)：整数幂用乘法
 
     T J2_term = (3.0 / 2.0) * bddd::J2 * Re2_r2 * (1.0 - 5.0 * z2_r2);
     T J3_term = (5.0 / 2.0) * bddd::J3 * Re3_r3 * (3.0 * z_r - 7.0 * z3_r3);
@@ -220,11 +220,11 @@ AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,T beta, double mu, dou
     // T v = vel.vnorm(); // velocity magnitude
     AlgebraicVector<T> rel_vel = {x[3] +bddd::OMEGA_EARTH * x[1], x[4] -bddd::OMEGA_EARTH * x[0], x[5]}; // Earth rotation correction
     T v = rel_vel.vnorm();
-    AlgebraicVector<T> drag_acc = {
-        -0.5 * rhoCdA_m * beta*exp(-(r-Re - h0) / H0) * v * rel_vel[0],
-        -0.5 * rhoCdA_m * beta*exp(-(r-Re - h0) / H0) * v * rel_vel[1],
-        -0.5 * rhoCdA_m * beta*exp(-(r-Re - h0) / H0) * v * rel_vel[2]
-    };
+    T rho_expo = exp(-(r-Re - h0) / H0);          // 密度指数只算一次（原先每分量各算一次）
+    T drag_coef = -0.5 * rhoCdA_m * beta * rho_expo * v;
+    AlgebraicVector<T> drag_acc = {drag_coef * rel_vel[0],
+                                   drag_coef * rel_vel[1],
+                                   drag_coef * rel_vel[2]};
 // cout<<"DA---v, v_x,v_y, v_z(m/s^2)="<<cons(v)*1e3<<",\t"<<cons(rel_vel[0])*1e3<<",\t"<<cons(rel_vel[1])*1e3<<",\t"<<cons(rel_vel[2])*1e3<<endl;
 
     // Combine accelerations
@@ -268,13 +268,12 @@ void enumerate_monomials_uv(unsigned int nv, unsigned int order,
 }
 } // namespace
 
-Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
-                             int order, double step,
-                             std::vector<double> &coeffs,
-                             std::vector<std::vector<unsigned int>> &mons){
-    const int N = 7;
-    DA::init(order, N);
-    DA::setEps(0.0);   // 不做 fabs(c)<=eps 的系数丢弃，否则阻力等小灵敏度会被截掉
+namespace {
+// 核心：假定 DA::init 已调用（批处理里只 init 一次）。不含全局初始化。
+Vector6d daJ234DragAugCoeffs_core(const Vector6d &rv0, double kappa0, double tf,
+                                  int order, double step,
+                                  std::vector<double> &coeffs,
+                                  std::vector<std::vector<unsigned int>> &mons){
     AlgebraicVector<DA> x(7);
     for(int i=0;i<6;i++) x[i] = rv0(i)/1e3 + DA(i+1);
     x[6] = kappa0 + DA(7);
@@ -293,6 +292,53 @@ Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
     Vector6d rvf;
     for(int i=0;i<6;i++) rvf[i]=cons(x[i])*1e3;
     return rvf;
+}
+} // namespace
+
+Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
+                             int order, double step,
+                             std::vector<double> &coeffs,
+                             std::vector<std::vector<unsigned int>> &mons){
+    DA::init(order, 7);
+    DA::setEps(0.0);   // 不做 fabs(c)<=eps 的系数丢弃，否则阻力等小灵敏度会被截掉
+    return daJ234DragAugCoeffs_core(rv0, kappa0, tf, order, step, coeffs, mons);
+}
+
+namespace {
+// 无 DACE 的纯 double 单星传播：J234 + 阻力（β=kappa）。线程安全（仅局部变量）。
+Vector6d propDragD(const Vector6d &rv0, double kappa, double tf, double step){
+    AlgebraicVector<double> x7(7);
+    for(int i=0;i<6;i++) x7[i] = rv0(i)/1e3;
+    x7[6] = kappa;
+    x7 = rk4<AlgebraicVector<double>>(x7, 0.0, tf, TBPfull_param<double>, 0.0, step);
+    Vector6d rvf;
+    for(int i=0;i<6;i++) rvf[i] = x7[i]*1e3;
+    return rvf;
+}
+} // namespace
+
+// 整星座批处理（线程安全）：对每星做 2 次 double 传播（κ 与 κ+dk），FD 给 ∂x_f/∂κ。
+// 绕过 DACE 全局态，可用 OpenMP 并行；用于可微因子中的 forward + 一阶灵敏度（direct）。
+std::vector<Vector6d> daJ234DragBatchD(const std::vector<Vector6d> &rv0s,
+                                       const std::vector<double> &kappas,
+                                       double tf, double step, double dk,
+                                       std::vector<Vector6d> &sens, int nthreads){
+    const std::size_t n = rv0s.size();
+    const bool scalar = (kappas.size() == 1);
+    std::vector<Vector6d> xf(n);
+    sens.assign(n, Vector6d::Zero());
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long i=0;i<(long long)n;i++){
+        const double k = scalar ? kappas[0] : kappas[(std::size_t)i];   // 标量广播 / 每星一个
+        Vector6d a = propDragD(rv0s[(std::size_t)i], k, tf, step);
+        Vector6d b = propDragD(rv0s[(std::size_t)i], k + dk, tf, step);
+        xf[(std::size_t)i] = a;
+        sens[(std::size_t)i] = (b - a) / dk;
+    }
+    return xf;
 }
 
 // 通用增广 RHS：x = [rv(6), theta(m)]，阻力项乘上 Π theta_k（各参数为独立乘性因子）。

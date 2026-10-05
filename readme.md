@@ -1,26 +1,48 @@
-## Intro
-This is orbit propagater designed for precise orbit determination. It's not well tested, and to be developed, you should test on your own. The author has limmited effort to continue, so it's made public.  
 
-Feature:
-- using Orbit Element and cardesian state
-- OE of classic orbit element and nonsingular element, considering transform of osculating and mean element, 
-- state covariance, jacobian from element to $r,v$ vectors.
-- state transition matrix, using lagrange analytical method
-- ODE propogation with RK8(7) and RK4(5), variable step or fixed step
-- C++ library and python libray `qoe` used in script
+轨道传播器，考虑 J2–J4 和阻力摄动，适用于轨道确定。使用 OE 和笛卡尔状态、状态协方差、雅可比矩阵和状态转移矩阵，以及光滑轨道元素和均值元素之间的变换。数值积分基于 RK8(7) 或 DA。
 
-Some (dastate.cpp) based on differential algebra library [DACE](https://github.com/dacelib/dace), provide for high order ODE propagation of state error and STM.
+### 特点
+这是一个用于高精度轨道确定的轨道传播器。它尚未经过充分测试，仍在持续开发中，建议您自行进行验证。原作者精力有限，因此将其公开发布。
 
-Some (mainly kepler.cpp) based on [pykep](https://esa.github.io/pykep/), transfer of orbit element, and 
+功能包括：
 
-referenced to book of LiuLin,HouXiyun, Nanjing University, 《轨道力学基础》
+- 使用轨道元素和笛卡尔状态
+- 经典轨道元素和非奇异轨道元素的 OE，考虑光滑轨道元素与均值元素之间的转换
+- 状态协方差，以及从元素到 r、v 向量的雅可比矩阵
+- 状态转移矩阵，采用拉格朗日解析方法
+- 基于 RK8(7) 和 RK4(5) 的 ODE 传播，支持可变步长或固定步长
+- C++ 库和 Python 库 `qoe`，可在脚本中使用
+- 部分内容（如 dastate.cpp）基于微分代数库 [DACE](https://github.com/dacelib/dace)，用于高阶 ODE 状态误差和 STM 的传播
+- 部分内容（主要是 kepler.cpp）基于 [pykep](https://esa.github.io/pykep/)，用于轨道元素转换，并参考了刘林、侯西云等编著的南京大学《轨道力学基础》
+
+
+## install
+项目根目录下运行以下命令以确保模块正确生成（会用当前激活的 Python/pybind11，见 `CMakeLists.txt`）：
+
+```sh
+mkdir -p build && cd build
+cmake .. -DPython3_EXECUTABLE="$(which python)"
+cmake --build . -j --target qoe
+```
+这样，生成的共享库模块位于 `build/`，命名为 `qoe.cpython-<版本>-<平台>.so`（如 conda `rover_slam`/py3.10 下为 `qoe.cpython-310-x86_64-linux-gnu.so`）。
+
+运行测试
+确保 PYTHONPATH 包含生成的模块路径，然后运行你的测试脚本：
+
+```sh
+export PYTHONPATH=$(pwd)/build:$PYTHONPATH
+cd ../tests
+python3 test_my_module.py
+```
+这样，你的 Python 测试脚本应该能够找到并导入 qoe 模块。
+
+
 
 ## usage
+
+### 作为一个在py中调用的库
 ```
 python3 ../script/testcov.py 
-```
-result:
-```
 Osculatimg Orbital Elements by RV:
  6.9366e+06   0.0350005 0.000674293 4.82366e-05     1.26494   0.0169624
 E_n1 = -0.036439
@@ -43,20 +65,15 @@ Conversion errpo:
 4.32522e-10
 2.54249e-09
 -6.58201e-09
-
+```
 J234 force: (m/s^2)                     -0.0113171      -0.000311193    -0.00111071
 RKdouble---Drag a_x, a_y, a_z(m/s^2)=   1.07131e-09,    -6.54819e-09,   -2.67007e-08,
 RKdouble---total acc a_x, a_y, a_z(m/s^2)=      -8.29887,       -0.22820,         -0.27753,
 DA---J234: (m/s^2)=                     -0.0113171,  -0.000311193,   -0.00111071
 DA-- a_x, a_y, a_z(m/s^2)=                      -8.29887,       -0.228199,        -0.277529
 DA---drag: (m/s^2)=                     1.07131e-09,    -6.54819e-09,   -2.67007e-08
-```
 ### testode
-```
 python3 ./script/testode.py
-```
-result: 
-```
 DA d state (6x1):
 0000    6925443.9520, 190432.6240, 230986.9010, -303.93854, 2277.90445, 7229.09828
 0010    6921989.6884, 213199.8038, 303262.5598, -386.90722, 2275.48603, 7225.88874
@@ -80,41 +97,3 @@ t0加误差状态正向递推的结果，反向递推恢复t0误差(6x1):
   9.99999998e-01 -1.00000000e+00]
 Backward prop estimate(6x1): [-1.31054781e-03  3.98564443e-05 -7.42875272e-05  2.61788959e-04
   3.19708806e-06  1.29809960e-05]
-```
-## install
-The user must change the related lines in CMake file, especilly :
-```
-find_library(DACE_LIB dace PATHS /usr/local/lib)
-```
-to your dace.so libyrary directory.
-
-**使用前需要配置好dace.so库的位置，以及比如你所要依赖的python可执行文件的位置、pybind库的位置。**
-### dependency
-- eigen
-- pybind11
-- dace
-- python
-
-### build
-项目根目录下运行以下命令以确保模块正确生成：
-
-```sh
-mkdir -p build
-cd build
-cmake ..
-make
-```
-这样，生成的共享库模块应该位于 build 目录中，并且命名为 qoe.cpython-38-x86_64-linux-gnu.so。
-
-C++ 运行测试可执行文件 build/test；
-
-或者通过python运行测试。
-确保 PYTHONPATH 包含生成的模块路径，然后运行你的测试脚本：
-
-```sh
-export PYTHONPATH=$(pwd)/build:$PYTHONPATH
-cd ../tests
-python3 test_my_module.py
-```
-这样，你的 Python 测试脚本应该能够找到并导入 qoe 模块。
-
