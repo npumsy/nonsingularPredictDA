@@ -55,6 +55,29 @@ Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
 // 整星座批处理（线程安全，无 DACE）：每星 2 次 double 传播（κ、κ+dk），FD 出 ∂x_f/∂κ。
 // kappas 长度 1（广播）或 N（每星一个）。返回终端状态 xf；sens 写入 ∂x_f/∂κ。
 // nthreads<=0 用默认线程数。可 OpenMP 并行。
+// 批 double 位置相关残差力场传播（场参数由 setRBFParams/setSHParams 设定）；返回 xf，
+// 并 FD 出 ∂x_f/∂θ（Jt, N*6*m）与 ∂x_f/∂x0（Jx, N*6*6）。
+std::vector<Vector6d> daFieldBatchD(const std::vector<Vector6d> &rv0s,
+                                    const std::vector<double> &thetas,
+                                    double tf, double step, double dk, int nthreads,
+                                    std::vector<double> &Jt, std::vector<double> &Jx);
+// 多历元批传播（每星一次连续积分，记录各历元状态与 ∂x/∂θ、∂x/∂x0）；场参数由 setRBF/SHParams 设定。
+void daFieldMultiEpochBatchD(const std::vector<Vector6d> &rv0s,
+                             const std::vector<double> &thetas,
+                             const std::vector<double> &tfs, double step, double dk, int nthreads,
+                             std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx);
+// 解析（变分）多历元批：逐星调 daVarMultiEpoch（A=∂f/∂x 由 DA(N=6) 精确给出，非 FD），
+// 返回 xf(n*K*6) 与 Jx(n*K*6*6)=∂x/∂x0。θ 为空时即参考场（J234+阻力）。
+void daVarMultiEpochBatch(const std::vector<Vector6d> &rv0s,
+                          const std::vector<double> &thetas,
+                          const std::vector<double> &tfs, double step, int nthreads,
+                          std::vector<double> &xf, std::vector<double> &Jx);
+// 批量并行【解析变分】：A=∂f/∂x 由线程局部 DACE(1,6) 精确给，[x,Φ,S] 以 double 积分；
+// 返回 xf(N*K*6,m)、Jt(N*K*6*m)、Jx(N*K*6*6)；场参数由 setRBF/SHParams 预设。nthreads<=0 默认。
+void daVarMultiEpochBatchP(const std::vector<Vector6d> &rv0s,
+                           const std::vector<double> &thetas,
+                           const std::vector<double> &tfs, double step, int nthreads,
+                           std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx);
 std::vector<Vector6d> daJ234DragBatchD(const std::vector<Vector6d> &rv0s,
                                        const std::vector<double> &kappas,
                                        double tf, double step, double dk,
@@ -105,6 +128,24 @@ void setSHParams(int lmax);
 void daFieldMultiEpoch(const Vector6d &rv0_m, const std::vector<double> &thetas,
                        const std::vector<double> &tfs, int order, double step,
                        std::vector<Vector6d> &rvf, std::vector<double> &Jflat);
+
+// D1：多历元**稠密泰勒系数**导出（一次连续积分，每个 tf 记录 6 个状态的 (mons, coeffs)）。
+// 用于在 Python/torch 侧对任意 (x0, θ) 做**精确非线性**求值（不重跑 DA），并支持 order>=2 二阶项。
+// 注意：状态 DA 内部单位为 km；coeffs 为该 km 状态的泰勒系数，rvf 为 m。
+// coeffs 排布 [k][输出状态 i][单式项]，长度 K*6*nmono；mons 长度 nmono，每个长度 N=6+m。
+void daFieldMultiEpochCoeffs(const Vector6d &rv0_m, const std::vector<double> &thetas,
+                             const std::vector<double> &tfs, int order, double step,
+                             std::vector<double> &rvf, std::vector<double> &coeffs,
+                             std::vector<std::vector<unsigned int>> &mons);
+
+// 批量并行【解析】DA 多历元展开（DACE WITH_PTHREAD + OpenMP）：主线程 DA::init 一次，
+// 每线程 daceInitializeThread，一次连续积分给各 tf 的 x、Φ=∂x/∂x0、∂x/∂θ（解析系数，非 FD）。
+// 场参数由 setRBFParams/setSHParams 预先设定。排布同 daFieldMultiEpochBatchD：
+// xf(N*K*6, m)、Jt(N*K*6*m, m/θ)、Jx(N*K*6*6)。nthreads<=0 用默认。
+void daFieldMultiEpochBatchDA(const std::vector<Vector6d> &rv0s,
+                              const std::vector<double> &thetas,
+                              const std::vector<double> &tfs, int order, double step, int nthreads,
+                              std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx);
 
 // 变分灵敏度多历元算子：DA 只作用于状态（N=6）求 A=∂f/∂x；积分增广 [x, Φ=∂x/∂x0, S=∂x/∂θ]，
 // θ **不进 DA**，代价对 m 线性。一次前向到各 tf；Jflat 同 daFieldMultiEpoch 排布。

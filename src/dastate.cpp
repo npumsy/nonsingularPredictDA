@@ -642,11 +642,100 @@ void daFieldMultiEpoch(const Vector6d &rv0_m, const std::vector<double> &thetas,
     }
 }
 
+// D1：多历元稠密泰勒系数导出（一次连续积分；每 tf 记录 6 状态的 (mons, coeffs)）。
+void daFieldMultiEpochCoeffs(const Vector6d &rv0_m, const std::vector<double> &thetas,
+                             const std::vector<double> &tfs, int order, double step,
+                             std::vector<double> &rvf, std::vector<double> &coeffs,
+                             std::vector<std::vector<unsigned int>> &mons){
+    const int m = (int)thetas.size();
+    const int N = 6 + m;
+    DA::init(order, N);
+    DA::setEps(0.0);
+    AlgebraicVector<DA> x(N);
+    for(int i=0;i<6;i++) x[i] = rv0_m(i)/1e3 + DA(i+1);
+    for(int k=0;k<m;k++) x[6+k] = thetas[k] + DA(7+k);
+
+    enumerate_monomials_uv((unsigned int)N, (unsigned int)order, mons);
+    const std::size_t nmono = mons.size();
+    const int K = (int)tfs.size();
+    rvf.assign((std::size_t)K*6, 0.0);
+    coeffs.assign((std::size_t)K*6*nmono, 0.0);
+    double tcur = 0.0;
+    for(int kk=0; kk<K; ++kk){
+        x = rk4(x, tcur, tfs[kk], TBPfull_field, 0.0, step);   // 连续积分，状态续用
+        tcur = tfs[kk];
+        for(int i=0;i<6;i++){
+            rvf[(std::size_t)kk*6+i] = cons(x[i])*1e3;
+            for(std::size_t k=0;k<nmono;k++)
+                coeffs[((std::size_t)kk*6+i)*nmono + k] = x[i].getCoefficient(mons[k]);
+        }
+    }
+}
+
+// 批量并行【解析】DA 多历元展开（DACE WITH_PTHREAD + OpenMP）。
+void daFieldMultiEpochBatchDA(const std::vector<Vector6d> &rv0s,
+                              const std::vector<double> &thetas,
+                              const std::vector<double> &tfs, int order, double step, int nthreads,
+                              std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx){
+    const std::size_t n = rv0s.size();
+    const int m = (int)thetas.size();
+    const int N = 6 + m;
+    const int K = (int)tfs.size();
+    xf.assign(n*K*6, 0.0); Jt.assign(n*K*6*m, 0.0); Jx.assign(n*K*6*6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+    DA::init(order, N);          // 主线程一次性初始化（全局 monomial 表，之后只读）
+    DA::setEps(0.0);
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nthreads)
+#endif
+    {
+        daceInitializeThread();  // 每线程线程局部 DA 态（DACECom_t/DACEDbg）
+        DA::setEps(0.0);
+        std::vector<std::vector<unsigned int>> e1(N);
+        for(int j=0;j<N;j++){ e1[j].assign(N,0u); e1[j][j]=1u; }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long ii=0; ii<(long long)n; ++ii){
+            const std::size_t i = (std::size_t)ii;
+            AlgebraicVector<DA> x(N);
+            const Vector6d &rv0 = rv0s[i];
+            for(int c=0;c<6;c++) x[c] = rv0(c)/1e3 + DA(c+1);
+            for(int k=0;k<m;k++) x[6+k] = thetas[k] + DA(7+k);
+            double tcur = 0.0;
+            for(int kk=0; kk<K; ++kk){
+                x = rk4(x, tcur, tfs[kk], TBPfull_field, 0.0, step);   // 连续积分，状态续用
+                tcur = tfs[kk];
+                for(int c=0;c<6;c++){
+                    xf[((std::size_t)i*K+kk)*6+c] = cons(x[c])*1e3;
+                    for(int j=0;j<6;j++)
+                        Jx[(((std::size_t)i*K+kk)*6+c)*6+j] = x[c].getCoefficient(e1[j]);
+                    for(int k=0;k<m;k++)
+                        Jt[(((std::size_t)i*K+kk)*6+c)*m+k] = x[c].getCoefficient(e1[6+k])*1e3;
+                }
+            }
+        }
+        daceCleanupThread();
+    }
+}
+
 // A = ∂f/∂x (6×6) at (rv_km, θ)：DA order=1、N=6 求一次 RHS 的 Jacobian（不含 θ 的 DA）。
 static void fieldStateJacobian(const double rv_km[6], const std::vector<double> &th, double A[36]){
     const int m = (int)th.size();
     DA::init(1, 6);
     DA::setEps(0.0);
+    AlgebraicVector<DA> xa(6+m);
+    for(int i=0;i<6;i++) xa[i] = rv_km[i] + DA(i+1);
+    for(int k=0;k<m;k++) xa[6+k] = DA(th[k]);   // θ 作为常数
+    AlgebraicVector<DA> f = TBPfull_field(xa, 0.0, 1.0);
+    std::vector<unsigned int> e(6, 0u);
+    for(int i=0;i<6;i++)
+        for(int j=0;j<6;j++){ e.assign(6,0u); e[j]=1u; A[i*6+j] = f[i].getCoefficient(e); }
+}
+
+// 同上，但**不调用 DA::init**（供已 init 的多线程调用；每线程须先 daceInitializeThread）。
+static void fieldStateJacobianNoInit(const double rv_km[6], const std::vector<double> &th, double A[36]){
+    const int m = (int)th.size();
     AlgebraicVector<DA> xa(6+m);
     for(int i=0;i<6;i++) xa[i] = rv_km[i] + DA(i+1);
     for(int k=0;k<m;k++) xa[6+k] = DA(th[k]);   // θ 作为常数
@@ -1146,3 +1235,209 @@ int main_(int argc, char *argv[])
     return 0;
 }
 
+
+// ---- 批 double 位置相关残差力场传播（线程安全 + OpenMP；场参数由 setRBFParams/setSHParams 设定）----
+// 同 daJ234DragBatchD 模式：纯 double、可 OpenMP；同时 FD 出 ∂x_f/∂θ（Jt, N*6*m）与 ∂x_f/∂x0（Jx, N*6*6）。
+namespace {
+Vector6d propFieldD(const Vector6d &rv0, const std::vector<double> &thetas, double tf, double step){
+    const int m = (int)thetas.size();
+    AlgebraicVector<double> x(6 + m);
+    for(int i=0;i<6;i++) x[i] = rv0(i)/1e3;
+    for(int k=0;k<m;k++) x[6+k] = thetas[k];
+    x = rk4<AlgebraicVector<double>>(x, 0.0, tf, TBPfull_field<double>, 0.0, step);
+    Vector6d rvf;
+    for(int i=0;i<6;i++) rvf[i] = x[i]*1e3;
+    return rvf;
+}
+} // namespace
+
+std::vector<Vector6d> daFieldBatchD(const std::vector<Vector6d> &rv0s,
+                                    const std::vector<double> &thetas,
+                                    double tf, double step, double dk, int nthreads,
+                                    std::vector<double> &Jt, std::vector<double> &Jx){
+    const std::size_t n = rv0s.size();
+    const int m = (int)thetas.size();
+    std::vector<Vector6d> xf(n);
+    Jt.assign(n*6*m, 0.0);
+    Jx.assign(n*6*6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long i=0;i<(long long)n;i++){
+        Vector6d a = propFieldD(rv0s[(std::size_t)i], thetas, tf, step);
+        xf[(std::size_t)i] = a;
+        std::vector<double> tp = thetas;
+        for(int j=0;j<m;j++){
+            tp[j] = thetas[j] + dk;
+            Vector6d b = propFieldD(rv0s[(std::size_t)i], tp, tf, step);
+            tp[j] = thetas[j];
+            for(int c=0;c<6;c++) Jt[((std::size_t)i*6+c)*m + j] = (b[c]-a[c])/dk;
+        }
+        for(int j=0;j<6;j++){
+            Vector6d rp = rv0s[(std::size_t)i]; rp[j] += dk*1e3;
+            Vector6d b = propFieldD(rp, thetas, tf, step);
+            for(int c=0;c<6;c++) Jx[((std::size_t)i*6+c)*6 + j] = (b[c]-a[c])/(dk*1e3);
+        }
+    }
+    return xf;
+}
+
+// ---- 多历元批传播：每星**一次连续积分**，记录各历元状态与 FD 的 ∂x/∂θ、∂x/∂x0 ----
+// 场参数由 setRBFParams/setSHParams 设定。输出展平：xf(N*K*6), Jt(N*K*6*m), Jx(N*K*6*6)。
+namespace {
+void propFieldMultiD(const Vector6d &rv0, const std::vector<double> &thetas,
+                     const std::vector<double> &tfs, double step, std::vector<Vector6d> &out){
+    const int m = (int)thetas.size();
+    AlgebraicVector<double> x(6 + m);
+    for(int i=0;i<6;i++) x[i] = rv0(i)/1e3;
+    for(int k=0;k<m;k++) x[6+k] = thetas[k];
+    out.resize(tfs.size());
+    double tcur = 0.0;
+    for(std::size_t k=0;k<tfs.size();k++){
+        x = rk4<AlgebraicVector<double>>(x, tcur, tfs[k], TBPfull_field<double>, 0.0, step);
+        tcur = tfs[k];
+        Vector6d v; for(int i=0;i<6;i++) v[i]=x[i]*1e3;
+        out[k]=v;
+    }
+}
+} // namespace
+
+void daFieldMultiEpochBatchD(const std::vector<Vector6d> &rv0s,
+                             const std::vector<double> &thetas,
+                             const std::vector<double> &tfs, double step, double dk, int nthreads,
+                             std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx){
+    const std::size_t n = rv0s.size();
+    const int m = (int)thetas.size();
+    const int K = (int)tfs.size();
+    xf.assign(n*K*6, 0.0); Jt.assign(n*K*6*m, 0.0); Jx.assign(n*K*6*6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long i=0;i<(long long)n;i++){
+        std::vector<Vector6d> xn;
+        propFieldMultiD(rv0s[(std::size_t)i], thetas, tfs, step, xn);
+        for(int k=0;k<K;k++) for(int c=0;c<6;c++) xf[((std::size_t)i*K+k)*6+c]=xn[k][c];
+        std::vector<double> tp = thetas;
+        for(int j=0;j<m;j++){
+            tp[j]=thetas[j]+dk;
+            std::vector<Vector6d> xp; propFieldMultiD(rv0s[(std::size_t)i], tp, tfs, step, xp);
+            tp[j]=thetas[j];
+            for(int k=0;k<K;k++) for(int c=0;c<6;c++)
+                Jt[(((std::size_t)i*K+k)*6+c)*m+j]=(xp[k][c]-xn[k][c])/dk;
+        }
+        for(int j=0;j<6;j++){
+            Vector6d rp = rv0s[(std::size_t)i]; rp[j]+=dk*1e3;
+            std::vector<Vector6d> xp; propFieldMultiD(rp, thetas, tfs, step, xp);
+            for(int k=0;k<K;k++) for(int c=0;c<6;c++)
+                Jx[(((std::size_t)i*K+k)*6+c)*6+j]=(xp[k][c]-xn[k][c])/(dk*1e3);
+        }
+    }
+}
+
+// double 变分多历元核心（供并行批）：A=∂f/∂x 由 fieldStateJacobianNoInit 精确给（不 DA::init）。
+static void varMultiEpochCore(const Vector6d &rv0_m, const std::vector<double> &thetas,
+                              const std::vector<double> &tfs, double step,
+                              std::vector<Vector6d> &rvf, std::vector<double> &Jflat){
+    const int m = (int)thetas.size();
+    const int nA = 6 + 36 + 6*m;
+    std::vector<double> y(nA, 0.0), k1(nA), k2(nA), k3(nA), k4(nA), yt(nA);
+    for(int i=0;i<6;i++) y[i] = rv0_m[i]/1e3;
+    for(int i=0;i<6;i++) y[6 + i*6 + i] = 1.0;
+    std::vector<double> B(6*m);
+    auto dydt = [&](const std::vector<double> &yy, std::vector<double> &out){
+        const double *x = &yy[0], *Phi = &yy[6], *S = &yy[42];
+        AlgebraicVector<double> xa(6+m);
+        for(int i=0;i<6;i++) xa[i]=x[i];
+        for(int k=0;k<m;k++) xa[6+k]=thetas[k];
+        AlgebraicVector<double> f = TBPfull_field(xa, 0.0, 1.0);
+        for(int i=0;i<6;i++) out[i]=f[i];
+        double A[36]; fieldStateJacobianNoInit(x, thetas, A);
+        for(int i=0;i<6;i++) for(int j=0;j<6;j++){
+            double s=0; for(int q=0;q<6;q++) s += A[i*6+q]*Phi[q*6+j]; out[6+i*6+j]=s; }
+        fieldBasis(x, m, B);
+        for(int i=0;i<6;i++) for(int k=0;k<m;k++){
+            double s=B[i*m+k]; for(int q=0;q<6;q++) s += A[i*6+q]*S[q*m+k]; out[42+i*m+k]=s; }
+    };
+    const int K = (int)tfs.size();
+    rvf.assign(K, Vector6d());
+    Jflat.assign((std::size_t)K*6*(6+m), 0.0);
+    double tcur = 0.0;
+    for(int kk=0; kk<K; ++kk){
+        const double H = tfs[kk]-tcur;
+        const int ns = std::max(1, (int)std::ceil(H/step));
+        const double h = H/ns;
+        for(int s=0;s<ns;s++){
+            dydt(y,k1);
+            for(int q=0;q<nA;q++) yt[q]=y[q]+h*k1[q]/3.0;                 dydt(yt,k2);
+            for(int q=0;q<nA;q++) yt[q]=y[q]+h*(-k1[q]/3.0+k2[q]);        dydt(yt,k3);
+            for(int q=0;q<nA;q++) yt[q]=y[q]+h*(k1[q]-k2[q]+k3[q]);       dydt(yt,k4);
+            for(int q=0;q<nA;q++) y[q]+=h*(k1[q]+3*k2[q]+3*k3[q]+k4[q])/8.0;
+        }
+        tcur = tfs[kk];
+        for(int i=0;i<6;i++) rvf[kk][i]=y[i]*1e3;
+        for(int i=0;i<6;i++) for(int j=0;j<6;j++)
+            Jflat[((std::size_t)kk*6+i)*(6+m)+j] = y[6+i*6+j];
+        for(int i=0;i<6;i++) for(int k=0;k<m;k++)
+            Jflat[((std::size_t)kk*6+i)*(6+m)+6+k] = y[42+i*m+k]*1e3;
+    }
+}
+
+// 批量并行【解析变分】：主线程 DA::init(1,6) 一次，每线程 daceInitializeThread/cleanup，
+// OpenMP over 卫星；返回 xf(N*K*6,m)、Jt(N*K*6*m)、Jx(N*K*6*6)。
+void daVarMultiEpochBatchP(const std::vector<Vector6d> &rv0s,
+                           const std::vector<double> &thetas,
+                           const std::vector<double> &tfs, double step, int nthreads,
+                           std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx){
+    const std::size_t n = rv0s.size();
+    const int m = (int)thetas.size();
+    const int K = (int)tfs.size();
+    xf.assign(n*K*6, 0.0); Jt.assign(n*K*6*m, 0.0); Jx.assign(n*K*6*6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+    DA::init(1, 6);
+    DA::setEps(0.0);
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nthreads)
+#endif
+    {
+        daceInitializeThread();
+        DA::setEps(0.0);
+        std::vector<Vector6d> rv; std::vector<double> Jf;
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long ii=0; ii<(long long)n; ++ii){
+            const std::size_t i = (std::size_t)ii;
+            varMultiEpochCore(rv0s[i], thetas, tfs, step, rv, Jf);
+            for(int k=0;k<K;k++) for(int c=0;c<6;c++) xf[((std::size_t)i*K+k)*6+c]=rv[k][c];
+            for(int k=0;k<K;k++) for(int c=0;c<6;c++){
+                for(int j=0;j<6;j++) Jx[(((std::size_t)i*K+k)*6+c)*6+j]=Jf[((std::size_t)k*6+c)*(6+m)+j];
+                for(int j=0;j<m;j++) Jt[(((std::size_t)i*K+k)*6+c)*m+j] =Jf[((std::size_t)k*6+c)*(6+m)+6+j];
+            }
+        }
+        daceCleanupThread();
+    }
+}
+
+// 解析（变分）多历元批：m=0 时即积分 [x; Φ]，A=∂f/∂x 由 DA(N=6) 精确给出（非 FD）。
+void daVarMultiEpochBatch(const std::vector<Vector6d> &rv0s,
+                          const std::vector<double> &thetas,
+                          const std::vector<double> &tfs, double step, int nthreads,
+                          std::vector<double> &xf, std::vector<double> &Jx){
+    const std::size_t n = rv0s.size();
+    const int m = (int)thetas.size();
+    const int K = (int)tfs.size();
+    xf.assign(n*K*6, 0.0); Jx.assign(n*K*6*6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long i=0;i<(long long)n;i++){
+        std::vector<Vector6d> rv; std::vector<double> Jf;
+        daVarMultiEpoch(rv0s[(std::size_t)i], thetas, tfs, step, rv, Jf);
+        for(int k=0;k<K;k++) for(int c=0;c<6;c++) xf[((std::size_t)i*K+k)*6+c]=rv[k][c];
+        for(int k=0;k<K;k++) for(int c=0;c<6;c++) for(int j=0;j<6;j++)
+            Jx[(((std::size_t)i*K+k)*6+c)*6+j]=Jf[((std::size_t)k*6+c)*(6+m)+j];
+    }
+}

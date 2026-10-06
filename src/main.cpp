@@ -262,6 +262,54 @@ PYBIND11_MODULE(qoe, m)
                整星座 J234+阻力 double 批传播（线程安全、OpenMP、释放 GIL）。
                Returns: (xf, sens)，sens=∂x_f/∂κ（有限差分）。
           )pbdoc");
+       // 整星座批传播（线程安全 double + OpenMP，释放 GIL）：位置相关残差场（RBF/SH），
+       // 返回 (xf, Jt=∂x/∂θ [N,6,m], Jx=∂x/∂x0 [N,6,6])。场参数由入参设定。
+       m.def("daFieldBatchDRBF", [](const std::vector<Vector6d> &rv0s,
+                                    const std::vector<double> &thetas,
+                                    const std::vector<std::array<double,3>> &centers, double s,
+                                    double tf, double step, double dk, int nthreads){
+            setRBFParams(centers, s);
+            std::vector<double> Jt, Jx; std::vector<Vector6d> xf;
+            { py::gil_scoped_release release;
+              xf = daFieldBatchD(rv0s, thetas, tf, step, dk, nthreads, Jt, Jx); }
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tf"), py::arg("step")=10.0, py::arg("dk")=1e-4, py::arg("nthreads")=0);
+       m.def("daFieldBatchDSH", [](const std::vector<Vector6d> &rv0s,
+                                   const std::vector<double> &thetas, int lmax,
+                                   double tf, double step, double dk, int nthreads){
+            setSHParams(lmax);
+            std::vector<double> Jt, Jx; std::vector<Vector6d> xf;
+            { py::gil_scoped_release release;
+              xf = daFieldBatchD(rv0s, thetas, tf, step, dk, nthreads, Jt, Jx); }
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tf"), py::arg("step")=10.0, py::arg("dk")=1e-4, py::arg("nthreads")=0);
+       // 多历元批传播（SH）：每星一次连续积分，返回 (xf[N,K,6]展平, Jt[N,K,6,m], Jx[N,K,6,6])。
+       m.def("daFieldMultiEpochBatchDSH", [](const std::vector<Vector6d> &rv0s,
+                                             const std::vector<double> &thetas, int lmax,
+                                             const std::vector<double> &tfs, double step,
+                                             double dk, int nthreads){
+            setSHParams(lmax);
+            std::vector<double> xf, Jt, Jx;
+            { py::gil_scoped_release release;
+              daFieldMultiEpochBatchD(rv0s, thetas, tfs, step, dk, nthreads, xf, Jt, Jx); }
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"), py::arg("tfs"),
+          py::arg("step")=10.0, py::arg("dk")=1e-4, py::arg("nthreads")=0);
+
+       m.def("daFieldMultiEpochBatchDRBF", [](const std::vector<Vector6d> &rv0s,
+                                              const std::vector<double> &thetas,
+                                              const std::vector<std::array<double,3>> &centers, double s,
+                                              const std::vector<double> &tfs, double step,
+                                              double dk, int nthreads){
+            setRBFParams(centers, s);
+            std::vector<double> xf, Jt, Jx;
+            { py::gil_scoped_release release;
+              daFieldMultiEpochBatchD(rv0s, thetas, tfs, step, dk, nthreads, xf, Jt, Jx); }
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("centers"), py::arg("s"), py::arg("tfs"),
+          py::arg("step")=10.0, py::arg("dk")=1e-4, py::arg("nthreads")=0);
        // 通用多参数增广状态 DA 传播：theta(1..m) 为阻力项的独立乘性因子（多参数可微 Learning）。
        m.def("daAugCoeffs", [](const Vector6d &rv0, const std::vector<double> &params,
                                double tf, int order, double step){
@@ -367,6 +415,48 @@ PYBIND11_MODULE(qoe, m)
        }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"),
           py::arg("tfs"), py::arg("order")=1, py::arg("step")=10.0,
           "多历元球谐一阶算子：返回 ([x_f^(k)], Jflat[k,6,6+m])。");
+       // D1：多历元稠密泰勒系数导出（供 torch 侧精确非线性求值/二阶）。
+       m.def("daFieldMultiEpochCoeffsRBF", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                              const std::vector<std::array<double,3>> &centers, double s,
+                                              const std::vector<double> &tfs, int order, double step){
+            setRBFParams(centers, s);
+            std::vector<double> rvf, coeffs; std::vector<std::vector<unsigned int>> mons;
+            daFieldMultiEpochCoeffs(rv0, thetas, tfs, order, step, rvf, coeffs, mons);
+            return py::make_tuple(rvf, coeffs, mons);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tfs"), py::arg("order")=1, py::arg("step")=10.0,
+          "多历元 RBF 稠密系数：返回 (rvf[K*6](m), coeffs[K*6*nmono], mons[nmono][N])。");
+       m.def("daFieldMultiEpochCoeffsSH", [](const Vector6d &rv0, const std::vector<double> &thetas,
+                                             int lmax, const std::vector<double> &tfs, int order, double step){
+            setSHParams(lmax);
+            std::vector<double> rvf, coeffs; std::vector<std::vector<unsigned int>> mons;
+            daFieldMultiEpochCoeffs(rv0, thetas, tfs, order, step, rvf, coeffs, mons);
+            return py::make_tuple(rvf, coeffs, mons);
+       }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tfs"), py::arg("order")=1, py::arg("step")=10.0,
+          "多历元球谐稠密系数：返回 (rvf[K*6](m), coeffs[K*6*nmono], mons[nmono][N])。");
+       // 批量并行【解析】DA 多历元展开（WITH_PTHREAD + OpenMP）
+       m.def("daFieldMultiEpochBatchDARBF", [](const std::vector<Vector6d> &rv0s,
+                                               const std::vector<double> &thetas,
+                                               const std::vector<std::array<double,3>> &centers, double s,
+                                               const std::vector<double> &tfs, int order, double step, int nthreads){
+            setRBFParams(centers, s);
+            std::vector<double> xf, Jt, Jx;
+            daFieldMultiEpochBatchDA(rv0s, thetas, tfs, order, step, nthreads, xf, Jt, Jx);
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tfs"), py::arg("order")=1, py::arg("step")=10.0, py::arg("nthreads")=0,
+          "批量并行解析 DA（RBF）：返回 (xf[N*K*6](m), Jt[N*K*6*m], Jx[N*K*6*6])。");
+       m.def("daFieldMultiEpochBatchDASH", [](const std::vector<Vector6d> &rv0s,
+                                              const std::vector<double> &thetas, int lmax,
+                                              const std::vector<double> &tfs, int order, double step, int nthreads){
+            setSHParams(lmax);
+            std::vector<double> xf, Jt, Jx;
+            daFieldMultiEpochBatchDA(rv0s, thetas, tfs, order, step, nthreads, xf, Jt, Jx);
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tfs"), py::arg("order")=1, py::arg("step")=10.0, py::arg("nthreads")=0,
+          "批量并行解析 DA（SH）：返回 (xf[N*K*6](m), Jt[N*K*6*m], Jx[N*K*6*6])。");
        // 变分灵敏度多历元算子：DA 只管状态(N=6)给 A，θ 用变分矩阵（不进 DA，对 m 线性）。
        m.def("daVarMultiEpochRBF", [](const Vector6d &rv0, const std::vector<double> &thetas,
                                       const std::vector<std::array<double,3>> &centers, double s,
@@ -385,6 +475,28 @@ PYBIND11_MODULE(qoe, m)
             return py::make_tuple(rvf, J);
        }, py::arg("rv0"), py::arg("thetas"), py::arg("lmax"),
           py::arg("tfs"), py::arg("step")=10.0, "变分灵敏度多历元球谐算子。");
+       // 批量并行【解析变分】（线程局部 DACE(1,6) + double [x,Φ,S]）
+       m.def("daVarMultiEpochBatchPRBF", [](const std::vector<Vector6d> &rv0s,
+                                            const std::vector<double> &thetas,
+                                            const std::vector<std::array<double,3>> &centers, double s,
+                                            const std::vector<double> &tfs, double step, int nthreads){
+            setRBFParams(centers, s);
+            std::vector<double> xf, Jt, Jx;
+            daVarMultiEpochBatchP(rv0s, thetas, tfs, step, nthreads, xf, Jt, Jx);
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("centers"), py::arg("s"),
+          py::arg("tfs"), py::arg("step")=10.0, py::arg("nthreads")=0,
+          "批量并行解析变分（RBF）：返回 (xf[N*K*6](m), Jt[N*K*6*m], Jx[N*K*6*6])。");
+       m.def("daVarMultiEpochBatchPSH", [](const std::vector<Vector6d> &rv0s,
+                                           const std::vector<double> &thetas, int lmax,
+                                           const std::vector<double> &tfs, double step, int nthreads){
+            setSHParams(lmax);
+            std::vector<double> xf, Jt, Jx;
+            daVarMultiEpochBatchP(rv0s, thetas, tfs, step, nthreads, xf, Jt, Jx);
+            return py::make_tuple(xf, Jt, Jx);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tfs"), py::arg("step")=10.0, py::arg("nthreads")=0,
+          "批量并行解析变分（SH）：返回 (xf[N*K*6](m), Jt[N*K*6*m], Jx[N*K*6*6])。");
        m.def("daRecordFlowBackward", [](const RecordFlow &rf, const std::vector<double> &grad){
             Vector6d gx; std::vector<double> gp;
             daRecordFlowBackward(rf, grad, gx, gp);
