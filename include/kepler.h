@@ -154,6 +154,9 @@ Eigen::VectorXd rv2OEOsc(const Eigen::VectorXd &x);
 // 输入: 轨道元素 OE，最大迭代次数 MaxIt 和容差 epsl。
 // 输出: 包含位置和速度的 6 元素向量 x。
 Eigen::VectorXd OEOsc2rv(const Eigen::VectorXd &OE, int MaxIt, double epsl);
+
+// 快速 qoe→ECI **位置**（省速度）：与 OEOsc2rv 的 PQW→ECI 公式逐位一致。供测距等只需位置的场景。
+Eigen::Vector3d oe2eciPos(const Eigen::VectorXd &OE, int MaxIt = 100, double epsl = 1e-5);
 // 实现第一类虚变量的贝塞尔函数
 double modified_bessel_first_kind(int n, double x);
 double gammaFun(int n);

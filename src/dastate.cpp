@@ -18,7 +18,47 @@ struct FieldSpec {
     double s = 1.0;                            // RBF 宽度（km）
 };
 FieldSpec g_field;
+// --- 三体（日/月）确定性摄动：解析低精度星历（ECI，km） + 传播起点绝对历元（MJD） ---
+bool g_use3b = false;
+double g_mjd0 = 0.0;                              // 传播 t=0 处的 MJD（绝对历元）
+const double D2R_ = 3.14159265358979323846 / 180.0;
+void sunPosECI_km(double mjd, double out[3]){
+    const double n = mjd - 2451545.0;
+    const double L = fmod(280.460 + 0.9856474 * n, 360.0);
+    const double g = (fmod(357.528 + 0.9856003 * n, 360.0)) * D2R_;
+    const double lam = (L + 1.915 * sin(g) + 0.020 * sin(2.0 * g)) * D2R_;
+    const double eps = (23.439 - 4.0e-7 * n) * D2R_;
+    const double R = (1.00014 - 0.01671 * cos(g) - 0.00014 * cos(2.0 * g)) * 1.495978707e8; // AU->km
+    out[0] = R * cos(lam); out[1] = R * cos(eps) * sin(lam); out[2] = R * sin(eps) * sin(lam);
+}
+void moonPosECI_km(double mjd, double out[3]){
+    const double n = mjd - 2451545.0;
+    const double Lp = fmod(218.316 + 13.176396 * n, 360.0) * D2R_;
+    const double M  = fmod(134.963 + 13.064993 * n, 360.0) * D2R_;
+    const double F  = fmod(93.272 + 13.229350 * n, 360.0) * D2R_;
+    const double lam = Lp + 6.289 * D2R_ * sin(M);
+    const double beta = 5.128 * D2R_ * sin(F);
+    const double Delta = 385001.0 - 20905.0 * cos(M);      // km
+    const double eps = 23.439 * D2R_;
+    out[0] = Delta * cos(beta) * cos(lam);
+    out[1] = Delta * (cos(eps) * cos(beta) * sin(lam) - sin(eps) * sin(beta));
+    out[2] = Delta * (sin(eps) * cos(beta) * sin(lam) + cos(eps) * sin(beta));
+}
+// 名义阻力加速度（β=κ=1，km/s²，位置 x 为 km）。即 ∂f/∂κ（阻力对 κ 线性）。与 TBPfull 内阻力项同式。
+void dragAccelKm(const double x_km[6], double out[3]){
+    const double omega = bddd::OMEGA_EARTH;
+    const double rx = x_km[0], ry = x_km[1]; const double vx = x_km[3], vy = x_km[4], vz = x_km[5];
+    const double rvx = vx + omega * ry, rvy = vy - omega * rx, rvz = vz;
+    const double v = std::sqrt(rvx*rvx + rvy*rvy + rvz*rvz);
+    const double r = std::sqrt(rx*rx + ry*ry + x_km[2]*x_km[2]);
+    const double Re = bddd::RE / 1e3, h0 = 530.0, H0 = 65.18534, rhoCdA_m = 1.42812824E-12;
+    const double rho_expo = std::exp(-(r - Re - h0) / H0);
+    const double c = -0.5 * rhoCdA_m * rho_expo * v;
+    out[0] = c * rvx; out[1] = c * rvy; out[2] = c * rvz;
+}
 } // namespace
+void setThirdBody(bool on){ g_use3b = on; }
+void setPropEpoch(double mjd0){ g_mjd0 = mjd0; }
 void setRBFParams(const std::vector<std::array<double,3>> &centers, double s){
     g_field.kind = FIELD_RBF;
     g_field.centers = centers;
@@ -235,6 +275,23 @@ AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,T beta, double mu, dou
     res[4] +=drag_acc[1];
     res[5] +=drag_acc[2];
 
+    // 三体（日/月）确定性摄动（km/s²）：a = mu3*[(r3-r)/|r3-r|³ - r3/|r3|³]，位置取 DA 中心值。
+    if(g_use3b){
+        const double mjd = g_mjd0 + t / 86400.0;
+        double rs[3], rm[3]; sunPosECI_km(mjd, rs); moonPosECI_km(mjd, rm);
+        const double mus = 1.32712440018e11, mum = 4.9028e3;
+        const double px = cons(pos[0]), py = cons(pos[1]), pz = cons(pos[2]);
+        const double d1 = sqrt((rs[0]-px)*(rs[0]-px)+(rs[1]-py)*(rs[1]-py)+(rs[2]-pz)*(rs[2]-pz));
+        const double rn = sqrt(rs[0]*rs[0]+rs[1]*rs[1]+rs[2]*rs[2]);
+        const double d2 = sqrt((rm[0]-px)*(rm[0]-px)+(rm[1]-py)*(rm[1]-py)+(rm[2]-pz)*(rm[2]-pz));
+        const double rmn = sqrt(rm[0]*rm[0]+rm[1]*rm[1]+rm[2]*rm[2]);
+        const double s1 = mus/(d1*d1*d1), m1 = mum/(d2*d2*d2);
+        const double s0 = mus/(rn*rn*rn), m0 = mum/(rmn*rmn*rmn);
+        res[3] += s1*(rs[0]-px) - s0*rs[0] + m1*(rm[0]-px) - m0*rm[0];
+        res[4] += s1*(rs[1]-py) - s0*rs[1] + m1*(rm[1]-py) - m0*rm[1];
+        res[5] += s1*(rs[2]-pz) - s0*rs[2] + m1*(rm[2]-pz) - m0*rm[2];
+    }
+
  if(printTotalAccleration_da)cout<<"DA-- a_x, a_y, a_z(m/s^2)="<<1e3*cons(res[3])<<",\t"<<1e3*cons(res[4])<<",\t"<<1e3*cons(res[5])<<endl;
   if(printEachStepPertub_da)cout<<"DA---drag: (m/s^2)="<<cons(drag_acc[0])*1e3<<",\t"<<cons(drag_acc[1])*1e3<<",\t"<<cons(drag_acc[2])*1e3<<endl;
 
@@ -319,26 +376,88 @@ Vector6d propDragD(const Vector6d &rv0, double kappa, double tf, double step){
 
 // 整星座批处理（线程安全）：对每星做 2 次 double 传播（κ 与 κ+dk），FD 给 ∂x_f/∂κ。
 // 绕过 DACE 全局态，可用 OpenMP 并行；用于可微因子中的 forward + 一阶灵敏度（direct）。
+// **解析**（κ 进 DA，N=7）：单历元批量传播 + 解析 ∂x_f/∂κ（κ 线性系数）。`dk` 忽略——不用 FD。
 std::vector<Vector6d> daJ234DragBatchD(const std::vector<Vector6d> &rv0s,
                                        const std::vector<double> &kappas,
                                        double tf, double step, double dk,
                                        std::vector<Vector6d> &sens, int nthreads){
+    (void)dk;
     const std::size_t n = rv0s.size();
     const bool scalar = (kappas.size() == 1);
     std::vector<Vector6d> xf(n);
     sens.assign(n, Vector6d::Zero());
     if(nthreads <= 0) nthreads = 1;
+    DA::init(1, 7); DA::setEps(0.0);
+    std::vector<unsigned int> e7(7, 0u); e7[6] = 1u;
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(static) num_threads(nthreads)
+    #pragma omp parallel num_threads(nthreads)
 #endif
-    for(long long i=0;i<(long long)n;i++){
-        const double k = scalar ? kappas[0] : kappas[(std::size_t)i];   // 标量广播 / 每星一个
-        Vector6d a = propDragD(rv0s[(std::size_t)i], k, tf, step);
-        Vector6d b = propDragD(rv0s[(std::size_t)i], k + dk, tf, step);
-        xf[(std::size_t)i] = a;
-        sens[(std::size_t)i] = (b - a) / dk;
+    {
+        daceInitializeThread(); DA::setEps(0.0);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long i=0;i<(long long)n;i++){
+            const double k = scalar ? kappas[0] : kappas[(std::size_t)i];
+            AlgebraicVector<DA> x(7);
+            for(int c=0;c<6;c++) x[c] = rv0s[(std::size_t)i](c)/1e3 + DA(c+1);
+            x[6] = k + DA(7);
+            x = rk4(x, 0.0, tf, TBPfull_param, 0.0, step);
+            for(int c=0;c<6;c++){
+                xf[(std::size_t)i](c) = cons(x[c])*1e3;
+                sens[(std::size_t)i](c) = x[c].getCoefficient(e7)*1e3;    // 解析 ∂x/∂κ
+            }
+        }
+        daceCleanupThread();
     }
     return xf;
+}
+
+// 多历元阻力灵敏度：每星一次连续积分，在 tfs 各历元记录 xf 与 ∂x/∂κ（对 κ 与 κ+dk 各积分一遍，
+// 沿途记录）。相比"每历元各传播一次"（O(K) 次全程积分），这里是 O(1) 次全程积分 + 记录。
+// **解析**（κ 进 DA，N=7）：每星一次连续积分，各历元取 x 与 **解析 ∂x/∂κ**（κ 的线性系数）。
+// `dk` 仅为兼容旧签名，**忽略**——本函数不再用任何有限差分。nthreads<=0 默认。
+void daJ234DragMultiEpochBatch(const std::vector<Vector6d> &rv0s,
+                               const std::vector<double> &kappas,
+                               const std::vector<double> &tfs,
+                               double step, double dk, int nthreads,
+                               std::vector<double> &xf, std::vector<double> &sens){
+    (void)dk;
+    const std::size_t n = rv0s.size();
+    const bool scalar = (kappas.size() == 1);
+    const int K = (int)tfs.size();
+    xf.assign((std::size_t)n*K*6, 0.0);
+    sens.assign((std::size_t)n*K*6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+    DA::init(1, 7); DA::setEps(0.0);
+    std::vector<unsigned int> e7(7, 0u); e7[6] = 1u;
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nthreads)
+#endif
+    {
+        daceInitializeThread(); DA::setEps(0.0);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long i=0;i<(long long)n;i++){
+            const double k = scalar ? kappas[0] : kappas[(std::size_t)i];
+            const Vector6d &rv0 = rv0s[(std::size_t)i];
+            AlgebraicVector<DA> x(7);
+            for(int c=0;c<6;c++) x[c] = rv0(c)/1e3 + DA(c+1);
+            x[6] = k + DA(7);
+            double tcur = 0.0;
+            for(int kk=0; kk<K; ++kk){
+                const double tf = tfs[(std::size_t)kk];
+                x = rk4(x, tcur, tf, TBPfull_param, 0.0, step);
+                tcur = tf;
+                for(int c=0;c<6;c++){
+                    xf[((std::size_t)i*K+kk)*6+c]   = cons(x[c])*1e3;
+                    sens[((std::size_t)i*K+kk)*6+c] = x[c].getCoefficient(e7)*1e3;   // 解析 ∂x/∂κ
+                }
+            }
+        }
+        daceCleanupThread();
+    }
 }
 
 // 通用增广 RHS：x = [rv(6), theta(m)]，阻力项乘上 Π theta_k（各参数为独立乘性因子）。
@@ -719,6 +838,64 @@ void daFieldMultiEpochBatchDA(const std::vector<Vector6d> &rv0s,
     }
 }
 
+// 同 daFieldMultiEpochBatchDA，但额外解析出**二阶 Hessian**（对 x0；DA 原始系数约定：
+// c_{2e_a}=½∂²、c_{e_a+e_b}=∂²，故写 H[2a]=2·c、H[a,b]=c）。order 须≥2。
+void daFieldMultiEpochBatchDA2(const std::vector<Vector6d> &rv0s,
+                               const std::vector<double> &thetas,
+                               const std::vector<double> &tfs, int order, double step, int nthreads,
+                               std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx,
+                               std::vector<double> &Hess){
+    const std::size_t n = rv0s.size();
+    const int m = (int)thetas.size();
+    const int N = 6 + m;
+    const int K = (int)tfs.size();
+    xf.assign(n*K*6, 0.0); Jt.assign(n*K*6*m, 0.0); Jx.assign(n*K*6*6, 0.0);
+    Hess.assign(n*K*6*36, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+    if(order < 2) order = 2;
+    DA::init(order, N);
+    DA::setEps(0.0);
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nthreads)
+#endif
+    {
+        daceInitializeThread();
+        DA::setEps(0.0);
+        std::vector<std::vector<unsigned int>> e1(N);
+        for(int j=0;j<N;j++){ e1[j].assign(N,0u); e1[j][j]=1u; }
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long ii=0; ii<(long long)n; ++ii){
+            const std::size_t i = (std::size_t)ii;
+            AlgebraicVector<DA> x(N);
+            const Vector6d &rv0 = rv0s[i];
+            for(int c=0;c<6;c++) x[c] = rv0(c)/1e3 + DA(c+1);
+            for(int k=0;k<m;k++) x[6+k] = thetas[k] + DA(7+k);
+            double tcur = 0.0;
+            for(int kk=0; kk<K; ++kk){
+                x = rk4(x, tcur, tfs[kk], TBPfull_field, 0.0, step);
+                tcur = tfs[kk];
+                for(int c=0;c<6;c++){
+                    xf[((std::size_t)i*K+kk)*6+c] = cons(x[c])*1e3;
+                    for(int j=0;j<6;j++)
+                        Jx[(((std::size_t)i*K+kk)*6+c)*6+j] = x[c].getCoefficient(e1[j]);
+                    for(int k=0;k<m;k++)
+                        Jt[(((std::size_t)i*K+kk)*6+c)*m+k] = x[c].getCoefficient(e1[6+k])*1e3;
+                    for(int a=0;a<6;a++) for(int b=a;b<6;b++){
+                        std::vector<unsigned int> ex(N, 0u); ex[a] += 1u; ex[b] += 1u;
+                        double c2 = x[c].getCoefficient(ex);
+                        double val = (a==b) ? 2.0*c2 : c2;
+                        std::size_t base = (((std::size_t)i*K+kk)*6+c)*36;
+                        Hess[base + a*6+b] = val; Hess[base + b*6+a] = val;
+                    }
+                }
+            }
+        }
+        daceCleanupThread();
+    }
+}
+
 // A = ∂f/∂x (6×6) at (rv_km, θ)：DA order=1、N=6 求一次 RHS 的 Jacobian（不含 θ 的 DA）。
 static void fieldStateJacobian(const double rv_km[6], const std::vector<double> &th, double A[36]){
     const int m = (int)th.size();
@@ -787,6 +964,25 @@ Vector6d fieldResidualAccel(const Vector6d &rv_m, const std::vector<double> &the
     AlgebraicVector<double> a = fieldAccel(x, m);
     Vector6d out; out.setZero();
     for(int i=0;i<3;i++) out[i]=a[i]*1e3;    // km/s^2 -> m/s^2
+    return out;
+}
+
+// 摄动加速度（去二体）：a_pert = (J234+阻力+三体) + SH(θ)，ECI，m/s²。供非奇异要素 Gauss 变分方程用。
+Vector6d pertAccelECI(const Vector6d &rv_m, double kappa, const std::vector<double> &thetas, int lmax){
+    Vector6d xk = rv_m / 1e3;                                  // km
+    AlgebraicVector<double> x(6);
+    for(int i=0;i<6;i++) x[i] = xk[i];
+    AlgebraicVector<double> acc = TBPfull<double>(x, 0.0, kappa);   // km/s²（含二体）
+    const double mu_km = bddd::MU / 1e9;
+    const double rn = sqrt(x[0]*x[0] + x[1]*x[1] + x[2]*x[2]);
+    const double c = mu_km / (rn*rn*rn);
+    Vector6d out; out.setZero();
+    for(int i=0;i<3;i++) out[i] = (acc[3+i] + c*x[i]) * 1e3;   // 去二体 → m/s²
+    if(!thetas.empty()){
+        setSHParams(lmax);
+        Vector6d sh = fieldResidualAccel(rv_m, thetas);        // m/s²
+        for(int i=0;i<3;i++) out[i] += sh[i];
+    }
     return out;
 }
 
@@ -1381,6 +1577,89 @@ static void varMultiEpochCore(const Vector6d &rv0_m, const std::vector<double> &
             Jflat[((std::size_t)kk*6+i)*(6+m)+j] = y[6+i*6+j];
         for(int i=0;i<6;i++) for(int k=0;k<m;k++)
             Jflat[((std::size_t)kk*6+i)*(6+m)+6+k] = y[42+i*m+k]*1e3;
+    }
+}
+
+// 变分（含 κ 列）：[x(6); Φ(36); S(6m); K(6)]；dK/dt = A·K + Fκ（Fκ=名义阻力加速度=∂f/∂κ）。
+static void varMultiEpochCoreKC(const Vector6d &rv0_m, const std::vector<double> &thetas,
+                                const std::vector<double> &tfs, double step,
+                                std::vector<Vector6d> &rvf, std::vector<double> &Jf,
+                                std::vector<Vector6d> &Kf){
+    const int m = (int)thetas.size();
+    const int offK = 42 + 6*m;
+    const int nA = offK + 6;
+    std::vector<double> y(nA,0.0),k1(nA),k2(nA),k3(nA),k4(nA),yt(nA);
+    for(int i=0;i<6;i++) y[i]=rv0_m[i]/1e3;
+    for(int i=0;i<6;i++) y[6+i*6+i]=1.0;
+    std::vector<double> B(6*m);
+    auto dydt=[&](const std::vector<double>&yy, std::vector<double>&out){
+        const double *x=&yy[0], *Phi=&yy[6], *S=&yy[42], *Kc=&yy[offK];
+        AlgebraicVector<double> xa(6+m);
+        for(int i=0;i<6;i++) xa[i]=x[i];
+        for(int k=0;k<m;k++) xa[6+k]=thetas[k];
+        AlgebraicVector<double> f=TBPfull_field(xa,0.0,1.0);
+        for(int i=0;i<6;i++) out[i]=f[i];
+        double A[36]; fieldStateJacobianNoInit(x,thetas,A);
+        for(int i=0;i<6;i++) for(int j=0;j<6;j++){ double s=0; for(int q=0;q<6;q++) s+=A[i*6+q]*Phi[q*6+j]; out[6+i*6+j]=s; }
+        fieldBasis(x,m,B);
+        for(int i=0;i<6;i++) for(int k=0;k<m;k++){ double s=B[i*m+k]; for(int q=0;q<6;q++) s+=A[i*6+q]*S[q*m+k]; out[42+i*m+k]=s; }
+        double dk[3]; dragAccelKm(x,dk);
+        const double Fk[6]={0,0,0,dk[0],dk[1],dk[2]};
+        for(int i=0;i<6;i++){ double s=Fk[i]; for(int q=0;q<6;q++) s+=A[i*6+q]*Kc[q]; out[offK+i]=s; }
+    };
+    const int Kt=(int)tfs.size();
+    rvf.assign(Kt,Vector6d()); Kf.assign(Kt,Vector6d());
+    Jf.assign((std::size_t)Kt*6*(6+m),0.0);
+    double tcur=0.0;
+    for(int kk=0;kk<Kt;++kk){
+        const double H=tfs[kk]-tcur; const int ns=std::max(1,(int)std::ceil(H/step)); const double h=H/ns;
+        for(int s=0;s<ns;s++){
+            dydt(y,k1);
+            for(int q=0;q<nA;q++) yt[q]=y[q]+h*k1[q]/3.0;              dydt(yt,k2);
+            for(int q=0;q<nA;q++) yt[q]=y[q]+h*(-k1[q]/3.0+k2[q]);     dydt(yt,k3);
+            for(int q=0;q<nA;q++) yt[q]=y[q]+h*(k1[q]-k2[q]+k3[q]);    dydt(yt,k4);
+            for(int q=0;q<nA;q++) y[q]+=h*(k1[q]+3*k2[q]+3*k3[q]+k4[q])/8.0;
+        }
+        tcur=tfs[kk];
+        for(int i=0;i<6;i++) rvf[kk][i]=y[i]*1e3;
+        for(int i=0;i<6;i++) for(int j=0;j<6;j++) Jf[((std::size_t)kk*6+i)*(6+m)+j]=y[6+i*6+j];
+        for(int i=0;i<6;i++) for(int k=0;k<m;k++) Jf[((std::size_t)kk*6+i)*(6+m)+6+k]=y[42+i*m+k]*1e3;
+        for(int i=0;i<6;i++) Kf[kk][i]=y[offK+i]*1e3;
+    }
+}
+
+// 批量并行【解析变分 + κ】：返回 xf(N*K*6,m)、Jt(N*K*6*m)=∂x/∂θ、Jx(N*K*6*6)=∂x/∂x0、Jk(N*K*6)=∂x/∂κ。
+// 主线程 DA::init(1,6) 一次；每线程 daceInitializeThread/cleanup；OpenMP over 卫星。场参数由 setSHParams 预设。
+void daVarMultiEpochBatchPSKC(const std::vector<Vector6d> &rv0s,
+                              const std::vector<double> &thetas, int lmax,
+                              const std::vector<double> &tfs, double step, int nthreads,
+                              std::vector<double> &xf, std::vector<double> &Jt,
+                              std::vector<double> &Jx, std::vector<double> &Jk){
+    (void)lmax;
+    const std::size_t n=rv0s.size(); const int m=(int)thetas.size(); const int K=(int)tfs.size();
+    xf.assign(n*K*6,0.0); Jt.assign(n*K*6*m,0.0); Jx.assign(n*K*6*6,0.0); Jk.assign(n*K*6,0.0);
+    if(nthreads<=0) nthreads=1;
+    DA::init(1,6); DA::setEps(0.0);
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nthreads)
+#endif
+    {
+        daceInitializeThread(); DA::setEps(0.0);
+        std::vector<Vector6d> rv,Kv; std::vector<double> Jf;
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long ii=0;ii<(long long)n;++ii){
+            const std::size_t i=(std::size_t)ii;
+            varMultiEpochCoreKC(rv0s[i],thetas,tfs,step,rv,Jf,Kv);
+            for(int k=0;k<K;k++) for(int c=0;c<6;c++) xf[((std::size_t)i*K+k)*6+c]=rv[k][c];
+            for(int k=0;k<K;k++) for(int c=0;c<6;c++){
+                for(int j=0;j<6;j++) Jx[(((std::size_t)i*K+k)*6+c)*6+j]=Jf[((std::size_t)k*6+c)*(6+m)+j];
+                for(int j=0;j<m;j++) Jt[(((std::size_t)i*K+k)*6+c)*m+j]=Jf[((std::size_t)k*6+c)*(6+m)+6+j];
+                Jk[((std::size_t)i*K+k)*6+c]=Kv[k][c];
+            }
+        }
+        daceCleanupThread();
     }
 }
 

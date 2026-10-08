@@ -663,6 +663,39 @@ Eigen::VectorXd OEOsc2rv(const Eigen::VectorXd &OE, int MaxIt = 100, double epsl
 
     return x;
 }
+// 快速 qoe→ECI **位置**（省速度）：与 `OEOsc2rv` 的 PQW→ECI 公式**同一路径**，逐位一致。
+Eigen::Vector3d oe2eciPos(const Eigen::VectorXd &OE, int MaxIt, double epsl) {
+    const double a = OE(0), u = OE(1), ex = OE(2), ey = OE(3), i = OE(4), Omega = OE(5);
+    const double e = std::sqrt(ex * ex + ey * ey);
+    const double p = a * (1 - e * e);
+    double omega, nu;
+    if (e < 1e-5) {
+        omega = 0; nu = u;
+    } else {
+        omega = std::atan2(ey, ex);
+        double M = u - omega;
+        if (M < -M_PI) M += std::floor(std::abs(M - M_PI) / (2 * M_PI)) * 2 * M_PI;
+        else if (M > M_PI) M -= std::floor((M + M_PI) / (2 * M_PI)) * 2 * M_PI;
+        const double E = KepEqtnE(M, e, MaxIt, epsl);
+        nu = 2 * std::atan(std::sqrt((1 + e) / (1 - e)) * std::tan(E / 2));
+    }
+    Eigen::Vector3d rPQW;   // 与 OEOsc2rv 完全同一表达式（逐位一致）
+    rPQW << p * std::cos(nu) / (1 + e * std::cos(nu)),
+            p * std::sin(nu) / (1 + e * std::cos(nu)),
+            0;
+    Eigen::Matrix3d T;
+    T << std::cos(Omega) * std::cos(omega) - std::sin(Omega) * std::sin(omega) * std::cos(i),
+         -std::cos(Omega) * std::sin(omega) - std::sin(Omega) * std::cos(omega) * std::cos(i),
+         std::sin(Omega) * std::sin(i),
+         std::sin(Omega) * std::cos(omega) + std::cos(Omega) * std::sin(omega) * std::cos(i),
+         -std::sin(Omega) * std::sin(omega) + std::cos(Omega) * std::cos(omega) * std::cos(i),
+         -std::cos(Omega) * std::sin(i),
+         std::sin(omega) * std::sin(i),
+         std::cos(omega) * std::sin(i),
+         std::cos(i);
+    return T * rPQW;
+}
+
 void testOEosc() {
     // Example usage
     Eigen::VectorXd x(6);

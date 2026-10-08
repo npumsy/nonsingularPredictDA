@@ -40,6 +40,16 @@ PYBIND11_MODULE(qoe, m)
      m.def("PI", []()
            { return M_PI; });
 
+     m.def("pertAccelECI", [](const Vector6d &rv, double kappa, const std::vector<double> &thetas, int lmax){
+         return pertAccelECI(rv, kappa, thetas, lmax);
+       }, py::arg("rv"), py::arg("kappa") = 1.0, py::arg("thetas") = std::vector<double>{}, py::arg("lmax") = 2,
+          "摄动加速度（去二体，ECI，m/s²）：J234+阻力(κ)+三体+SH(θ)");
+
+     m.def("setThirdBody", [](bool on){ setThirdBody(on); }, py::arg("on"),
+           "三体（日/月）确定性摄动开关");
+     m.def("setPropEpoch", [](double mjd0){ setPropEpoch(mjd0); }, py::arg("mjd0"),
+           "传播起点绝对历元（MJD）");
+
      m.def("GM_Earth", []()
            { return osculating::MU; });
 
@@ -102,6 +112,8 @@ PYBIND11_MODULE(qoe, m)
               Propagated state vector (6x1).
           )pbdoc");
      m.def("rv2OEOsc", &osculating::rv2OEOsc);
+     m.def("oe2eciPos", &osculating::oe2eciPos, py::arg("OE"), py::arg("MaxIt") = 100, py::arg("eps") = 1e-5,
+           "快速 qoe→ECI 位置（与 OEOsc2rv 的 PQW→ECI 公式逐位一致）");
      m.def("OEOsc2rv", &osculating::OEOsc2rv,py::arg("ICSc"), py::arg("MaxIt"), py::arg("eps"),
       R"pbdoc(
             使用 OEOsc2rv 函数计算位置-速度向量 x。
@@ -262,6 +274,21 @@ PYBIND11_MODULE(qoe, m)
                整星座 J234+阻力 double 批传播（线程安全、OpenMP、释放 GIL）。
                Returns: (xf, sens)，sens=∂x_f/∂κ（有限差分）。
           )pbdoc");
+       // 多历元阻力灵敏度：每星一次连续积分、各 tfs 输出 xf 与 ∂x/∂κ（展平 [N,K,6]）。
+       m.def("daJ234DragMultiEpochBatch", [](const std::vector<Vector6d> &rv0s,
+                                            const std::vector<double> &kappas,
+                                            const std::vector<double> &tfs,
+                                            double step, double dk, int nthreads){
+             std::vector<double> xf, sens;
+             { py::gil_scoped_release release;
+               daJ234DragMultiEpochBatch(rv0s, kappas, tfs, step, dk, nthreads, xf, sens); }
+             return py::make_tuple(xf, sens);
+       }, py::arg("rv0s"), py::arg("kappas"), py::arg("tfs"), py::arg("step")=10.0,
+          py::arg("dk")=1e-4, py::arg("nthreads")=0,
+          R"pbdoc(
+               多历元阻力灵敏度：每星一次连续积分，在 tfs 各时间历元输出 xf 与 sens=∂x/∂κ。
+               返回展平列表 (xf, sens)，索引 [i*K*6 + k*6 + c]。
+          )pbdoc");
        // 整星座批传播（线程安全 double + OpenMP，释放 GIL）：位置相关残差场（RBF/SH），
        // 返回 (xf, Jt=∂x/∂θ [N,6,m], Jx=∂x/∂x0 [N,6,6])。场参数由入参设定。
        m.def("daFieldBatchDRBF", [](const std::vector<Vector6d> &rv0s,
@@ -297,6 +324,19 @@ PYBIND11_MODULE(qoe, m)
             return py::make_tuple(xf, Jt, Jx);
        }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"), py::arg("tfs"),
           py::arg("step")=10.0, py::arg("dk")=1e-4, py::arg("nthreads")=0);
+
+       m.def("daFieldMultiEpochBatchDSH2", [](const std::vector<Vector6d> &rv0s,
+                                             const std::vector<double> &thetas, int lmax,
+                                             const std::vector<double> &tfs, double step,
+                                             int nthreads){
+            setSHParams(lmax);
+            std::vector<double> xf, Jt, Jx, Hess;
+            { py::gil_scoped_release release;
+              daFieldMultiEpochBatchDA2(rv0s, thetas, tfs, 2, step, nthreads, xf, Jt, Jx, Hess); }
+            return py::make_tuple(xf, Jt, Jx, Hess);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"), py::arg("tfs"),
+          py::arg("step")=10.0, py::arg("nthreads")=0,
+          "解析批量多历元 order=2：返回 (xf, Jt, Jx, Hess[...,36])。");
 
        m.def("daFieldMultiEpochBatchDRBF", [](const std::vector<Vector6d> &rv0s,
                                               const std::vector<double> &thetas,
@@ -497,6 +537,16 @@ PYBIND11_MODULE(qoe, m)
        }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"),
           py::arg("tfs"), py::arg("step")=10.0, py::arg("nthreads")=0,
           "批量并行解析变分（SH）：返回 (xf[N*K*6](m), Jt[N*K*6*m], Jx[N*K*6*6])。");
+       m.def("daVarMultiEpochBatchPSKC", [](const std::vector<Vector6d> &rv0s,
+                                            const std::vector<double> &thetas, int lmax,
+                                            const std::vector<double> &tfs, double step, int nthreads){
+            setSHParams(lmax);
+            std::vector<double> xf, Jt, Jx, Jk;
+            daVarMultiEpochBatchPSKC(rv0s, thetas, lmax, tfs, step, nthreads, xf, Jt, Jx, Jk);
+            return py::make_tuple(xf, Jt, Jx, Jk);
+       }, py::arg("rv0s"), py::arg("thetas"), py::arg("lmax"),
+          py::arg("tfs"), py::arg("step")=10.0, py::arg("nthreads")=0,
+          "批量解析变分 + 解析 κ：返回 (xf[N*K*6], Jt[N*K*6*m]=∂x/∂θ, Jx[N*K*6*6]=∂x/∂x0, Jk[N*K*6]=∂x/∂κ)。");
        m.def("daRecordFlowBackward", [](const RecordFlow &rf, const std::vector<double> &grad){
             Vector6d gx; std::vector<double> gp;
             daRecordFlowBackward(rf, grad, gx, gp);

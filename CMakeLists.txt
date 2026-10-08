@@ -87,3 +87,10 @@ set_target_properties(dastate PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
 add_executable(test src/test.cpp src/kepler.cpp src/elements.cpp src/integrater.cpp)
 target_link_libraries(test dastate)
 set_target_properties(test PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
+
+# --- gtest：qoe 变换等价性/长期传播/三体（直接运行 build/gtest_qoe；未用 CTest 以免与 target `test` 冲突）---
+find_package(GTest REQUIRED)
+add_executable(gtest_qoe test/test_qoe_gtest.cpp src/kepler.cpp src/elements.cpp src/integrater.cpp)
+target_link_libraries(gtest_qoe dastate GTest::gtest GTest::gtest_main)
+target_link_libraries(gtest_qoe dace::dace OpenMP::OpenMP_CXX)
+set_target_properties(gtest_qoe PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")

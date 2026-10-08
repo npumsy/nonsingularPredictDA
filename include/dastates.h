@@ -19,9 +19,9 @@ namespace bddd{
     const double MU = 3.986004415e14;  // Gravitational parameter (m^3/s^2)
     const double RE = 6378.137e3;      // Earth's radius (m)
     const double J2 = 1082.626690598e-6;    // J2 harmonic
-    const double J3 = 2.532435345754e-6 ;    // J3 harmonic
+    const double J3 = -2.532435345754e-6 ;   // J3 harmonic（doc/HG-iod.md l89-109 取负号）
     // const double J3 = 0 ;    // J3 harmonic
-    const double J4 = 1.619331205072e-6 ;    // J4 harmonic
+    const double J4 = -1.619331205072e-6 ;   // J4 harmonic（doc/HG-iod.md l89-109 取负号）
     // const double J4 = 0 ;    // J4 harmonic
     const double epsilon = 3.35281317789691e-3;
     const double OMEGA_EARTH = 7.2921159e-5; // 地球自转角速度，单位为rad/s
@@ -52,7 +52,7 @@ Vector6d daJ234DragAugCoeffs(const Vector6d &rv0, double kappa0, double tf,
                              std::vector<double> &coeffs,
                              std::vector<std::vector<unsigned int>> &mons);
 
-// 整星座批处理（线程安全，无 DACE）：每星 2 次 double 传播（κ、κ+dk），FD 出 ∂x_f/∂κ。
+// 整星座批处理：**解析**（κ 进 DA 第 7 变量）出 x_f 与 ∂x_f/∂κ（非 FD；`dk` 忽略）。
 // kappas 长度 1（广播）或 N（每星一个）。返回终端状态 xf；sens 写入 ∂x_f/∂κ。
 // nthreads<=0 用默认线程数。可 OpenMP 并行。
 // 批 double 位置相关残差力场传播（场参数由 setRBFParams/setSHParams 设定）；返回 xf，
@@ -78,10 +78,26 @@ void daVarMultiEpochBatchP(const std::vector<Vector6d> &rv0s,
                            const std::vector<double> &thetas,
                            const std::vector<double> &tfs, double step, int nthreads,
                            std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx);
+
+// 批量解析变分 + **κ 列（解析，非 FD）**：xf(N*K*6)、Jt(N*K*6*m)=∂x/∂θ、Jx(N*K*6*6)=∂x/∂x0、Jk(N*K*6)=∂x/∂κ。
+// κ 走变分增广（dK/dt=A·K+Fκ，Fκ=名义阻力），θ 不进 DA。场参数由 setSHParams 预设。nthreads<=0 默认。
+void daVarMultiEpochBatchPSKC(const std::vector<Vector6d> &rv0s,
+                              const std::vector<double> &thetas, int lmax,
+                              const std::vector<double> &tfs, double step, int nthreads,
+                              std::vector<double> &xf, std::vector<double> &Jt,
+                              std::vector<double> &Jx, std::vector<double> &Jk);
 std::vector<Vector6d> daJ234DragBatchD(const std::vector<Vector6d> &rv0s,
                                        const std::vector<double> &kappas,
                                        double tf, double step, double dk,
                                        std::vector<Vector6d> &sens, int nthreads);
+
+// 多历元阻力灵敏度：每星**一次连续积分**，各历元输出 xf 与 **解析** ∂x/∂κ（κ 进 DA 线性系数，非 FD）。
+// xf/sens 展平为 [i*K*6 + k*6 + c]（i=星、k=历元、c=状态分量）。线程安全、OpenMP、释放 GIL。
+void daJ234DragMultiEpochBatch(const std::vector<Vector6d> &rv0s,
+                               const std::vector<double> &kappas,
+                               const std::vector<double> &tfs,
+                               double step, double dk, int nthreads,
+                               std::vector<double> &xf, std::vector<double> &sens);
 
 // 通用增广状态版：x = [r(3), v(3), theta(1..m)]，每个 theta_k 都是阻力项的独立乘性因子
 // （如大气密度倍率、阻力系数 Cd、面质比 A/m），RK4 时 theta_k' = 0。
@@ -122,6 +138,10 @@ Vector6d daAugSHCoeffs(const Vector6d &rv0, const std::vector<double> &thetas,
 void setRBFParams(const std::vector<std::array<double,3>> &centers, double s);
 void setSHParams(int lmax);
 
+// 三体（日/月）确定性摄动开关 + 传播起点绝对历元（MJD）。开启后 forceAccel/TBPfull 内叠加日月第三体。
+void setThirdBody(bool on);
+void setPropEpoch(double mjd0);
+
 // 多历元一阶可微算子：一次积分到各 tf，取状态与一阶 Jacobian [∂x/∂x0 (6) | ∂x/∂θ (m)]。
 // 只需 order=1（对 m 线性，无二项式爆炸），供 PyTorch 训练一次前向、backward 仅做矩阵乘。
 // rvf[k] : 第 k 个历元末态（m）；Jflat 按 [k][输出 i][列 (6+m)] 行主序（∂x_f(m)/∂x0(m)、∂x_f(m)/∂θ）。
@@ -147,6 +167,14 @@ void daFieldMultiEpochBatchDA(const std::vector<Vector6d> &rv0s,
                               const std::vector<double> &tfs, int order, double step, int nthreads,
                               std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx);
 
+// 同 daFieldMultiEpochBatchDA，但额外输出**二阶 Hessian**（对 x0，N=6 部分；order 须≥2）。
+// Hess 排布 (N*K*6, 36)：[(i*K+k)*6+c]*36 + a*6+b = ∂²x_c/∂δ_a∂δ_b（归一化单位、对称）。
+void daFieldMultiEpochBatchDA2(const std::vector<Vector6d> &rv0s,
+                               const std::vector<double> &thetas,
+                               const std::vector<double> &tfs, int order, double step, int nthreads,
+                               std::vector<double> &xf, std::vector<double> &Jt, std::vector<double> &Jx,
+                               std::vector<double> &Hess);
+
 // 变分灵敏度多历元算子：DA 只作用于状态（N=6）求 A=∂f/∂x；积分增广 [x, Φ=∂x/∂x0, S=∂x/∂θ]，
 // θ **不进 DA**，代价对 m 线性。一次前向到各 tf；Jflat 同 daFieldMultiEpoch 排布。
 void daVarMultiEpoch(const Vector6d &rv0_m, const std::vector<double> &thetas,
@@ -155,6 +183,9 @@ void daVarMultiEpoch(const Vector6d &rv0_m, const std::vector<double> &thetas,
 
 // 残差加速度 a_res(r;θ)（m/s^2，前 3 维）——供 fieldBasisJacobian 的 FD 自检。
 Vector6d fieldResidualAccel(const Vector6d &rv_m, const std::vector<double> &thetas);
+
+// 摄动加速度（去二体，ECI，m/s²）：J234 + 阻力(乘 κ) + 三体(若开) + SH(θ)。供非奇异要素 Gauss 变分方程。
+Vector6d pertAccelECI(const Vector6d &rv_m, double kappa, const std::vector<double> &thetas, int lmax);
 
 // ∂b_k/∂x（6x6，每个 k）——A_{,θ_k} = ∂²f/∂x∂θ_k（力场基对状态的 Jacobian）。
 // 力场由 setRBFParams/setSHParams 设定；dBdx 长度 m*36，排布 [k][i*6+j]。
