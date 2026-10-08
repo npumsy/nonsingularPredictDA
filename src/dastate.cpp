@@ -333,7 +333,7 @@ AlgebraicVector<T> gveRhsQOE(AlgebraicVector<T> OE, double t, double arg1){
     // dM 的系数是经典 GVE 的 b/(a h e)（b = a√(1−e²)），即 √(1−e²)/(h e)——**不是** 1/(h e)：
     // 少了 √(1−e²) 会让 u = M + ω 与笛卡尔同物理差 ~e²·n（实测 1/4T 9 m → 修正后 0 m，见 test_qoe_gtest.cpp）。
     const T fM  = sqrt(atLeast(1 - e * e, 0.0)) / (h * ef);
-    const T dM  = sqrt(MU / (a * a * a)) + fM * ((p * cnu - 2 * r * e) * aR - (p + r) * snu * aT);
+    const T dM  = sqrt(MU / atLeast((T)(a * a * a), 1e-6)) + fM * ((p * cnu - 2 * r * e) * aR - (p + r) * snu * aT);
     AlgebraicVector<T> out(6);
     out[0] = da;
     out[1] = dM + dw;                                  // u = M + ω
@@ -800,6 +800,36 @@ void stateTransferBatch(const std::vector<Vector6d> &rv0s, double dt, int nthrea
         for(int c=0;c<6;c++) xf[(std::size_t)i](c) = rv2[c]*1e3;
         for(int a=0;a<6;a++) for(int b=0;b<6;b++)
             Phi[(std::size_t)i*36 + 6*a + b] = P(a,b);
+    }
+}
+
+// 解析两体 STM 折叠（一次算完整弧）：A[f] = (Φ_rv(t_f)·A0)[0:3, :]。
+// rv0s: n×6 (m,m/s)；dts: nfr 个飞行时间/s；A0flat: n×36（行主序，∂rv0/∂oe0）；Aout: nfr×n×18。
+void stateStmFoldBatch(const std::vector<Vector6d> &rv0s, const std::vector<double> &dts,
+                       const std::vector<double> &A0flat, int nthreads, std::vector<double> &Aout){
+    const std::size_t n = rv0s.size(), nf = dts.size();
+    Aout.assign(nf*n*18, 0.0);
+    const double mu_km = bddd::MU/1e9;
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long i=0;i<(long long)n;i++){
+        const Vector6d &rv = rv0s[(std::size_t)i];
+        Eigen::Vector3d p0(rv[0]/1e3, rv[1]/1e3, rv[2]/1e3);
+        Eigen::Vector3d v0(rv[3]/1e3, rv[4]/1e3, rv[5]/1e3);
+        Eigen::Matrix<double,6,6> A0i;
+        for(int a=0;a<6;a++) for(int b=0;b<6;b++) A0i(a,b) = A0flat[(std::size_t)i*36 + 6*a + b];
+        for(std::size_t f=0; f<nf; ++f){
+            Eigen::Matrix<double,6,6> P = Eigen::Matrix<double,6,6>::Identity();
+            if(dts[f] != 0.0){
+                kep3::Vector6d rv2 = kep3::propagate_lagrangian(p0, v0, dts[f], mu_km, true, P);
+                if(!rv2.allFinite() || !P.allFinite()) P = Eigen::Matrix<double,6,6>::Identity();
+            }
+            Eigen::Matrix<double,6,6> M = P * A0i;
+            double* o = &Aout[((std::size_t)f*n + (std::size_t)i)*18];
+            for(int a=0;a<3;a++) for(int b=0;b<6;b++) o[6*a+b] = M(a,b);
+        }
     }
 }
 

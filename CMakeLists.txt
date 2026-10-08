@@ -8,6 +8,12 @@ cmake_minimum_required(VERSION 3.8.0)
 # Set project name
 project(qoe)
 
+# Enable CUDA（GVE 单步 3/8-RK4 核，见 src/gve_step.cu；对整星座 N 并行）
+enable_language(CUDA)
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_ARCHITECTURES 120)   # RTX 5070 (Blackwell, sm_120)
+find_package(CUDAToolkit REQUIRED)
+
 # Set  C++ standard version
 set(CMAKE_CXX_STANDARD 17)
 include_directories(/usr/include/eigen3)
@@ -55,7 +61,7 @@ endif()
 #     ${PROJECT_SOURCE_DIR}/src/kepler.cpp
 #     ${PROJECT_SOURCE_DIR}/src/main.cpp
 #     SRC_LIST)
-set(SRC_LIST src/elements.cpp src/integrater.cpp src/kepler.cpp src/dastate.cpp src/main.cpp)
+set(SRC_LIST src/elements.cpp src/integrater.cpp src/kepler.cpp src/dastate.cpp src/main.cpp src/gve_step.cu)
 
 # Set Include h file path
 list(APPEND PYLIB_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/include)
@@ -72,8 +78,8 @@ set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/build)
 
 # Add pybind11 module
 pybind11_add_module(${PROJECT_NAME} ${SRC_LIST})
-# 链接 dace 库与 OpenMP 到 qoe 模块
-target_link_libraries(${PROJECT_NAME} PRIVATE dace::dace OpenMP::OpenMP_CXX)
+# 链接 dace 库、OpenMP 与 CUDA runtime 到 qoe 模块
+target_link_libraries(${PROJECT_NAME} PRIVATE dace::dace OpenMP::OpenMP_CXX CUDA::cudart)
 set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
 # 设置编译目标
 # add_executable(da src/dastate.cpp)

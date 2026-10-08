@@ -16,6 +16,9 @@
 #include <pybind11/chrono.h>
 #include <pybind11/eigen.h>
 
+#include <cstring>
+#include <stdexcept>
+#include <string>
 #include "elements.h"
 #include "kepler.h"
 #include "integrater.h"
@@ -111,6 +114,12 @@ PYBIND11_MODULE(qoe, m)
           numpy.ndarray
               Propagated state vector (6x1).
           )pbdoc");
+     m.def("gveStepNoeBatch", [](const std::vector<kep3::Vector6d> &oe0s, double t0, double dt,
+                                 int nthreads, double beta){
+            std::vector<kep3::Vector6d> oef;
+            { py::gil_scoped_release release; kep3::gveStepNoeBatch(oe0s, t0, dt, nthreads, beta, oef); }
+            return oef;
+         }, py::arg("oe0s"), py::arg("t0"), py::arg("dt"), py::arg("nthreads") = 16, py::arg("beta") = 1.0);
      m.def("rv2OEOsc", &osculating::rv2OEOsc);
      m.def("oe2eciPos", &osculating::oe2eciPos, py::arg("OE"), py::arg("MaxIt") = 100, py::arg("eps") = 1e-5,
            "快速 qoe→ECI 位置（与 OEOsc2rv 的 PQW→ECI 公式逐位一致）");
@@ -242,6 +251,152 @@ PYBIND11_MODULE(qoe, m)
             return OE;
             }, py::arg("rvs"), py::arg("nthreads")=16,
             "批量 rv→非奇异要素（展平 n×6，行主序）");
+
+      // ---- 快速 numpy 入口（避免逐星 std::vector<Vector6d> 的 Python/pybind 转换开销）----
+      auto _v6_from_np = [](py::array_t<double, py::array::c_style | py::array::forcecast> a,
+                            const char *what){
+            auto buf = a.request();
+            if(buf.ndim != 2 || buf.shape[1] != 6)
+                throw std::runtime_error(std::string(what) + " 需 (n,6) float64 数组");
+            const std::size_t n = (std::size_t)buf.shape[0];
+            std::vector<Vector6d> v(n);
+            const double *p = static_cast<const double *>(buf.ptr);
+            for(std::size_t i = 0; i < n; ++i)
+                for(int c = 0; c < 6; ++c) v[i](c) = p[i*6 + c];
+            return v;
+      };
+      m.def("stateTransferBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> x, double dt, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(x, "stateTransferBatchFlat");
+            std::vector<Vector6d> xf; std::vector<double> Phi;
+            { py::gil_scoped_release release; stateTransferBatch(v, dt, nthreads, xf, Phi); }
+            const std::size_t n = v.size();
+            py::array_t<double> XF({n, (std::size_t)6}), PH({n, (std::size_t)36});
+            double *px = XF.mutable_data(), *pp = PH.mutable_data();
+            for(std::size_t i = 0; i < n; ++i){
+                for(int c = 0; c < 6; ++c) px[i*6 + c] = xf[i](c);
+                for(int c = 0; c < 36; ++c) pp[i*36 + c] = Phi[i*36 + c];
+            }
+            return py::make_tuple(XF, PH);
+            }, py::arg("x"), py::arg("dt"), py::arg("nthreads")=16,
+            "批量单步（全动力学状态 + 解析二体 STM）：(n,6) numpy → ((n,6),(n,36))");
+      m.def("noeOsc2rvBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "noeOsc2rvBatchFlat");
+            std::vector<double> RV;
+            { py::gil_scoped_release release; noeOsc2rvBatch(v, nthreads, RV); }
+            const std::size_t n = v.size();
+            py::array_t<double> O({n, (std::size_t)6});
+            std::memcpy(O.mutable_data(), RV.data(), n*6*sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("nthreads")=16, "批量 QOE→rv（(n,6) numpy）");
+      m.def("noeOsc2rvJacBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "noeOsc2rvJacBatchFlat");
+            std::vector<double> J;
+            { py::gil_scoped_release release; noeOsc2rvJacBatch(v, nthreads, J); }
+            const std::size_t n = v.size();
+            py::array_t<double> JJ({n, (std::size_t)6, (std::size_t)6});
+            std::memcpy(JJ.mutable_data(), J.data(), n*36*sizeof(double));
+            return JJ;
+            }, py::arg("oe"), py::arg("nthreads")=16, "批量 ∂(r,v)/∂oe（(n,6,6) numpy）");
+      m.def("gveStepNoeBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, double t0, double dt,
+                int nthreads, double beta){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveStepNoeBatchFlat");
+            std::vector<Vector6d> of;
+            { py::gil_scoped_release release; kep3::gveStepNoeBatch(v, t0, dt, nthreads, beta, of); }
+            const std::size_t n = v.size();
+            py::array_t<double> O({n, (std::size_t)6});
+            double *p = O.mutable_data();
+            for(std::size_t i = 0; i < n; ++i)
+                for(int c = 0; c < 6; ++c) p[i*6 + c] = of[i](c);
+            return O;
+            }, py::arg("oe"), py::arg("t0"), py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
+            "批量 GVE 单步 3/8-RK4（CUDA）：(n,6) numpy → (n,6) numpy");
+      m.def("gveGetTiming", &kep3::gveGetTiming,
+            "GVE 单步细粒度计时 [pack, h2d, kernel, d2h]（秒，累计）");
+      m.def("gveResetTiming", &kep3::gveResetTiming, "清零 GVE 单步细粒度计时");
+      m.def("gvePropagateNoeBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nfr,
+                double dt, int nthreads, double beta){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gvePropagateNoeBatchFlat");
+            const int n = (int)v.size();
+            std::vector<double> rv_all;
+            { py::gil_scoped_release release; kep3::gvePropagateNoeBatch(v, nfr, dt, nthreads, beta, rv_all); }
+            py::array_t<double> O({(std::size_t)nfr, (std::size_t)n, (std::size_t)6});
+            std::memcpy(O.mutable_data(), rv_all.data(), rv_all.size()*sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("nfr"), py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
+            "整弧多帧 GVE（CUDA）：(n,6) → rv (nfr,n,6)");
+      m.def("stmFoldGpuFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv0, int nfr, double dt,
+                py::array_t<double, py::array::c_style | py::array::forcecast> A0, int nthreads){
+            auto b0 = rv0.request(); auto ba = A0.request();
+            if(b0.ndim != 2 || b0.shape[1] != 6) throw std::runtime_error("rv0 需 (n,6)");
+            if(ba.ndim != 2 || ba.shape[1] != 36) throw std::runtime_error("A0 需 (n,36)");
+            const std::size_t n = (std::size_t)b0.shape[0];
+            const double *p0 = static_cast<const double *>(b0.ptr);
+            std::vector<Vector6d> rv(n);
+            for(std::size_t i = 0; i < n; ++i)
+                for(int c = 0; c < 6; ++c) rv[i](c) = p0[i*6 + c];
+            std::vector<double> a0(n*36);
+            std::memcpy(a0.data(), ba.ptr, n*36*sizeof(double));
+            std::vector<double> out;
+            { py::gil_scoped_release release; kep3::stmFoldGpuBatch(rv, nfr, dt, a0, nthreads, out); }
+            py::array_t<double> O({(std::size_t)nfr, n, (std::size_t)3, (std::size_t)6});
+            std::memcpy(O.mutable_data(), out.data(), out.size()*sizeof(double));
+            return O;
+            }, py::arg("rv0"), py::arg("nfr"), py::arg("dt"), py::arg("A0"), py::arg("nthreads")=16,
+            "解析两体 STM 折叠（GPU）：(n,6),nfr,dt,(n,36) → A (nfr,n,3,6)");
+      m.def("cartStepBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> x, double dt,
+                int nthreads, double beta){
+            std::vector<Vector6d> v = _v6_from_np(x, "cartStepBatchFlat");
+            std::vector<Vector6d> of;
+            { py::gil_scoped_release release; kep3::cartStepBatch(v, dt, nthreads, beta, of); }
+            py::array_t<double> O({v.size(), (std::size_t)6});
+            double *p = O.mutable_data();
+            for(std::size_t i = 0; i < v.size(); ++i)
+                for(int c = 0; c < 6; ++c) p[i*6 + c] = of[i](c);
+            return O;
+            }, py::arg("x"), py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
+            "笛卡尔全动力学单步 3/8-RK4（CUDA）：(n,6) → (n,6)");
+      m.def("cartPropagateBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> x, int nfr, double dt,
+                int nthreads, double beta){
+            std::vector<Vector6d> v = _v6_from_np(x, "cartPropagateBatchFlat");
+            const int n = (int)v.size();
+            std::vector<double> x_all;
+            { py::gil_scoped_release release; kep3::cartPropagateBatch(v, nfr, dt, nthreads, beta, x_all); }
+            py::array_t<double> O({(std::size_t)nfr, (std::size_t)n, (std::size_t)6});
+            std::memcpy(O.mutable_data(), x_all.data(), x_all.size()*sizeof(double));
+            return O;
+            }, py::arg("x"), py::arg("nfr"), py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
+            "笛卡尔全动力学整弧多帧（CUDA）：(n,6) → (nfr,n,6)");
+      m.def("stateStmFoldFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv0,
+                py::array_t<double, py::array::c_style | py::array::forcecast> dts,
+                py::array_t<double, py::array::c_style | py::array::forcecast> A0, int nthreads){
+            auto b0 = rv0.request(); auto bd = dts.request(); auto ba = A0.request();
+            if(b0.ndim != 2 || b0.shape[1] != 6) throw std::runtime_error("rv0 需 (n,6)");
+            if(ba.ndim != 2 || ba.shape[1] != 36) throw std::runtime_error("A0 需 (n,36)");
+            const std::size_t n = (std::size_t)b0.shape[0], nf = (std::size_t)bd.shape[0];
+            const double *p0 = static_cast<const double *>(b0.ptr);
+            std::vector<Vector6d> rv(n);
+            for(std::size_t i = 0; i < n; ++i)
+                for(int c = 0; c < 6; ++c) rv[i](c) = p0[i*6 + c];
+            std::vector<double> dtv(nf);
+            std::memcpy(dtv.data(), bd.ptr, nf*sizeof(double));
+            std::vector<double> a0(n*36);
+            std::memcpy(a0.data(), ba.ptr, n*36*sizeof(double));
+            std::vector<double> out;
+            { py::gil_scoped_release release; stateStmFoldBatch(rv, dtv, a0, nthreads, out); }
+            py::array_t<double> O({nf, n, (std::size_t)3, (std::size_t)6});
+            std::memcpy(O.mutable_data(), out.data(), out.size()*sizeof(double));
+            return O;
+            }, py::arg("rv0"), py::arg("dts"), py::arg("A0"), py::arg("nthreads")=16,
+            "解析两体 STM 折叠：(n,6),(nfr,),(n,36) → A (nfr,n,3,6)");
       py::class_<NominalErrorPropNOE>(m, "NominalErrorPropNOE")
             .def(py::init<const Vector6d&, int>(), py::arg("oe0"), py::arg("order")=1, R"pbdoc(
                   构造函数：非奇异要素 (a[m], u=M+ω, ex, ey, i, Ω[rad]) 的一阶 DA 误差传播（GVE 递推）。

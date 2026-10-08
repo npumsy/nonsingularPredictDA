@@ -2,6 +2,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <iostream>
+#include <vector>
 #include <Eigen/Dense>
 #include "kepler.h"
 #include "elements.h"

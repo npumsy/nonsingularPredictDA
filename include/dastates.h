@@ -105,6 +105,10 @@ void daJ234DragMultiEpochBatch(const std::vector<Vector6d> &rv0s,
 void stateTransferBatch(const std::vector<Vector6d> &rv0s, double dt, int nthreads,
                         std::vector<Vector6d> &xf, std::vector<double> &Phi);
 
+// 解析两体 STM 折叠（一次算完整弧）：A[f] = (Φ_rv(t_f)·A0)[0:3, :]；Aout 展平 nfr*n*18。
+void stateStmFoldBatch(const std::vector<Vector6d> &rv0s, const std::vector<double> &dts,
+                       const std::vector<double> &A0flat, int nthreads, std::vector<double> &Aout);
+
 // 通用增广状态版：x = [r(3), v(3), theta(1..m)]，每个 theta_k 都是阻力项的独立乘性因子
 // （如大气密度倍率、阻力系数 Cd、面质比 A/m），RK4 时 theta_k' = 0。
 // 用于多参数（较大 m）的可微 Learning：pybind 接口 daAugCoeffs 暴露。

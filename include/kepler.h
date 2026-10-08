@@ -1,4 +1,5 @@
 #include <functional>
+#include <vector>
 #include <Eigen/Dense>
 // #define BOOST_MATH_INSTRUMENT true
 
@@ -96,6 +97,30 @@ Vector6d propagate_lagrangian(
     const Vector3d &pos0, const Vector3d &vel0, 
     const double tof, const double mu, bool stm,
     Eigen::Ref<Eigen::Matrix<double, 6, 6>> Phi0f);
+
+// 批量并行 GVE 单步 3/8-RK4（CUDA，无 DA/DACE，对整星座 N 并行；实现见 src/gve_step.cu）：
+// oe0s (n×6, a[m]/rad) --t0,t0+dt--> oef。t0 = 相对弧起点的积分起点/s（RHS 自治，现未尝）；
+// 用于内环 single-shooting 的逐帧状态推进（STM 另用解析两体，见 run_filter_ekf.py）。
+void gveStepNoeBatch(const std::vector<Vector6d> &oe0s, double t0, double dt, int nthreads,
+                     double beta, std::vector<Vector6d> &oef);
+
+// gveStepNoeBatch 的细粒度计时（秒）：[pack, h2d, kernel, d2h]（累计；重置见 gveResetTiming）。
+void gveResetTiming();
+std::vector<double> gveGetTiming();
+
+// 整弧多帧 GVE（CUDA）：每星线程链式 nfr-1 次单步，输出每帧 rv（平铺 nfr*n*6，[f][i][6]）。
+void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt, int nthreads,
+                          double beta, std::vector<double> &rv_all);
+
+// 解析两体 STM 折叠（GPU）：rv0(n,6) + A0(n,36) → A（平铺 nfr*n*18，[f][i][3×6]，A_f=(Φ_f·A0)[0:3]）。
+void stmFoldGpuBatch(const std::vector<Vector6d> &rv0s, int nfr, double dt,
+                     const std::vector<double> &A0flat, int nthreads, std::vector<double> &A_all);
+
+// 笛卡尔 ECI 全动力学 RK4（GPU，对比 qoe-GVE）：单步 / 整弧多帧。state=(x,y,z,vx,vy,vz) m/m·s⁻¹。
+void cartStepBatch(const std::vector<Vector6d> &x0s, double dt, int nthreads, double beta,
+                   std::vector<Vector6d> &xf);
+void cartPropagateBatch(const std::vector<Vector6d> &x0s, int nfr, double dt, int nthreads,
+                        double beta, std::vector<double> &x_all);
 
 template <class F, class T>
 T newton_raphson_iterate(F f, T guess, T min, T max, int digits, uint& max_iter);
