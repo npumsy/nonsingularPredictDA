@@ -213,11 +213,11 @@ TEST(Var, KappaSensitivity_AnalyticVsVariational) {
     Vector6d rv0;
     rv0 << osculating::OEOsc2rv(sample_oe()[0], 100, 1e-12).head<6>();
     std::vector<Vector6d> rv0s = {rv0};
-    std::vector<double> tfs = {600.0, 1440.0};
+    std::vector<double> tfs = {-720.0, 600.0, 1440.0};   // 含**负**（反向）历元
     std::vector<double> xf, Jt, Jx, Jk, xf2, sens;
     daVarMultiEpochBatchPSKC(rv0s, {}, 0, tfs, 10.0, 1, xf, Jt, Jx, Jk);
     daJ234DragMultiEpochBatch(rv0s, {1.0}, tfs, 10.0, 0.0, 1, xf2, sens);   // 解析
-    for (int k = 0; k < 2; ++k) {
+    for (int k = 0; k < 3; ++k) {
         Vector6d a = Eigen::Map<Vector6d>(&Jk[k * 6]);     // 变分解析 ∂x/∂κ (m)
         Vector6d b = Eigen::Map<Vector6d>(&sens[k * 6]);   // DA-N7 解析 ∂x/∂κ (m)
         EXPECT_LT((a - b).norm(), 1e-6 * std::max(1.0, b.norm()));
@@ -225,6 +225,118 @@ TEST(Var, KappaSensitivity_AnalyticVsVariational) {
         Vector6d xb = Eigen::Map<Vector6d>(&xf2[k * 6]);
         EXPECT_LT((xa - xb).norm(), 1e-6);
     }
+}
+
+// ---------------------------------------------------------------------------
+// 正向/反向 RK4：简单模型（谐振子 + 时间显含）验证。论点：ODE 正/反向无区别，
+// 反向 == rk4 取负时间步；现成 `rk4b` 与 `rk4(t1<0)` 等价（自治时），且其时间标签须正确。
+// ---------------------------------------------------------------------------
+namespace {
+// 谐振子：d p/dt = v, d v/dt = -w2 p（自治，解析解已知）
+Vector6d f_harmonic(Vector6d x, double /*t*/, double w2) {
+    Vector6d dx;
+    dx.head<3>() = x.tail<3>();
+    dx.tail<3>() = -w2 * x.head<3>();
+    return dx;
+}
+// 时间显含：dx/dt = a·t（解析 x(t)=x0 + a t^2/2），用于暴露反向时间标签错误
+Vector6d f_ramp(Vector6d /*x*/, double t, double a) { return Vector6d::Constant(a * t); }
+}  // namespace
+
+TEST(Backward, Rk4_SignedTime_Harmonic_ForwardBackwardRoundtrip) {
+    Vector6d x0; x0 << 1000.0, 0.0, 0.0, 0.5, 0.0, 0.0;
+    const double w2 = 1e-6, w = 1e-3, T = 1440.0, h = 10.0;
+    Vector6d xf = rk4<Vector6d>(x0, 0.0, T, f_harmonic, w2, h);    // 正向
+    Vector6d xb = rk4<Vector6d>(x0, 0.0, -T, f_harmonic, w2, h);   // 反向（负时间步）
+    auto pos = [&](double t) { return x0(0) * std::cos(w * t) + x0(3) / w * std::sin(w * t); };
+    EXPECT_LT(std::fabs(xf(0) - pos(T)), 1e-4);
+    EXPECT_LT(std::fabs(xb(0) - pos(-T)), 1e-4);
+    Vector6d back = rk4<Vector6d>(xf, 0.0, -T, f_harmonic, w2, h);  // 往返
+    EXPECT_LT((back - x0).norm(), 1e-6);
+}
+
+TEST(Backward, Rk4b_Equivalent_To_SignedRk4_Autonomous) {
+    Vector6d x0; x0 << 1000.0, 0.0, 0.0, 0.0, 0.5, 0.0;
+    const double w2 = 1e-6, T = 1440.0, h = 10.0;
+    Vector6d a = rk4b<Vector6d>(x0, 0.0, T, f_harmonic, w2, h);     // 现成 backwardProp
+    Vector6d b = rk4<Vector6d>(x0, 0.0, -T, f_harmonic, w2, h);     // 反向 signed rk4
+    EXPECT_LT((a - b).norm(), 1e-9);
+}
+
+TEST(Backward, Rk4b_TimeLabel_NonAutonomous) {
+    Vector6d x0 = Vector6d::Zero();
+    const double a = 2.0, T = 1440.0, h = 10.0;
+    Vector6d f = rk4<Vector6d>(x0, 0.0, T, f_ramp, a, h);           // 正向
+    Vector6d b = rk4<Vector6d>(x0, 0.0, -T, f_ramp, a, h);          // 反向
+    Vector6d c = rk4b<Vector6d>(x0, 0.0, T, f_ramp, a, h);          // 现成 backwardProp（时间标签）
+    const double exact = a * T * T / 2.0;                           // x(±T) = x0 + a T^2/2
+    EXPECT_LT(std::fabs(f(0) - exact), 1e-6);
+    EXPECT_LT(std::fabs(b(0) - exact), 1e-6);
+    EXPECT_LT(std::fabs(c(0) - exact), 1e-6);
+}
+
+// ---------------------------------------------------------------------------
+// 非奇异要素（QOE）GVE 误差传播 `NominalErrorPropNOE`：与**笛卡尔 DA 引擎**等价。
+// 论点：同物理（二体+J234+阻力）下，两条独立路径的终端状态在 RK4 截断级一致。
+// ---------------------------------------------------------------------------
+namespace {
+// 非奇异要素 → rv 的**模板版** `noeOsc2rv` 与既有 `OEOsc2rv` 必须逐位同（同一公式，rel ~1e-16）。
+void noeOsc2rv_matches_reference(const VectorXd &oe) {
+    Vector6d oe6; oe6 << oe(0), oe(1), oe(2), oe(3), oe(4), oe(5);
+    Vector6d a = noeOsc2rv(oe6, 200, 1e-13);
+    Vector6d b = osculating::OEOsc2rv(oe, 200, 1e-13).head<6>();
+    EXPECT_LT((a - b).norm() / std::max(b.norm(), 1.0), 1e-14);
+}
+}  // namespace
+
+TEST(NOE, Osc2rv_MatchesReference) {
+    for (const auto &oe : sample_oe()) noeOsc2rv_matches_reference(oe);
+}
+
+// 主断言：NOE（GVE 递推）终端状态 vs 笛卡尔 DA 引擎 `daJ234DragBatchD`（同物理）。
+TEST(NOE, GvePropagation_MatchesCartesianDA) {
+    const double step = 10.0;
+    for (const auto &oe : sample_oe()) {
+        if (std::hypot(oe(2), oe(3)) == 0.0) continue;   // e=0 时 ω 不定（GVE 口径退化），另测
+        Vector6d rv0 = osculating::OEOsc2rv(oe, 200, 1e-13).head<6>();
+        Vector6d oe0;   // 用 rv→要素的**引擎口径**（而非直接给 oe），消除两套要素约定的差
+        oe0 << osculating::rv2OEOsc(rv0).head<6>();
+
+        std::vector<Vector6d> sens;
+        std::vector<Vector6d> ref = daJ234DragBatchD({rv0}, {1.0}, 1440.0, step, 0.0, sens, 1);
+
+        NominalErrorPropNOE da(oe0, 1);
+        Eigen::Matrix<double, 6, 6> Phi = Eigen::Matrix<double, 6, 6>::Zero();
+        Vector6d oef = da.propNomJ234Drag(Phi, 1440.0, true, step);
+        Vector6d rvf = noeOsc2rv(oef, 200, 1e-13);
+        EXPECT_LT((rvf.head<3>() - ref[0].head<3>()).norm(), 0.02);      // 1/4T：实测 7 mm
+        EXPECT_LT((rvf.tail<3>() - ref[0].tail<3>()).norm(), 1e-4);      // 速度
+        EXPECT_TRUE(Phi.allFinite());   // Φ = ∂oe_f/∂oe_0；与笛卡尔 STM 的共轭关系 Φ ≈ D_f·Φ_cart·D_0^{-1}
+    }
+    // e≈0（圆轨）：ω 口径退化，位置仍应有限且与笛卡尔同物理（容差放宽）
+    Vector6d oe_c; oe_c << 6.93e6, 0.5, 2e-3 * std::cos(2.0), 2e-3 * std::sin(2.0), 1.1, 0.4;
+    Vector6d rv0 = osculating::OEOsc2rv(oe_c, 200, 1e-13).head<6>();
+    Vector6d oe0; oe0 << osculating::rv2OEOsc(rv0).head<6>();
+    std::vector<Vector6d> sens, ref = daJ234DragBatchD({rv0}, {1.0}, 1440.0, step, 0.0, sens, 1);
+    NominalErrorPropNOE da(oe0, 1);
+    Eigen::Matrix<double, 6, 6> Phi = Eigen::Matrix<double, 6, 6>::Zero();
+    Vector6d rvf = noeOsc2rv(da.propNomJ234Drag(Phi, 1440.0, true, step), 200, 1e-13);
+    EXPECT_TRUE(rvf.allFinite());
+    EXPECT_LT((rvf.head<3>() - ref[0].head<3>()).norm(), 0.02);
+}
+
+// 反向递推：由终端要素倒推回初始要素（同一动力学，往返应闭合在 RK4 截断级）。
+TEST(NOE, BackwardRoundtrip) {
+    Vector6d rv0 = osculating::OEOsc2rv(sample_oe()[1], 200, 1e-13).head<6>();
+    Vector6d oe0; oe0 << osculating::rv2OEOsc(rv0).head<6>();
+    NominalErrorPropNOE fwd(oe0, 1);
+    Eigen::Matrix<double, 6, 6> Pf = Eigen::Matrix<double, 6, 6>::Zero();
+    Vector6d oef = fwd.propNomJ234Drag(Pf, 1440.0, true, 2.0);
+    NominalErrorPropNOE bwd(oef, 1);
+    Eigen::Matrix<double, 6, 6> Pb = Eigen::Matrix<double, 6, 6>::Zero();
+    Vector6d back = bwd.bkpropNomJ234Drag(Pb, 1440.0, true, 2.0);
+    EXPECT_LT(std::fabs(back(0) - oe0(0)), 1e-3);       // 半长轴闭环（m）
+    EXPECT_LT((back - oe0).norm(), 1e-6);               // 全要素闭环
 }
 
 int main(int argc, char **argv) {

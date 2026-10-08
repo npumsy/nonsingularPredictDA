@@ -99,6 +99,12 @@ void daJ234DragMultiEpochBatch(const std::vector<Vector6d> &rv0s,
                                double step, double dk, int nthreads,
                                std::vector<double> &xf, std::vector<double> &sens);
 
+// C++ 批量单步 StateTransfer：**一步 3/8 RK4**（全 TBPfull 动力学：二体+J234+阻力）给 x(dt)；
+// STM 用**解析二体变分** A=∂f_two/∂x（沿同一步 RK4 积分，非 FD）。纯 double、OpenMP、释放 GIL。
+// 单位 m / m·s⁻¹；Phi 展平 [i*36 + 6*row + col]，无量纲。
+void stateTransferBatch(const std::vector<Vector6d> &rv0s, double dt, int nthreads,
+                        std::vector<Vector6d> &xf, std::vector<double> &Phi);
+
 // 通用增广状态版：x = [r(3), v(3), theta(1..m)]，每个 theta_k 都是阻力项的独立乘性因子
 // （如大气密度倍率、阻力系数 Cd、面质比 A/m），RK4 时 theta_k' = 0。
 // 用于多参数（较大 m）的可微 Learning：pybind 接口 daAugCoeffs 暴露。
@@ -256,8 +262,14 @@ class NominalErrorProp{
         AlgebraicVector<DA>  xf,x0,xp;
 };
 
+// 非奇异要素 (a, u=M+ω, e_x=e cosω, e_y=e sinω, i, Ω) 的一阶 DA 误差传播。
+// 状态口径：a 为 **m**，角度为 **rad**（与 `qoe` 其余入口一致；内部 rv 亦为 m）。
+// 递推方程 = 高斯变分方程（去二体摄动 a_R/a_T/a_N），摄动取 TBPfull（二体+J234+阻力，三体随全局开关），
+// 与 `script/core/da_engine.py::_gve_rhs` 同一组公式（dM 的系数取经典 GVE 的 √(1−e²)/(h e)）。
+// θ 不进（同 NominalErrorProp，纯 J234+阻力）。
+// 注：e ≈ 0 时 ω 不定，取 0（与 `osculating::OEOsc2rv` 同口径）；真实轨道 e~1e-3 不受影响。
 class NominalErrorPropNOE{
-    public: 
+    public:
         NominalErrorPropNOE(const Vector6d &oe0,int order=1);
         ~NominalErrorPropNOE();
         void updateX0(const Vector6d &oe0);
@@ -268,5 +280,20 @@ class NominalErrorPropNOE{
     private:
         AlgebraicVector<DA>  xf,x0,xp;
 };
+
+// 非奇异要素→rv（m, m/s）：与 `osculating::OEOsc2rv` **同一公式**（T=double 时 rel ~1e-15）。
+// 模板化是为让 GVE 的 DA 递推能对要素求导；此 double 实例供 gtest / Python 对拍。
+Vector6d noeOsc2rv(const Vector6d &oe, int MaxIt = 100, double epsl = 1e-12);
+// 高斯变分方程 RHS（非奇异要素 [a,u,ex,ey,i,Om]，m/rad）；beta 为阻力乘性因子（κ），t 为传播时间（三体）。
+Vector6d noeGveRhs(const Vector6d &oe, double beta = 1.0, double t = 0.0);
+// 批量并行 GVE 一步传播（EKF 用）：oe_f (n×6) 与 Phi=∂oe_f/∂oe_0 (n×36, 行主序)。
+void stateTransferGVEBatch(const std::vector<Vector6d> &oes, double tf, int nthreads,
+                           std::vector<Vector6d> &oef, std::vector<double> &Phi, double step = 10.0);
+// 批量并行 ∂(r,v)/∂oe（复用 DA 可微的 OEOsc2rvT），返回 n×36 行主序。
+void noeOsc2rvJacBatch(const std::vector<Vector6d> &oes, int nthreads, std::vector<double> &J);
+// 批量并行 非奇异要素→rv（纯 double），返回 n×6 行主序。
+void noeOsc2rvBatch(const std::vector<Vector6d> &oes, int nthreads, std::vector<double> &RV);
+// 批量并行 rv→非奇异要素，返回 n×6 行主序。
+void rv2OEOscBatch(const std::vector<Vector6d> &rvs, int nthreads, std::vector<double> &OE);
 #endif
 

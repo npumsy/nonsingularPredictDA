@@ -211,8 +211,51 @@ PYBIND11_MODULE(qoe, m)
                   py::arg("step")=10.0
             )
             .def("evaldXp", &NominalErrorProp::evaldXp,
-                  py::arg("drv0"), 
+                  py::arg("drv0"),
                   py::arg("scale_rhoCdA_m")=1.0);
+      // 非奇异要素（QOE）版误差传播：状态/返回值均为要素 (a[m], u=M+ω, ex, ey, i, Ω[rad])，高斯变分方程递推。
+      m.def("noeGveRhs", &noeGveRhs, py::arg("oe"), py::arg("beta")=1.0, py::arg("t")=0.0,
+            "高斯变分方程 RHS（非奇异要素 [a,u,ex,ey,i,Om]，m/rad）：摄动=J234+阻力(β)+三体");
+      m.def("noeOsc2rv", &noeOsc2rv, py::arg("oe"), py::arg("MaxIt")=100, py::arg("epsl")=1e-12,
+            "非奇异要素→rv（m, m/s），与 osculating::OEOsc2rv 同一公式");
+      m.def("stateTransferGVEBatch", [](const std::vector<Vector6d> &oes, double tf, int nthreads, double step){
+            std::vector<Vector6d> oef; std::vector<double> Phi;
+            { py::gil_scoped_release release; stateTransferGVEBatch(oes, tf, nthreads, oef, Phi, step); }
+            return py::make_tuple(oef, Phi);
+            }, py::arg("oes"), py::arg("tf"), py::arg("nthreads")=16, py::arg("step")=10.0,
+            "批量 GVE 一步传播：返回 (oe_f, Phi=∂oe_f/∂oe_0 展平 n×36)");
+      m.def("noeOsc2rvJacBatch", [](const std::vector<Vector6d> &oes, int nthreads){
+            std::vector<double> J;
+            { py::gil_scoped_release release; noeOsc2rvJacBatch(oes, nthreads, J); }
+            return J;
+            }, py::arg("oes"), py::arg("nthreads")=16,
+            "批量 ∂(r,v)/∂oe（展平 n×36，行主序）");
+      m.def("noeOsc2rvBatch", [](const std::vector<Vector6d> &oes, int nthreads){
+            std::vector<double> RV;
+            { py::gil_scoped_release release; noeOsc2rvBatch(oes, nthreads, RV); }
+            return RV;
+            }, py::arg("oes"), py::arg("nthreads")=16,
+            "批量 非奇异要素→rv（展平 n×6，行主序）");
+      m.def("rv2OEOscBatch", [](const std::vector<Vector6d> &rvs, int nthreads){
+            std::vector<double> OE;
+            { py::gil_scoped_release release; rv2OEOscBatch(rvs, nthreads, OE); }
+            return OE;
+            }, py::arg("rvs"), py::arg("nthreads")=16,
+            "批量 rv→非奇异要素（展平 n×6，行主序）");
+      py::class_<NominalErrorPropNOE>(m, "NominalErrorPropNOE")
+            .def(py::init<const Vector6d&, int>(), py::arg("oe0"), py::arg("order")=1, R"pbdoc(
+                  构造函数：非奇异要素 (a[m], u=M+ω, ex, ey, i, Ω[rad]) 的一阶 DA 误差传播（GVE 递推）。
+            )pbdoc")
+            .def("updateX0", &NominalErrorPropNOE::updateX0, py::arg("oe0"))
+            .def("propNomJ234Drag", &NominalErrorPropNOE::propNomJ234Drag,
+                  py::arg("Phi0f"), py::arg("tf"), py::arg("givePhi")=true, py::arg("step")=10.0,
+                  "正向递推：返回终端要素 oe_f（m, rad）；givePhi 时写 Phi0f = ∂oe_f/∂oe_0")
+            .def("bkpropNomJ234Drag", &NominalErrorPropNOE::bkpropNomJ234Drag,
+                  py::arg("Phi0f"), py::arg("tp"), py::arg("givePhi")=true, py::arg("step")=10.0,
+                  "反向递推（tp 为正向时长，物理时间递减）：返回终端要素；givePhi 时写 ∂/∂oe_0")
+            .def("evaldXf", &NominalErrorPropNOE::evaldXf, py::arg("doe0"), py::arg("scale_rhoCdA_m")=1.0,
+                  "在一阶 Taylor 模型上由 d oe_0 求终端要素")
+            .def("evaldXp", &NominalErrorPropNOE::evaldXp, py::arg("doe0"), py::arg("scale_rhoCdA_m")=1.0);
       m.def("daJ234DragRV_RK4Step", daJ234DragRV_RK4Step, py::arg("rv0"), 
             py::arg("Phi0f"),
             py::arg("tf"),
@@ -288,6 +331,15 @@ PYBIND11_MODULE(qoe, m)
           R"pbdoc(
                多历元阻力灵敏度：每星一次连续积分，在 tfs 各时间历元输出 xf 与 sens=∂x/∂κ。
                返回展平列表 (xf, sens)，索引 [i*K*6 + k*6 + c]。
+          )pbdoc");
+       // C++ 批量单步 StateTransfer：一步 3/8 RK4（全 TBPfull 动力学）+ 解析二体变分 STM。
+       m.def("stateTransferBatch", [](const std::vector<Vector6d> &rv0s, double dt, int nthreads){
+            std::vector<Vector6d> xf; std::vector<double> Phi;
+            { py::gil_scoped_release release; stateTransferBatch(rv0s, dt, nthreads, xf, Phi); }
+            return py::make_tuple(xf, Phi);
+       }, py::arg("rv0s"), py::arg("dt"), py::arg("nthreads")=0,
+          R"pbdoc(
+                C++ 批量单步 StateTransfer：x(dt) 一步 RK4（全动力学）；Phi=∂x(dt)/∂x0 解析二体变分。
           )pbdoc");
        // 整星座批传播（线程安全 double + OpenMP，释放 GIL）：位置相关残差场（RBF/SH），
        // 返回 (xf, Jt=∂x/∂θ [N,6,m], Jx=∂x/∂x0 [N,6,6])。场参数由入参设定。

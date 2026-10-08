@@ -1,4 +1,5 @@
 #include "dastates.h"
+#include "kepler.h"
 #include <Eigen/Core>
 // #include <Eigen/Dense>
 #include <functional>
@@ -77,8 +78,9 @@ AlgebraicVector<T> TBPfullwarp(AlgebraicVector<T> x, double t, double arg1){
 // Exercise 6.2.1: 3/8 rule RK4 integrator
 template<typename T> T rk4( T x0, double t0, double t1, T (*f)(T,double,double) ,double arg1, double hmax)
 {
-	int steps = ceil( (t1-t0)/hmax );
-	double h = (t1-t0)/steps;
+	int steps = (int)ceil( fabs(t1-t0)/hmax );   // 取步数用 |Δt|：允许 t1<t0（反向积分），正向不变
+	if( steps < 1 ) steps = 1;
+	double h = (t1-t0)/steps;                     // h 带符号：反向积分 h<0
     double t = t0;
 
     T k1, k2, k3, k4;
@@ -96,8 +98,11 @@ template<typename T> T rk4( T x0, double t0, double t1, T (*f)(T,double,double) 
 }
 template<typename T> T rk4b( T x0, double t0, double t1, T (*f)(T,double,double) ,double arg1, double hmax)
 {
-	int steps = ceil( (t1-t0)/hmax );
-	double h = (t1-t0)/steps;
+	// 与 rk4(x0,t0,t1，即 t1<t0 反向) 等价：同一 3/8 公式、步长取负。t1 为**正的倒退时长**时 t1>t0，
+	// 故物理时间在每步后应**递减**（此前误为 `t += h`，非自治 f 的时间标签会错）。
+	int steps = (int)ceil( fabs(t1-t0)/hmax );
+	if( steps < 1 ) steps = 1;
+	double h = fabs(t1-t0)/steps;
     double t = t0;
 
     T k1, k2, k3, k4;
@@ -108,11 +113,15 @@ template<typename T> T rk4b( T x0, double t0, double t1, T (*f)(T,double,double)
         k3 = f( x0 - h*(-k1/3.0 + k2), t - 2.0*h/3.0 ,arg1);
         k4 = f( x0 - h*(k1 - k2 + k3), t - h ,arg1);
         x0 = x0 - h*(k1 + 3*k2 + 3*k3 +k4)/8.0;
-		t += h;
+		t -= h;
 	}
 
     return x0;
 }
+
+// 显式实例化（供 gtest 用简单模型直接调用 rk4/rk4b，验证正向/反向积分）
+template Vector6d rk4<Vector6d>(Vector6d, double, double, Vector6d(*)(Vector6d,double,double), double, double);
+template Vector6d rk4b<Vector6d>(Vector6d, double, double, Vector6d(*)(Vector6d,double,double), double, double);
 NominalErrorProp::NominalErrorProp(const Vector6d &rv0,int order){
     const int N = 6;
      DA::init( order, N );       // initialize DACE for 1st-order computations in 2 variables
@@ -194,6 +203,314 @@ Vector6d NominalErrorProp::evaldXp(const Vector6d &drv0,double scale_rhoCdA_m){
     return drvf;
 }
 NominalErrorProp::~NominalErrorProp(){
+    DA::popTO( );
+}
+
+// ============================ 非奇异要素（QOE）的 GVE DA 误差传播 ============================
+// 口径：**接口与内部状态一律 m / rad**（a 为 m、角度为 rad），与 `qoe` 其余入口、与
+// `script/core/da_engine.py::_gve_rhs` 一致；TBPfull 内部仍需 km，故在摄动加速度处换算一次。
+namespace {
+// 取标量的常数部分（T=double 时即其自身）：仅供收敛判据、分支选择等"只看名义值"的场合。
+inline double cst(const DA &v){ return v.cons(); }
+inline double cst(double v){ return v; }
+// 逐元素取 max(v, thr)，按常数部分选择（DA 不可比较，须落在名义值上选分支）。
+template<typename T> inline T atLeast(const T &v, double thr){ return (cst(v) < thr) ? T(thr) : v; }
+
+// Newton 解 Kepler 方程 M → E（镜像 `osculating::KepEqtnE`，支持 T=DA：迭代式本身是光滑的，
+// 名义值收敛即全部一阶系数收敛）。初值取 M±e，与 `KepEqtnE` 同。
+template<typename T>
+T KepEqtnET(T M, T e, int MaxIt, double epsl){
+    T E = ((cst(M) > -M_PI && cst(M) < 0) || cst(M) > M_PI) ? M - e : M + e;
+    for(int it = 0; it < MaxIt; ++it){
+        T En = E;
+        E = En + (M - En + e * sin(En)) / (1.0 - e * cos(En));
+        if(std::fabs(cst(E - En)) < epsl) break;
+    }
+    return E;
+}
+
+// 非奇异要素→rv（m, m/s）。逐式镜像 `osculating::OEOsc2rv`（同一分支、同一表达式）。
+template<typename T>
+AlgebraicVector<T> OEOsc2rvT(const AlgebraicVector<T> &OE, int MaxIt, double epsl){
+    const double MU = bddd::MU;                       // m^3/s^2
+    const T a = OE[0], u = OE[1], ex = OE[2], ey = OE[3], i = OE[4], Om = OE[5];
+    const T e = sqrt(ex * ex + ey * ey);
+    const T p = atLeast((T)(a * (1 - e * e)), 1e-6);   // 防 RK4 子步 e>1 时 p<=0（sqrt 抛异常）
+    T omega, nu;
+    if(cst(e) < 1e-5){
+        omega = T(0.0);
+        nu = u;
+    } else {
+        omega = atan2(ey, ex);
+        T M = u - omega;
+        if(cst(M) < -M_PI) M = M + std::floor(std::fabs(cst(M) - M_PI) / (2 * M_PI)) * 2 * M_PI;
+        else if(cst(M) > M_PI) M = M - std::floor((cst(M) + M_PI) / (2 * M_PI)) * 2 * M_PI;
+        const T E = KepEqtnET<T>(M, e, MaxIt, epsl);
+        nu = 2 * atan(sqrt(atLeast((T)((1 + e) / (1 - e)), 0.0)) * tan(E / 2));
+    }
+    const T cnu = cos(nu), snu = sin(nu);
+    const T vscale = sqrt(MU / p);
+    AlgebraicVector<T> rPQW(3), vPQW(3);
+    rPQW[0] = p * cnu / (1 + e * cnu); rPQW[1] = p * snu / (1 + e * cnu); rPQW[2] = T(0.0);
+    vPQW[0] = -vscale * snu;           vPQW[1] = vscale * (e + cnu);       vPQW[2] = T(0.0);
+    const T cO = cos(Om), sO = sin(Om), ci = cos(i), si = sin(i), cw = cos(omega), sw = sin(omega);
+    AlgebraicVector<T> x(6);
+    const T Trow[9] = {cO*cw - sO*sw*ci, -cO*sw - sO*cw*ci, sO*si,
+                       sO*cw + cO*sw*ci, -sO*sw + cO*cw*ci, -cO*si,
+                       sw*si,             cw*si,             ci};
+    for(int r = 0; r < 3; ++r){
+        x[r]     = Trow[3*r]*rPQW[0] + Trow[3*r+1]*rPQW[1] + Trow[3*r+2]*rPQW[2];
+        x[3 + r] = Trow[3*r]*vPQW[0] + Trow[3*r+1]*vPQW[1] + Trow[3*r+2]*vPQW[2];
+    }
+    return x;
+}
+
+template<typename T>
+AlgebraicVector<T> cross3(const AlgebraicVector<T> &a, const AlgebraicVector<T> &b){
+    AlgebraicVector<T> c(3);
+    c[0] = a[1]*b[2] - a[2]*b[1];
+    c[1] = a[2]*b[0] - a[0]*b[2];
+    c[2] = a[0]*b[1] - a[1]*b[0];
+    return c;
+}
+
+// 摄动加速度（去二体，ECI，m/s²）：rv(m) → TBPfull(km) 减二体后回 m。与 `pertAccelECI` 同式。
+template<typename T>
+AlgebraicVector<T> pertAccelT(const AlgebraicVector<T> &rv_m, double beta, double t){
+    const double mu_km = bddd::MU / 1e9;
+    AlgebraicVector<T> xk(6);
+    for(int k = 0; k < 6; ++k) xk[k] = rv_m[k] / 1e3;
+    const AlgebraicVector<T> acc = TBPfull<T>(xk, t, T(beta));   // km/s²（二体+J234+阻力+三体）
+    const T rn = sqrt(xk[0]*xk[0] + xk[1]*xk[1] + xk[2]*xk[2]);
+    const T c = mu_km / (rn*rn*rn);
+    AlgebraicVector<T> out(3);
+    for(int k = 0; k < 3; ++k) out[k] = (acc[3 + k] + c * xk[k]) * 1e3;   // 去二体 → m/s²
+    return out;
+}
+
+// 高斯变分方程 RHS：d/dt [a, u, ex, ey, i, Ω]，u = M + ω。与 `script/core/da_engine.py::_gve_rhs`
+// 同一组公式与单位，**唯一差别**：dM 的摄动系数用经典 GVE 的 b/(a h e) = √(1−e²)/(h e)
+// （`_gve_rhs` 少了 √(1−e²)，致 u 与笛卡尔同物理差 ~e²·n）。
+template<typename T>
+AlgebraicVector<T> gveRhsQOE(AlgebraicVector<T> OE, double t, double arg1){
+    const double MU = bddd::MU;                       // m^3/s^2
+    const double beta = arg1;                         // 阻力乘性因子（κ）
+    const T a = OE[0], u = OE[1], ex = OE[2], ey = OE[3], inc = OE[4];
+    const T e = sqrt(ex * ex + ey * ey);
+    const T p = atLeast((T)(a * (1 - e * e)), 1e-6);
+    const T w = (cst(e) > 0.0) ? atan2(ey, ex) : T(0.0);   // e=0 时 ω 取 0（与 OEOsc2rv 同口径）
+    T M = u - w;
+    if(cst(M) < -M_PI) M = M + std::floor(std::fabs(cst(M) - M_PI) / (2 * M_PI)) * 2 * M_PI;
+    else if(cst(M) > M_PI) M = M - std::floor((cst(M) + M_PI) / (2 * M_PI)) * 2 * M_PI;
+    const T E = KepEqtnET<T>(M, e, 60, 1e-13);
+    const T cE = cos(E), sE = sin(E);
+    const T cnu = (cE - e) / (1 - e * cE);
+    const T snu = sqrt(atLeast(1 - e * e, 0.0)) * sE / (1 - e * cE);
+    const T r = p / (1 + e * cnu);
+    const T h = sqrt(MU * p);
+
+    const AlgebraicVector<T> rv = OEOsc2rvT<T>(OE, 60, 1e-13);      // m, m/s
+    const AlgebraicVector<T> ap = pertAccelT<T>(rv, beta, t);       // m/s²（去二体）
+    AlgebraicVector<T> r3(3), v3(3);
+    for(int k = 0; k < 3; ++k){ r3[k] = rv[k]; v3[k] = rv[3 + k]; }
+    const T rn = r3.vnorm();
+    const AlgebraicVector<T> Rc = r3 / rn;
+    const AlgebraicVector<T> hvec = cross3(r3, v3);
+    const AlgebraicVector<T> Nc = hvec / hvec.vnorm();
+    const AlgebraicVector<T> Tc = cross3(Nc, Rc);
+    T aR(0.0), aT(0.0), aN(0.0);
+    for(int k = 0; k < 3; ++k){ aR = aR + ap[k]*Rc[k]; aT = aT + ap[k]*Tc[k]; aN = aN + ap[k]*Nc[k]; }
+
+    const T ef  = atLeast(e, 1e-8);
+    const T sif = atLeast(sin(inc), 1e-8);
+    const T uarg = w + atan2(snu, cnu);
+    const T da  = (2 * a * a / h) * (e * snu * aR + (p / r) * aT);
+    const T de  = (1.0 / h) * (p * snu * aR + ((p + r) * cnu + r * e) * aT);
+    const T di  = (r * cos(uarg) / h) * aN;
+    const T dOm = (r * sin(uarg) / (h * sif)) * aN;
+    const T dw  = (1.0 / (h * ef)) * (-p * cnu * aR + (p + r) * snu * aT)
+                - (r * sin(uarg) * cos(inc) / (h * sif)) * aN;
+    // dM 的系数是经典 GVE 的 b/(a h e)（b = a√(1−e²)），即 √(1−e²)/(h e)——**不是** 1/(h e)：
+    // 少了 √(1−e²) 会让 u = M + ω 与笛卡尔同物理差 ~e²·n（实测 1/4T 9 m → 修正后 0 m，见 test_qoe_gtest.cpp）。
+    const T fM  = sqrt(atLeast(1 - e * e, 0.0)) / (h * ef);
+    const T dM  = sqrt(MU / (a * a * a)) + fM * ((p * cnu - 2 * r * e) * aR - (p + r) * snu * aT);
+    AlgebraicVector<T> out(6);
+    out[0] = da;
+    out[1] = dM + dw;                                  // u = M + ω
+    out[2] = cos(w) * de - e * sin(w) * dw;            // e_x = e cos ω
+    out[3] = sin(w) * de + e * cos(w) * dw;            // e_y = e sin ω
+    out[4] = di;
+    out[5] = dOm;
+    return out;
+}
+} // namespace
+
+Vector6d noeOsc2rv(const Vector6d &oe, int MaxIt, double epsl){
+    AlgebraicVector<double> o(6);
+    for(int i = 0; i < 6; ++i) o[i] = oe[i];
+    AlgebraicVector<double> x = OEOsc2rvT<double>(o, MaxIt, epsl);
+    Vector6d out;
+    for(int i = 0; i < 6; ++i) out[i] = x[i];
+    return out;
+}
+
+Vector6d noeGveRhs(const Vector6d &oe, double beta, double t){
+    AlgebraicVector<double> o(6);
+    for(int i = 0; i < 6; ++i) o[i] = oe[i];
+    AlgebraicVector<double> d = gveRhsQOE<double>(o, t, beta);
+    Vector6d out;
+    for(int i = 0; i < 6; ++i) out[i] = d[i];
+    return out;
+}
+
+// ============ 批量并行（OpenMP + 线程局部 DACE）:EKF 用 ============
+// GVE 一步传播（与 NominalErrorPropNOE 同物理）：oe_f 与 Phi=∂oe_f/∂oe_0（m/rad）。
+void stateTransferGVEBatch(const std::vector<Vector6d> &oes, double tf, int nthreads,
+                           std::vector<Vector6d> &oef, std::vector<double> &Phi, double step){
+    const std::size_t n = oes.size();
+    oef.assign(n, Vector6d::Zero());
+    Phi.assign(n * 36, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+    DA::init(1, 6);
+    DA::setEps(0.0);
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nthreads)
+#endif
+    {
+        daceInitializeThread();
+        DA::setEps(0.0);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long ii = 0; ii < (long long)n; ++ii){
+            const std::size_t i = (std::size_t)ii;
+            AlgebraicVector<DA> x0(6);
+            for(int c = 0; c < 6; ++c) x0[c] = oes[i][c] + DA(c + 1);
+            AlgebraicVector<DA> xf = rk4<AlgebraicVector<DA>>(x0, 0.0, tf, gveRhsQOE<DA>, 1.0, step);
+            for(int c = 0; c < 6; ++c){
+                oef[i][c] = cons(xf[c]);
+                for(int j = 1; j <= 6; ++j) Phi[i * 36 + 6 * c + (j - 1)] = cons(xf[c].deriv(j));
+            }
+        }
+    }
+}
+
+// 批量并行：∂(r,v)/∂oe（复用 DA 可微的 OEOsc2rvT；无 FD）。
+void noeOsc2rvJacBatch(const std::vector<Vector6d> &oes, int nthreads, std::vector<double> &J){
+    const std::size_t n = oes.size();
+    J.assign(n * 36, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+    DA::init(1, 6);
+    DA::setEps(0.0);
+#ifdef _OPENMP
+    #pragma omp parallel num_threads(nthreads)
+#endif
+    {
+        daceInitializeThread();
+        DA::setEps(0.0);
+#ifdef _OPENMP
+        #pragma omp for schedule(static)
+#endif
+        for(long long ii = 0; ii < (long long)n; ++ii){
+            const std::size_t i = (std::size_t)ii;
+            AlgebraicVector<DA> x0(6);
+            for(int c = 0; c < 6; ++c) x0[c] = oes[i][c] + DA(c + 1);
+            AlgebraicVector<DA> rv = OEOsc2rvT<DA>(x0, 100, 1e-12);
+            for(int a = 0; a < 6; ++a) for(int j = 1; j <= 6; ++j) J[i * 36 + 6 * a + (j - 1)] = cons(rv[a].deriv(j));
+        }
+    }
+}
+
+// 批量并行：非奇异要素→rv（纯 double，无 DA）。
+void noeOsc2rvBatch(const std::vector<Vector6d> &oes, int nthreads, std::vector<double> &RV){
+    const std::size_t n = oes.size();
+    RV.assign(n * 6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long ii = 0; ii < (long long)n; ++ii){
+        const std::size_t i = (std::size_t)ii;
+        AlgebraicVector<double> o(6);
+        for(int c = 0; c < 6; ++c) o[c] = oes[i][c];
+        AlgebraicVector<double> rv = OEOsc2rvT<double>(o, 100, 1e-12);
+        for(int c = 0; c < 6; ++c) RV[i * 6 + c] = rv[c];
+    }
+}
+// 批量并行：rv→非奇异要素。
+void rv2OEOscBatch(const std::vector<Vector6d> &rvs, int nthreads, std::vector<double> &OE){
+    const std::size_t n = rvs.size();
+    OE.assign(n * 6, 0.0);
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long ii = 0; ii < (long long)n; ++ii){
+        const std::size_t i = (std::size_t)ii;
+        Eigen::VectorXd x(6);
+        for(int c = 0; c < 6; ++c) x(c) = rvs[i][c];
+        Eigen::VectorXd oe = osculating::rv2OEOsc(x);
+        for(int c = 0; c < 6; ++c) OE[i * 6 + c] = oe(c);
+    }
+}
+
+NominalErrorPropNOE::NominalErrorPropNOE(const Vector6d &oe0, int order){
+    const int N = 6;
+    DA::init( order, N );
+    DA::setEps( 0.0 );      // a~7e6 m 与 ∂u/∂a~1e-7 rad/m 同存，不丢小系数
+    x0 = AlgebraicVector<DA>(6);
+    xf = AlgebraicVector<DA>(6);
+    xp = AlgebraicVector<DA>(6);
+    for(int i = 0; i < 6; ++i) x0[i] = oe0(i) + DA(i + 1);
+    DA::pushTO( 1 );        // 只需一阶（Φ = ∂x_f/∂x_0）
+}
+void NominalErrorPropNOE::updateX0(const Vector6d &oe0){
+    for(int i = 0; i < 6; ++i) x0[i] = oe0(i) + DA(i + 1);
+}
+Vector6d NominalErrorPropNOE::propNomJ234Drag( Eigen::Ref<Eigen::Matrix<double, 6, 6>> Phi0f, double tf,
+                                    bool givePhi, double step){
+    xf = rk4<AlgebraicVector<DA>>( x0, 0, tf, gveRhsQOE<DA>, 1.0, step );
+
+    if(givePhi)
+        for( int i = 0; i < 6; i++ )
+            for( int j = 1; j <= 6; j++ )
+                Phi0f(i,j-1) = cons(xf[i].deriv(j));
+    Vector6d oef;
+    for(int i = 0; i < 6; i++) oef[i] = cons(xf[i]);      // 要素（m, rad），不再换回 rv
+    return oef;
+}
+Vector6d NominalErrorPropNOE::bkpropNomJ234Drag( Eigen::Ref<Eigen::Matrix<double, 6, 6>> Phi0f, double tf,
+                                    bool givePhi, double step){
+    xp = rk4b<AlgebraicVector<DA>>( x0, 0, tf, gveRhsQOE<DA>, 1.0, step );
+
+    if(givePhi)
+        for( int i = 0; i < 6; i++ )
+            for( int j = 1; j <= 6; j++ )
+                Phi0f(i,j-1) = cons(xp[i].deriv(j));
+    Vector6d oef;
+    for(int i = 0; i < 6; i++) oef[i] = cons(xp[i]);
+    return oef;
+}
+// 在展开中心的**一阶 Taylor 模型**上求值（返回终端要素，非增量）；β 固定在展开处（=1，同 NominalErrorProp）。
+Vector6d NominalErrorPropNOE::evaldXf(const Vector6d &doe0,double scale_rhoCdA_m){
+    (void)scale_rhoCdA_m;
+    AlgebraicVector<double> doe(6);
+    for(int i = 0; i < 6; ++i) doe[i] = doe0[i];
+    AlgebraicVector<double> dOef = xf.eval(doe);
+    Vector6d out;
+    for(int i = 0; i < 6; ++i) out[i] = dOef[i];
+    return out;
+}
+Vector6d NominalErrorPropNOE::evaldXp(const Vector6d &doe0,double scale_rhoCdA_m){
+    (void)scale_rhoCdA_m;
+    AlgebraicVector<double> doe(6);
+    for(int i = 0; i < 6; ++i) doe[i] = doe0[i];
+    AlgebraicVector<double> dOef = xp.eval(doe);
+    Vector6d out;
+    for(int i = 0; i < 6; ++i) out[i] = dOef[i];
+    return out;
+}
+NominalErrorPropNOE::~NominalErrorPropNOE(){
     DA::popTO( );
 }
 
@@ -457,6 +774,32 @@ void daJ234DragMultiEpochBatch(const std::vector<Vector6d> &rv0s,
             }
         }
         daceCleanupThread();
+    }
+}
+
+// C++ 批量单步 StateTransfer：**10 s 内严格二体**（解析 Lagrangian：状态 + STM，kepler.h），OpenMP 批并行。
+void stateTransferBatch(const std::vector<Vector6d> &rv0s, double dt, int nthreads,
+                        std::vector<Vector6d> &xf, std::vector<double> &Phi){
+    const std::size_t n = rv0s.size();
+    xf.assign(n, Vector6d::Zero());
+    Phi.assign(n*36, 0.0);
+    const double mu_km = bddd::MU/1e9;                 // km³/s²
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(static) num_threads(nthreads)
+#endif
+    for(long long i=0;i<(long long)n;i++){
+        const Vector6d &rv = rv0s[(std::size_t)i];
+        Eigen::Vector3d p0(rv[0]/1e3, rv[1]/1e3, rv[2]/1e3);
+        Eigen::Vector3d v0(rv[3]/1e3, rv[4]/1e3, rv[5]/1e3);
+        Eigen::Matrix<double,6,6> P = Eigen::Matrix<double,6,6>::Identity();
+        kep3::Vector6d rv2 = kep3::propagate_lagrangian(p0, v0, dt, mu_km, true, P);
+        if(!rv2.allFinite() || !P.allFinite()){
+            for(int c=0;c<6;c++) rv2[c] = rv[c]/1e3; P = Eigen::Matrix<double,6,6>::Identity();
+        }
+        for(int c=0;c<6;c++) xf[(std::size_t)i](c) = rv2[c]*1e3;
+        for(int a=0;a<6;a++) for(int b=0;b<6;b++)
+            Phi[(std::size_t)i*36 + 6*a + b] = P(a,b);
     }
 }
 
@@ -1053,7 +1396,7 @@ void daVarMultiEpoch(const Vector6d &rv0_m, const std::vector<double> &thetas,
     double tcur = 0.0;
     for(int kk=0; kk<K; ++kk){
         const double H = tfs[kk]-tcur;
-        const int ns = std::max(1, (int)std::ceil(H/step));
+        const int ns = std::max(1, (int)std::ceil(std::fabs(H)/step));
         const double h = H/ns;
         for(int s=0;s<ns;s++){
             dydt(y,k1);
@@ -1284,7 +1627,7 @@ void daDeepForward(const Vector6d &rv0_km, const std::vector<double> &thetas,
     double Phi[36]; for(int q=0;q<36;q++) Phi[q]=0.0; for(int i=0;i<6;i++) Phi[i*6+i]=1.0;
     double tcur=0.0;
     for(int kk=0;kk<K;kk++){
-        double H=tfs[kk]-tcur; int ns=std::max(1,(int)std::ceil(H/step)); double h=H/ns;
+        double H=tfs[kk]-tcur; int ns=std::max(1,(int)std::ceil(std::fabs(H)/step)); double h=H/ns;
         for(int s=0;s<ns;s++){
             double f1[6],A1[36]; deepRhs(x,thetas,m,f1,A1);
             double x2[6]; for(int i=0;i<6;i++) x2[i]=x[i]+(h/3.0)*f1[i];
@@ -1562,7 +1905,7 @@ static void varMultiEpochCore(const Vector6d &rv0_m, const std::vector<double> &
     double tcur = 0.0;
     for(int kk=0; kk<K; ++kk){
         const double H = tfs[kk]-tcur;
-        const int ns = std::max(1, (int)std::ceil(H/step));
+        const int ns = std::max(1, (int)std::ceil(std::fabs(H)/step));
         const double h = H/ns;
         for(int s=0;s<ns;s++){
             dydt(y,k1);
@@ -1612,7 +1955,7 @@ static void varMultiEpochCoreKC(const Vector6d &rv0_m, const std::vector<double>
     Jf.assign((std::size_t)Kt*6*(6+m),0.0);
     double tcur=0.0;
     for(int kk=0;kk<Kt;++kk){
-        const double H=tfs[kk]-tcur; const int ns=std::max(1,(int)std::ceil(H/step)); const double h=H/ns;
+        const double H=tfs[kk]-tcur; const int ns=std::max(1,(int)std::ceil(std::fabs(H)/step)); const double h=H/ns;
         for(int s=0;s<ns;s++){
             dydt(y,k1);
             for(int q=0;q<nA;q++) yt[q]=y[q]+h*k1[q]/3.0;              dydt(yt,k2);
