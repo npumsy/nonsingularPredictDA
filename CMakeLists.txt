@@ -81,6 +81,12 @@ pybind11_add_module(${PROJECT_NAME} ${SRC_LIST})
 # 链接 dace 库、OpenMP 与 CUDA runtime 到 qoe 模块
 target_link_libraries(${PROJECT_NAME} PRIVATE dace::dace OpenMP::OpenMP_CXX CUDA::cudart)
 set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
+
+# qoejopt：joint 内环 C++/CUDA（device 常驻装配）。独立模块，仅依赖 gve_step.cu 的核 + pybind11
+# （不引 dace/torch：rv0/A0 由 Python 用 qoe 的扁平入口算好传入；Baspacho 仍在 Python/Theseus 侧）。
+pybind11_add_module(qoejopt src/qoejopt.cpp src/gve_step.cu)
+target_link_libraries(qoejopt PRIVATE OpenMP::OpenMP_CXX CUDA::cudart)
+target_include_directories(qoejopt PRIVATE ${PROJECT_SOURCE_DIR}/include)
 # 设置编译目标
 # add_executable(da src/dastate.cpp)
 # target_link_libraries(da dace)

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <chrono>
 #include "kepler.h"   // kep3::Vector6d + gveStepNoeBatch 声明
+#include "qoejopt.h"  // qoejopt::Ctx + joint* host 包装声明
 
 #define PI 3.14159265358979323846
 #define MU_M 3.986004415e14            // m^3/s^2 (bddd::MU)
@@ -342,6 +343,37 @@ __global__ void gvePropagateKernel(const double* oe0, int n, int nfr, double dt,
     }
 }
 
+// 整弧多帧（逐星 κ=betas[idx]）：P4.3 θ 学习的正向；与 gvePropagateKernel 仅 β 来源不同。
+__global__ void gvePropagateBetaKernel(const double* oe0, const double* betas, int n, int nfr,
+                                       double dt, double* rv_all){
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    const double beta = betas[idx];
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6], rv[6];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    oe2rv_dev(y, rv);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) rv_all[((size_t)0*n + idx)*6 + c] = rv[c];
+    for(int f = 1; f < nfr; ++f){
+        gveRhs_dev(y, beta, k1);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*k1[c]/3.0;
+        gveRhs_dev(tmp, beta, k2);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(-k1[c]/3.0 + k2[c]);
+        gveRhs_dev(tmp, beta, k3);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(k1[c] - k2[c] + k3[c]);
+        gveRhs_dev(tmp, beta, k4);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) y[c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
+        oe2rv_dev(y, rv);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) rv_all[((size_t)f*n + idx)*6 + c] = rv[c];
+    }
+}
+
 // 笛卡尔单步 3/8-RK4（全动力学）：x0 (n×6, m/m·s⁻¹) → xf。
 __global__ void cartStepKernel(const double* x0, int n, double dt, double beta, double* xf){
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -517,6 +549,45 @@ void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
     g_gve_d2h += _now() - _t;
 }
 
+// 整弧多帧（逐星 κ）：oe0s(n,6) + betas(n) --多帧链式--> rv_all（平铺 nfr*n*6）。
+void gvePropagateNoeBatchBeta(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                              int nfr, double dt, int nthreads, std::vector<double> &rv_all){
+    (void)nthreads;
+    using clk = std::chrono::steady_clock;
+    auto _now = []{ return std::chrono::duration<double>(clk::now().time_since_epoch()).count(); };
+    const int n = (int)oe0s.size();
+    rv_all.assign((size_t)nfr * n * 6, 0.0);
+    if(n == 0 || nfr <= 0) return;
+    static thread_local std::vector<double> h0, hb;
+    h0.resize((size_t)n * 6); hb.resize((size_t)n);
+    double _t = _now();
+    for(int i = 0; i < n; ++i){
+        for(int c = 0; c < 6; ++c) h0[(size_t)i*6 + c] = oe0s[i](c);
+        hb[(size_t)i] = (betas.size() == (size_t)n) ? betas[i] : (betas.empty() ? 1.0 : betas[0]);
+    }
+    g_gve_pack += _now() - _t;
+    static thread_local double *d0 = nullptr, *db = nullptr, *drv = nullptr;
+    static thread_local size_t c0 = 0, cb = 0, crv = 0;
+    const size_t b0 = (size_t)n*6*sizeof(double), bb = (size_t)n*sizeof(double),
+                 brv = (size_t)nfr*n*6*sizeof(double);
+    if(b0 > c0){ if(d0) cudaFree(d0); d0 = nullptr; cudaMalloc(&d0, b0); c0 = b0; }
+    if(bb > cb){ if(db) cudaFree(db); db = nullptr; cudaMalloc(&db, bb); cb = bb; }
+    if(brv > crv){ if(drv) cudaFree(drv); drv = nullptr; cudaMalloc(&drv, brv); crv = brv; }
+    _t = _now();
+    cudaMemcpy(d0, h0.data(), b0, cudaMemcpyHostToDevice);
+    cudaMemcpy(db, hb.data(), bb, cudaMemcpyHostToDevice);
+    g_gve_h2d += _now() - _t;
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    _t = _now();
+    gvePropagateBetaKernel<<<blocks, threads>>>(d0, db, n, nfr, dt, drv);
+    cudaError_t err = cudaDeviceSynchronize();
+    g_gve_kernel += _now() - _t;
+    if(err != cudaSuccess) fprintf(stderr, "[gvePropagateNoeBatchBeta] %s\n", cudaGetErrorString(err));
+    _t = _now();
+    cudaMemcpy(rv_all.data(), drv, brv, cudaMemcpyDeviceToHost);
+    g_gve_d2h += _now() - _t;
+}
+
 // 解析两体 STM 折叠（GPU 版 stateStmFoldBatch）：rv0(n,6) + A0(n,36) → A（平铺 nfr*n*18）。
 void stmFoldGpuBatch(const std::vector<Vector6d> &rv0s, int nfr, double dt,
                      const std::vector<double> &A0flat, int nthreads, std::vector<double> &A_all){
@@ -619,3 +690,320 @@ void cartPropagateBatch(const std::vector<Vector6d> &x0s, int nfr, double dt, in
     _t = _now(); cudaMemcpy(x_all.data(), dx, bx, cudaMemcpyDeviceToHost); g_gve_d2h += _now() - _t;
 }
 } // namespace kep3
+
+// ===================== qoejopt：joint 装配（device 常驻） =====================
+// 复用本 TU 的 device 助手（oe2rv_dev/gveRhs_dev/stmTwoBodyDev）。A_val/b 由 Python 提供
+// torch cuda 缓冲指针直写，P/A 中间量只驻显存。布局与 host `_lift_struct`/`_lift_assemble` 严格一致：
+//   ISL 行 r=f*E+e：12 非零 [sat_i 的 6，sat_j 的 6]，b[r] = -(rr-D)*wi
+//   GTS 行 r=f*G+a：6 非零，b[nISL+r] = -(rg-D)*wg
+//   damp 行 c：1 非零（对角 issq），b[nISL+nGTS+c] = -issq*(X[c]-ctr[c])
+namespace qoejopt {
+
+double jt_expand = 0.0, jt_stm = 0.0, jt_asm = 0.0, jt_res2 = 0.0;
+void jointResetTiming() { jt_expand = jt_stm = jt_asm = jt_res2 = 0.0; }
+std::vector<double> jointGetTiming() { return { jt_expand, jt_stm, jt_asm, jt_res2 }; }
+static inline double _jnow() {
+    using clk = std::chrono::steady_clock;
+    return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
+}
+
+__global__ void jointIslAsmKernel(const double *d_P, const double *d_A,
+                                  const int *isl_i, const int *isl_jj,
+                                  const double *isl_D, const double *isl_W,
+                                  int n, int nfr, int E, double s_isl, int off_isl,
+                                  double *A_val, double *b) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (int)((size_t)nfr * E)) return;
+    const int f = idx / E, e = idx % E;
+    const int i = isl_i[idx], j = isl_jj[idx];
+    const double *pi = d_P + ((size_t)f * n + i) * 6;
+    const double *pj = d_P + ((size_t)f * n + j) * 6;
+    const double d0 = pi[0] - pj[0], d1 = pi[1] - pj[1], d2 = pi[2] - pj[2];
+    const double rr = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double ir = (rr > 1e-12) ? 1.0 / rr : 0.0;
+    const double u0 = d0 * ir, u1 = d1 * ir, u2 = d2 * ir;
+    const double *Ai = d_A + ((size_t)f * n + i) * 18;
+    const double *Aj = d_A + ((size_t)f * n + j) * 18;
+    const double wit = isl_W[idx] * s_isl;
+    double *av = A_val + off_isl + (size_t)idx * 12;
+#pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        av[k]     =  wit * (u0 * Ai[0 * 6 + k] + u1 * Ai[1 * 6 + k] + u2 * Ai[2 * 6 + k]);
+        av[6 + k] = -wit * (u0 * Aj[0 * 6 + k] + u1 * Aj[1 * 6 + k] + u2 * Aj[2 * 6 + k]);
+    }
+    b[idx] = -(rr - isl_D[idx]) * wit;
+}
+
+__global__ void jointGtsAsmKernel(const double *d_P, const double *d_A,
+                                  const int *gts_a, const double *gts_D,
+                                  const double *gts_W, const double *gts_Q,
+                                  int n, int G, int nGTS, double s_gts, int nISL,
+                                  int off_gts, double *A_val, double *b) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nGTS) return;
+    const int f = idx / G;
+    const int a = gts_a[idx];
+    const double *pf = d_P + ((size_t)f * n + a) * 6;
+    const double *q = gts_Q + (size_t)idx * 3;
+    const double d0 = pf[0] - q[0], d1 = pf[1] - q[1], d2 = pf[2] - q[2];
+    const double rg = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double ir = (rg > 1e-12) ? 1.0 / rg : 0.0;
+    const double u0 = d0 * ir, u1 = d1 * ir, u2 = d2 * ir;
+    const double *Ag = d_A + ((size_t)f * n + a) * 18;
+    const double wg = gts_W[idx] * s_gts;
+    double *av = A_val + off_gts + (size_t)idx * 6;
+#pragma unroll
+    for (int k = 0; k < 6; ++k)
+        av[k] = wg * (u0 * Ag[0 * 6 + k] + u1 * Ag[1 * 6 + k] + u2 * Ag[2 * 6 + k]);
+    b[nISL + idx] = -(rg - gts_D[idx]) * wg;
+}
+
+__global__ void jointDampKernel(const double *d_X, const double *ctr, int ncol,
+                                double issq, int off_damp, int base_b,
+                                double *A_val, double *b) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= ncol) return;
+    A_val[off_damp + c] = issq;
+    b[base_b + c] = -issq * (d_X[c] - ctr[c]);
+}
+
+__global__ void jointRes2Kernel(const double *d_P, const int *isl_i, const int *isl_jj,
+                                const double *isl_D, const double *isl_W,
+                                int n, int E, int nISL, double *acc) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nISL) return;
+    if (isl_W[idx] <= 0.0) return;
+    const int f = idx / E;
+    const int i = isl_i[idx], j = isl_jj[idx];
+    const double *pi = d_P + ((size_t)f * n + i) * 6;
+    const double *pj = d_P + ((size_t)f * n + j) * 6;
+    const double d0 = pi[0] - pj[0], d1 = pi[1] - pj[1], d2 = pi[2] - pj[2];
+    const double rr = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double r = rr - isl_D[idx];
+    atomicAdd(acc, r * r);
+}
+
+void jointExpandDevice(Ctx &c) {
+    const int threads = 256;
+    const int blocks = (c.n + threads - 1) / threads;
+    const double t0 = _jnow();
+    gvePropagateKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, 1.0, c.d_P);
+    cudaError_t err = cudaDeviceSynchronize();
+    jt_expand += _jnow() - t0;
+    if (err != cudaSuccess)
+        fprintf(stderr, "[qoejopt::jointExpandDevice] %s\n", cudaGetErrorString(err));
+}
+
+void jointStmFoldDevice(Ctx &c) {
+    const int threads = 256;
+    const int blocks = (c.n + threads - 1) / threads;
+    const double t0 = _jnow();
+    stmFoldKernel<<<blocks, threads>>>(c.d_rv0, c.n, c.nfr, c.dt, c.d_A0, c.d_A);
+    cudaError_t err = cudaDeviceSynchronize();
+    jt_stm += _jnow() - t0;
+    if (err != cudaSuccess)
+        fprintf(stderr, "[qoejopt::jointStmFoldDevice] %s\n", cudaGetErrorString(err));
+}
+
+static double jointRes2Impl(Ctx &c) {
+    const int nISL = c.nfr * c.E;
+    if (nISL <= 0) return 0.0;
+    const double t0 = _jnow();
+    cudaMemset(c.d_res, 0, sizeof(double));
+    const int threads = 256;
+    const int blocks = (nISL + threads - 1) / threads;
+    jointRes2Kernel<<<blocks, threads>>>(c.d_P, c.d_isl_i, c.d_isl_jj, c.d_isl_D,
+                                         c.d_isl_W, c.n, c.E, nISL, c.d_res);
+    double h = 0.0;
+    cudaMemcpy(&h, c.d_res, sizeof(double), cudaMemcpyDeviceToHost);
+    jt_res2 += _jnow() - t0;
+    return h;
+}
+
+static void _asmKernels(Ctx &c, double *A_val, double *b) {
+    if (!(A_val && b)) return;
+    const int threads = 256;
+    const int nISL = c.nfr * c.E;
+    const int nGTS = c.nfr * c.G;
+    if (nISL > 0) {
+        const int blocks = (nISL + threads - 1) / threads;
+        jointIslAsmKernel<<<blocks, threads>>>(c.d_P, c.d_A, c.d_isl_i, c.d_isl_jj,
+                                               c.d_isl_D, c.d_isl_W, c.n, c.nfr, c.E,
+                                               c.s_isl, c.off_isl, A_val, b);
+    }
+    if (nGTS > 0) {
+        const int blocks = (nGTS + threads - 1) / threads;
+        jointGtsAsmKernel<<<blocks, threads>>>(c.d_P, c.d_A, c.d_gts_a, c.d_gts_D,
+                                               c.d_gts_W, c.d_gts_Q, c.n, c.G, nGTS,
+                                               c.s_gts, nISL, c.off_gts, A_val, b);
+    }
+    if (c.ncol > 0) {
+        const int blocks = (c.ncol + threads - 1) / threads;
+        jointDampKernel<<<blocks, threads>>>(c.d_X, c.d_ctr, c.ncol, c.issq,
+                                             c.off_damp, nISL + nGTS, A_val, b);
+    }
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        fprintf(stderr, "[qoejopt::_asmKernels] %s\n", cudaGetErrorString(err));
+}
+
+double jointAssembleInto(Ctx &c, double *A_val, double *b) {
+    jointExpandDevice(c);
+    jointStmFoldDevice(c);
+    const double t_asm0 = _jnow();
+    _asmKernels(c, A_val, b);
+    jt_asm += _jnow() - t_asm0;
+    return jointRes2Impl(c);
+}
+
+double jointAssembleCachedInto(Ctx &c, double *A_val, double *b) {
+    const double t_asm0 = _jnow();
+    _asmKernels(c, A_val, b);
+    jt_asm += _jnow() - t_asm0;
+    return jointRes2Impl(c);
+}
+
+double jointIslRes2(Ctx &c) {
+    jointExpandDevice(c);
+    jointStmFoldDevice(c);
+    return jointRes2Impl(c);
+}
+
+void jointCopyOut(const Ctx &c, double *host_rv) {
+    cudaMemcpy(host_rv, c.d_P, (size_t)c.nfr * c.n * 6 * sizeof(double),
+               cudaMemcpyDeviceToHost);
+}
+
+// ---- P4.2 前向敏度：S_f = ∂oe_f/∂κ（变分方程 + 同一 3/8-RK4）----
+// A=∂f/∂oe、Fκ=∂f/∂κ 用设备端中心差分（可后续替换为解析式，接口不变；β 只乘阻力项、对其线性，故 Fκ 精确）。
+__device__ __forceinline__ void gveRhsJacFD_dev(const double *OE, double beta, double A[6][6]) {
+    // 中心差分（2 阶）；继续提精度需解析 ∂f/∂oe（接口不变）。
+    double fp[6], fm[6];
+    for (int j = 0; j < 6; ++j) {
+        const double hh = 1e-7 * (fabs(OE[j]) + 1.0);
+        double xp[6], xm[6];
+        #pragma unroll
+        for (int k = 0; k < 6; ++k) { xp[k] = OE[k]; xm[k] = OE[k]; }
+        xp[j] += hh; xm[j] -= hh;
+        gveRhs_dev(xp, beta, fp);
+        gveRhs_dev(xm, beta, fm);
+        const double inv = 1.0 / (2.0 * hh);
+        for (int i = 0; i < 6; ++i) A[i][j] = (fp[i] - fm[i]) * inv;
+    }
+}
+__device__ __forceinline__ void gveRhsKappaFD_dev(const double *OE, double beta, double Fk[6]) {
+    const double hb = 1e-6;
+    double fp[6], fm[6];
+    gveRhs_dev(OE, beta + hb, fp);
+    gveRhs_dev(OE, beta - hb, fm);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) Fk[i] = (fp[i] - fm[i]) / (2.0 * hb);
+}
+__device__ __forceinline__ void sensRhs_dev(const double *oe, const double *S, double beta,
+                                            double *doe, double *dS) {
+    gveRhs_dev(oe, beta, doe);
+    double A[6][6]; gveRhsJacFD_dev(oe, beta, A);
+    double Fk[6];   gveRhsKappaFD_dev(oe, beta, Fk);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) {
+        double s = Fk[i];
+        for (int j = 0; j < 6; ++j) s += A[i][j] * S[j];
+        dS[i] = s;
+    }
+}
+__global__ void gveSensPropagateKernel(const double *oe0, int n, int nfr, double dt, double beta,
+                                       double *oe_all, double *S_all) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double y[6], S[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) { y[c] = oe0[6 * idx + c]; S[c] = 0.0; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) {
+        oe_all[((size_t)0 * n + idx) * 6 + c] = y[c];
+        S_all[((size_t)0 * n + idx) * 6 + c] = S[c];
+    }
+    double k1y[6], k2y[6], k3y[6], k4y[6], s1[6], s2[6], s3[6], s4[6], ty[6], ts[6];
+    for (int f = 1; f < nfr; ++f) {
+        sensRhs_dev(y, S, beta, k1y, s1);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) { ty[c] = y[c] + dt * k1y[c] / 3.0; ts[c] = S[c] + dt * s1[c] / 3.0; }
+        sensRhs_dev(ty, ts, beta, k2y, s2);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) { ty[c] = y[c] + dt * (-k1y[c] / 3.0 + k2y[c]); ts[c] = S[c] + dt * (-s1[c] / 3.0 + s2[c]); }
+        sensRhs_dev(ty, ts, beta, k3y, s3);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) { ty[c] = y[c] + dt * (k1y[c] - k2y[c] + k3y[c]); ts[c] = S[c] + dt * (s1[c] - s2[c] + s3[c]); }
+        sensRhs_dev(ty, ts, beta, k4y, s4);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            y[c] += dt * (k1y[c] + 3.0 * k2y[c] + 3.0 * k3y[c] + k4y[c]) / 8.0;
+            S[c] += dt * (s1[c] + 3.0 * s2[c] + 3.0 * s3[c] + s4[c]) / 8.0;
+        }
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            oe_all[((size_t)f * n + idx) * 6 + c] = y[c];
+            S_all[((size_t)f * n + idx) * 6 + c] = S[c];
+        }
+    }
+}
+
+void jointStateSensBatch(const Ctx &c, const double *x_host, double beta, double *oe_all, double *S_all) {
+    const int n = c.n, nfr = c.nfr;
+    if (n <= 0 || nfr <= 0) return;
+    const size_t bx = (size_t)n * 6 * sizeof(double), bs = (size_t)nfr * n * 6 * sizeof(double);
+    double *dx = nullptr, *doe = nullptr, *dS = nullptr;
+    cudaMalloc(&dx, bx); cudaMalloc(&doe, bs); cudaMalloc(&dS, bs);
+    cudaMemcpy(dx, x_host, bx, cudaMemcpyHostToDevice);
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    const double t0 = _jnow();
+    gveSensPropagateKernel<<<blocks, threads>>>(dx, n, nfr, c.dt, 1.0, doe, dS);
+    cudaError_t err = cudaDeviceSynchronize();
+    jt_expand += _jnow() - t0;
+    if (err != cudaSuccess) fprintf(stderr, "[jointStateSensBatch] %s\n", cudaGetErrorString(err));
+    cudaMemcpy(oe_all, doe, bs, cudaMemcpyDeviceToHost);
+    cudaMemcpy(S_all, dS, bs, cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(doe); cudaFree(dS);
+}
+
+// ---- 单步 GVE + 全动力学变分 STM：Φ_oe = ∂oe(dt)/∂oe(0)，与状态同 3/8-RK4（供 EKF-qoe 预测）----
+__global__ void gveStmKernel(const double *oe0, int n, double dt, double beta,
+                             double *oef, double *Phi_all) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6];
+    double P[6][6], K1[6][6], K2[6][6], K3[6][6], K4[6][6], A[6][6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6 * idx + c];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) P[a][b] = (a == b) ? 1.0 : 0.0;
+    gveRhs_dev(y, beta, k1); gveRhsJacFD_dev(y, beta, A);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * P[c][b]; K1[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * k1[c] / 3.0;
+    gveRhs_dev(tmp, beta, k2); gveRhsJacFD_dev(tmp, beta, A);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * K1[c][b] / 3.0); K2[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
+    gveRhs_dev(tmp, beta, k3); gveRhsJacFD_dev(tmp, beta, A);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (-K1[c][b] / 3.0 + K2[c][b])); K3[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
+    gveRhs_dev(tmp, beta, k4); gveRhsJacFD_dev(tmp, beta, A);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (K1[c][b] - K2[c][b] + K3[c][b])); K4[a][b] = s; }
+    double *of = oef + 6 * idx; double *Pa = Phi_all + (size_t)idx * 36;
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) of[c] = y[c] + dt * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b)
+        Pa[a * 6 + b] = P[a][b] + dt * (K1[a][b] + 3.0 * K2[a][b] + 3.0 * K3[a][b] + K4[a][b]) / 8.0;
+}
+void gveStmDevice(const double *d_oe, int n, double dt, double beta, double *d_oef, double *d_Phi) {
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    gveStmKernel<<<blocks, threads>>>(d_oe, n, dt, beta, d_oef, d_Phi);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[gveStmDevice] %s\n", cudaGetErrorString(err));
+}
+
+}  // namespace qoejopt

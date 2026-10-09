@@ -300,6 +300,16 @@ PYBIND11_MODULE(qoe, m)
             std::memcpy(JJ.mutable_data(), J.data(), n*36*sizeof(double));
             return JJ;
             }, py::arg("oe"), py::arg("nthreads")=16, "批量 ∂(r,v)/∂oe（(n,6,6) numpy）");
+      m.def("rv2OEOscBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(rv, "rv2OEOscBatchFlat");
+            std::vector<double> OE;
+            { py::gil_scoped_release release; rv2OEOscBatch(v, nthreads, OE); }
+            const std::size_t n = v.size();
+            py::array_t<double> O({n, (std::size_t)6});
+            std::memcpy(O.mutable_data(), OE.data(), n*6*sizeof(double));
+            return O;
+            }, py::arg("rv"), py::arg("nthreads")=16, "批量 rv→非奇异要素（(n,6) numpy）");
       m.def("gveStepNoeBatchFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, double t0, double dt,
                 int nthreads, double beta){
@@ -329,6 +339,21 @@ PYBIND11_MODULE(qoe, m)
             return O;
             }, py::arg("oe"), py::arg("nfr"), py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
             "整弧多帧 GVE（CUDA）：(n,6) → rv (nfr,n,6)");
+      m.def("gvePropagateBetaFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                int nfr, double dt, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gvePropagateBetaFlat");
+            auto bb = betas.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<double> rv_all;
+            { py::gil_scoped_release release; kep3::gvePropagateNoeBatchBeta(v, bv, nfr, dt, nthreads, rv_all); }
+            const int n = (int)v.size();
+            py::array_t<double> O({(std::size_t)nfr, (std::size_t)n, (std::size_t)6});
+            std::memcpy(O.mutable_data(), rv_all.data(), rv_all.size()*sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("betas"), py::arg("nfr"), py::arg("dt"), py::arg("nthreads")=16,
+            "整弧多帧 GVE（CUDA，逐星 κ）：(n,6),(n,) → rv (nfr,n,6)");
       m.def("stmFoldGpuFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv0, int nfr, double dt,
                 py::array_t<double, py::array::c_style | py::array::forcecast> A0, int nthreads){

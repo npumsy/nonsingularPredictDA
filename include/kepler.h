@@ -112,6 +112,10 @@ std::vector<double> gveGetTiming();
 void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt, int nthreads,
                           double beta, std::vector<double> &rv_all);
 
+// 同上但**逐星 κ**（betas 长度 n；长度 1 则广播）。P4.3 θ 学习正向。
+void gvePropagateNoeBatchBeta(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                              int nfr, double dt, int nthreads, std::vector<double> &rv_all);
+
 // 解析两体 STM 折叠（GPU）：rv0(n,6) + A0(n,36) → A（平铺 nfr*n*18，[f][i][3×6]，A_f=(Φ_f·A0)[0:3]）。
 void stmFoldGpuBatch(const std::vector<Vector6d> &rv0s, int nfr, double dt,
                      const std::vector<double> &A0flat, int nthreads, std::vector<double> &A_all);
