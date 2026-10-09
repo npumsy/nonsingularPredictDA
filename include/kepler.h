@@ -1,5 +1,6 @@
 #include <functional>
 #include <vector>
+#include <array>
 #include <Eigen/Dense>
 // #define BOOST_MATH_INSTRUMENT true
 
@@ -108,6 +109,11 @@ void gveStepNoeBatch(const std::vector<Vector6d> &oe0s, double t0, double dt, in
 void gveResetTiming();
 std::vector<double> gveGetTiming();
 
+// 设定整星共享的 RBF 残差力场（CUDA）：中心（km）/宽度 s（km）/权重 θ（长度 m）。centers 空 → 关闭。
+// 与 dastate.cpp 的 RBF 同式：a_res=Σ_k θ_k (w/s²)(r-c_k)，w=exp(-|r-c_k|²/(2s²))。
+void setRbfCuda(const std::vector<std::array<double,3>> &centers, double s,
+                const std::vector<double> &w);
+
 // 整弧多帧 GVE（CUDA）：每星线程链式 nfr-1 次单步，输出每帧 rv（平铺 nfr*n*6，[f][i][6]）。
 void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt, int nthreads,
                           double beta, std::vector<double> &rv_all);
@@ -115,6 +121,10 @@ void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
 // 同上但**逐星 κ**（betas 长度 n；长度 1 则广播）。P4.3 θ 学习正向。
 void gvePropagateNoeBatchBeta(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
                               int nfr, double dt, int nthreads, std::vector<double> &rv_all);
+
+// 多重打靶 chunk 并行前向：rv0s=(n,6, m)，L 帧一 chunk，二体解析热启动 + 全动力学推 L 帧，输出 rv (nfr,n,6)。
+void gvePropagateChunkBatch(const std::vector<Vector6d> &rv0s, int nfr, int L, double dt, double beta,
+                            std::vector<double> &rv_all);
 
 // 解析两体 STM 折叠（GPU）：rv0(n,6) + A0(n,36) → A（平铺 nfr*n*18，[f][i][3×6]，A_f=(Φ_f·A0)[0:3]）。
 void stmFoldGpuBatch(const std::vector<Vector6d> &rv0s, int nfr, double dt,

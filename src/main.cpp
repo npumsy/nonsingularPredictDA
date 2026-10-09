@@ -327,6 +327,19 @@ PYBIND11_MODULE(qoe, m)
       m.def("gveGetTiming", &kep3::gveGetTiming,
             "GVE 单步细粒度计时 [pack, h2d, kernel, d2h]（秒，累计）");
       m.def("gveResetTiming", &kep3::gveResetTiming, "清零 GVE 单步细粒度计时");
+      m.def("setRbfCuda",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> centers, double s,
+                py::array_t<double, py::array::c_style | py::array::forcecast> w){
+            auto bc = centers.request(); auto bw = w.request();
+            std::vector<std::array<double,3>> C;
+            if(bc.ndim == 2 && bc.shape[1] == 3){
+                const double* p = static_cast<const double*>(bc.ptr);
+                for(py::ssize_t k=0; k<bc.shape[0]; ++k) C.push_back({p[3*k], p[3*k+1], p[3*k+2]});
+            }
+            std::vector<double> wv(static_cast<double*>(bw.ptr), static_cast<double*>(bw.ptr) + bw.size);
+            { py::gil_scoped_release release; kep3::setRbfCuda(C, s, wv); }
+            }, py::arg("centers"), py::arg("s"), py::arg("w"),
+            "设定整星共享 RBF 力场：centers(m,3,km), s(km), w(m)；centers 空 → 关闭");
       m.def("gvePropagateNoeBatchFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nfr,
                 double dt, int nthreads, double beta){
@@ -339,6 +352,18 @@ PYBIND11_MODULE(qoe, m)
             return O;
             }, py::arg("oe"), py::arg("nfr"), py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
             "整弧多帧 GVE（CUDA）：(n,6) → rv (nfr,n,6)");
+      m.def("gvePropagateChunkFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv0, int nfr, int L,
+                double dt, int nthreads, double beta){
+            std::vector<Vector6d> v = _v6_from_np(rv0, "gvePropagateChunkFlat");
+            const int n = (int)v.size();
+            std::vector<double> rv_all;
+            { py::gil_scoped_release release; kep3::gvePropagateChunkBatch(v, nfr, L, dt, beta, rv_all); }
+            py::array_t<double> O({(std::size_t)nfr, (std::size_t)n, (std::size_t)6});
+            std::memcpy(O.mutable_data(), rv_all.data(), rv_all.size()*sizeof(double));
+            return O;
+            }, py::arg("rv0"), py::arg("nfr"), py::arg("L")=18, py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
+            "多重打靶 chunk 并行前向：rv0(n,6) → rv(nfr,n,6)（L 帧一 chunk，二体解析热启动）");
       m.def("gvePropagateBetaFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
                 py::array_t<double, py::array::c_style | py::array::forcecast> betas,
