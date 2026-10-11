@@ -67,7 +67,7 @@ set(SRC_LIST src/elements.cpp src/integrater.cpp src/kepler.cpp src/dastate.cpp 
 # （此前 qoe 与 qoejopt 各编一份 gve_step.cu，构建时间翻倍且异常慢）。
 add_library(qoe_core STATIC src/gve_step.cu)
 target_include_directories(qoe_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
-target_link_libraries(qoe_core PUBLIC CUDA::cudart)
+target_link_libraries(qoe_core PUBLIC CUDA::cudart CUDA::cusolver CUDA::cublas)
 set_target_properties(qoe_core PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_PROPAGATE_HOST_FLAGS ON)
 
 # Set Include h file path
@@ -92,7 +92,7 @@ set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
 # qoejopt：joint 内环 C++/CUDA（device 常驻装配）。独立模块，仅依赖 gve_step.cu 的核 + pybind11
 # （不引 dace/torch：rv0/A0 由 Python 用 qoe 的扁平入口算好传入；Baspacho 仍在 Python/Theseus 侧）。
 pybind11_add_module(qoejopt src/qoejopt.cpp)
-target_link_libraries(qoejopt PRIVATE qoe_core OpenMP::OpenMP_CXX CUDA::cudart)
+target_link_libraries(qoejopt PRIVATE qoe_core OpenMP::OpenMP_CXX CUDA::cudart CUDA::cusolver CUDA::cublas)
 target_include_directories(qoejopt PRIVATE ${PROJECT_SOURCE_DIR}/include)
 # 设置编译目标
 # add_executable(da src/dastate.cpp)

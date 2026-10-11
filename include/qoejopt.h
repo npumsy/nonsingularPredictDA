@@ -27,6 +27,8 @@ struct Ctx {
     int off_isl = 0, off_gts = 0, off_damp = 0;
     double dt = 0.0, s_isl = 1.0, s_gts = 1.0, issq = 0.0, sigma_a = 0.0;
     int prior_mode = 0, cov_mode = 0;
+    int stm_gve = 0;            // 1=joint 的 d_A 用同源全动力学变分 Φ_oe（`stmFoldGveKernel`），0=二体
+    int sub_steps = 1;          // >1：每输出帧=一段，内部 sub_steps 个 dt/sub_steps 子步（大步长段级递推）
 
     // device 结构/观测（setup 上传）
     int *d_isl_i = nullptr, *d_isl_jj = nullptr, *d_gts_a = nullptr;
@@ -53,6 +55,8 @@ struct Ctx {
     double *d_X = nullptr, *d_rv0 = nullptr, *d_A0 = nullptr;
     double *d_P = nullptr,   // rv 全帧 (nfr*n*6)
            *d_A = nullptr,   // 位置 Jacobian 折叠 (nfr*n*18)
+           *d_phi_all = nullptr,  // 每帧 Φ_oe=∂oe_f/∂oe_0 (nfr*n*36，窗口 P⁻ 跨窗递推用)
+           *d_Pw = nullptr,       // 窗口 P 递推 scratch (n*36)
            *d_res = nullptr; // res2 累加器 (1)
 };
 
@@ -88,6 +92,21 @@ double jointIslRes2(Ctx &c);
 
 // 把 d_P (nfr*n*6) 拷回 host。
 void jointCopyOut(const Ctx &c, double *host_rv);
+// 整弧单发：由 QOE 先验 d_P0 与先验均值 d_zprior 算 rv 边界 d_P0rv=J0 P0 J0ᵀ（J0=∂rv/∂oe）。
+void jointSetCov0(Ctx &c);
+
+// K 帧单发窗口：P⁻ 跨窗递推 P_next_i = Φ_{s,i} P_i Φ_{s,i}ᵀ + Q_i（均在 QOE 空间；
+// Φ 取 d_phi_all 的第 stride 帧=∂oe_{stride}/∂oe_0，Q 由调用方按 rv→oe 映射后传入）。
+// hPp/hQ/hPn 均为 (n,36) host；需先 setup 且已 win_fold（d_phi_all 就绪）。
+void winPriorPropDevice(Ctx &c, const double *hPp, const double *hQ, int stride, double *hPn);
+
+// 可观测性：装配 H=AᵀA（ncol×ncol，ISL + prior 行）到 d_H；需先 expand（d_P/d_A 就绪）。
+void obsFormHDevice(Ctx &c, double *d_H);
+// H 对称特征分解（cuSOLVER syevd）：返回全谱升序 eval(ncol) 与最小 k 个特征向量 evec(ncol,k)。
+void obsEigDevice(Ctx &c, const double *d_H, int k, std::vector<double> &eval,
+                  std::vector<double> &evec);
+// 逐星有效 Jacobian Gram 的 6 个特征（奇异值²，升序）：h_sv2 (n,6)。需先 expand。
+void obsPerStarDevice(Ctx &c, double *h_sv2);
 
 // 细粒度计时（秒，累计）：[expand(GVE), stmfold, assemble, res2]。
 void jointResetTiming();
@@ -101,6 +120,9 @@ void dbgJac(const double *oe_host, int n, double beta, double *Aout, double *Fou
 // 单步 GVE + 全动力学变分 STM（Φ_oe=∂oe(dt)/∂oe(0)，设备端中心差分 Jacobian）；供 EKF-qoe 预测。
 // d_oe (n×6) → d_oef (n×6) 与 d_Phi (n×36)。
 void gveStmDevice(const double *d_oe, int n, double dt, double beta, double *d_oef, double *d_Phi);
+
+// 同源全动力学 STM 折叠：d_A(nfr,n,18)=∂p_f/∂oe_0（链式变分 Φ_oe，`gveStmStep_dev`）。
+void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta, double *d_A);
 
 // P4.2/CUDA：整弧 RBF θ 前向敏度 S_f = ∂oe_f/∂θ（nfr,n,6,m）；centers/s 需先 qoe.setRbfCuda 预设。
 // 变分方程 dS/dt = (∂f/∂oe)S + ∂f/∂θ（∂f/∂θ_k = RHS(ap=第 k 基加速度)），与状态同一 3/8-RK4。

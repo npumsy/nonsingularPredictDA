@@ -5,6 +5,8 @@
 // 积分用与 `rk4<Vector6d>` 相同的 **3/8 规则**（不是经典 1/6,2/6,2/6,1/6）。
 // 无 DA、无高阶展开；每帧一次 `dt` 单步，链式得到整弧状态。
 #include <cuda_runtime.h>
+#include <cusolverDn.h>
+#include <cublas_v2.h>
 #include <vector>
 #include <array>
 #include <cmath>
@@ -510,14 +512,14 @@ __device__ __forceinline__ void gveRhsFromAp_d_dev(const Dual6* OE, const Dual6*
 }
 
 // 全动力学 RHS 的对偶版
-__device__ __forceinline__ void gveRhs_d_dev(const Dual6* OE, double beta, Dual6* out){
+__device__ __noinline__ void gveRhs_d_dev(const Dual6* OE, double beta, Dual6* out){
     Dual6 rv[6]; oe2rv_d_dev(OE, rv);
     Dual6 ap[3]; pertAccel_d_dev(rv, beta, ap);
     gveRhsFromAp_d_dev(OE, ap, out);
 }
 
 // 解析：同时给 f(oe) 值与 A=∂f/∂oe（对偶传播，一次求值）
-__device__ __forceinline__ void gveRhsJacVal_dev(const double* OE, double beta,
+__device__ __noinline__ void gveRhsJacVal_dev(const double* OE, double beta,
                                                  double A[6][6], double fval[6]){
     Dual6 x[6], out[6];
     #pragma unroll
@@ -535,7 +537,7 @@ __device__ __forceinline__ void gveRhsJac_dev(const double* OE, double beta, dou
 }
 
 // 解析 ∂f/∂β：阻力对 β 线性，β=1 的阻力加速度即 ∂ap/∂β（m/s²）
-__device__ __forceinline__ void gveRhsKappa_dev(const double* OE, const double* rv_m, double Fk[6]){
+__device__ __noinline__ void gveRhsKappa_dev(const double* OE, const double* rv_m, double Fk[6]){
     double xk[6];
     #pragma unroll
     for(int k=0;k<6;k++) xk[k]=rv_m[k]*1e-3;
@@ -860,6 +862,202 @@ __global__ void stmFoldKernel(const double* rv0, int n, int nfr, double dt, cons
             }
     }
 }
+
+namespace qoejopt {
+// ---- 单步全动力学变分 STM（就地）+ 段级（段首冻结 A）+ 同源 STM 折叠 + 段级传播 ----
+// 单步：y(6) → y 与 Φ=∂y_out/∂y_in（与状态同 3/8-RK4，A 每阶段精确）。
+__device__ __noinline__ void gveStmStep_dev(double *y, double beta, double dt, double Phi[6][6]) {
+    double k1[6], k2[6], k3[6], k4[6], tmp[6], yn[6];
+    double P[6][6], K1[6][6], K2[6][6], K3[6][6], K4[6][6], A[6][6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) P[a][b] = (a == b) ? 1.0 : 0.0;
+    gveRhsJacVal_dev(y, beta, A, k1);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * P[c][b]; K1[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * k1[c] / 3.0;
+    gveRhsJacVal_dev(tmp, beta, A, k2);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * K1[c][b] / 3.0); K2[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
+    gveRhsJacVal_dev(tmp, beta, A, k3);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (-K1[c][b] / 3.0 + K2[c][b])); K3[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
+    gveRhsJacVal_dev(tmp, beta, A, k4);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (K1[c][b] - K2[c][b] + K3[c][b])); K4[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) yn[c] = y[c] + dt * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Phi[a][b] = P[a][b] + dt * (K1[a][b] + 3.0 * K2[a][b] + 3.0 * K3[a][b] + K4[a][b]) / 8.0;
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = yn[c];
+}
+
+// 段级（每输出帧=一段，内部 nsub 个 dt/nsub 子步）：段首冻结 A，段内状态精确 RHS-RK4、
+// STM 用冻结 A 的线性步进 Φ←(I+hA)Φ。nsub<=1 退化为单步精确。
+__device__ __noinline__ void gveStmStepSub_dev(double *y, double beta, double dt, int nsub, double Phi[6][6]) {
+    if (nsub <= 1) { gveStmStep_dev(y, beta, dt, Phi); return; }
+    const double h = dt / (double)nsub;
+    double A[6][6], kd[6];
+    gveRhsJacVal_dev(y, beta, A, kd);                 // 段首冻结 A
+    double P[6][6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) P[a][b] = (a == b) ? 1.0 : 0.0;
+    for (int s = 0; s < nsub; ++s) {
+        double kk1[6], kk2[6], kk3[6], kk4[6], tmp[6], yn[6];
+        gveRhs_dev(y, beta, kk1);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * kk1[c] / 3.0;
+        gveRhs_dev(tmp, beta, kk2);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * (-kk1[c] / 3.0 + kk2[c]);
+        gveRhs_dev(tmp, beta, kk3);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * (kk1[c] - kk2[c] + kk3[c]);
+        gveRhs_dev(tmp, beta, kk4);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) yn[c] = y[c] + h * (kk1[c] + 3.0 * kk2[c] + 3.0 * kk3[c] + kk4[c]) / 8.0;
+        double Pn[6][6];
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) { double s = P[a][b];
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += h * A[a][c] * P[c][b]; Pn[a][b] = s; }
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) y[c] = yn[c];
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) P[a][b] = Pn[a][b];
+    }
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Phi[a][b] = P[a][b];
+}
+
+// 段级状态步（每输出帧=一段，nsub 个 dt/nsub 子步的精确 3/8-RK4，就地更新 y）。
+__device__ __forceinline__ void gveStepSub_dev(double *y, double beta, double dt, int nsub) {
+    const int ns = (nsub > 1 ? nsub : 1);
+    const double h = dt / (double)ns;
+    double k1[6], k2[6], k3[6], k4[6], tmp[6];
+    for (int s = 0; s < ns; ++s) {
+        gveRhs_dev(y, beta, k1);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * k1[c] / 3.0;
+        gveRhs_dev(tmp, beta, k2);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * (-k1[c] / 3.0 + k2[c]);
+        gveRhs_dev(tmp, beta, k3);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * (k1[c] - k2[c] + k3[c]);
+        gveRhs_dev(tmp, beta, k4);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) y[c] = y[c] + h * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    }
+}
+
+// 从 QOE 算 rv(6) 与位置 Jacobian A18=∂p/∂oe(3×6)（设备端对偶）。
+__device__ __forceinline__ void rvJac_dev(const double *oe, double *rv, double *A18) {
+    Dual6 OD[6];
+    #pragma unroll
+    for (int j = 0; j < 6; ++j) OD[j] = d6_var(oe[j], j);
+    Dual6 xd[6]; oe2rv_d_dev(OD, xd);
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) rv[c] = xd[c].v;
+    #pragma unroll
+    for (int c = 0; c < 3; ++c)
+        #pragma unroll
+        for (int j = 0; j < 6; ++j) A18[c*6+j] = xd[c].d[j];
+}
+
+// 同源全动力学 STM 折叠：d_A[f]=∂p_f/∂oe_0（链式 Φ_oe），并输出每帧 Φ_oe（d_phi_all）与 rv（rv_all，可空）。
+__global__ void stmFoldGveKernel(const double *oe0, int n, int nfr, double dt, int nsub, double beta,
+                                 double *d_A, double *d_phi_all, double *rv_all) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double y[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    double rv[6], J[18];
+    rvJac_dev(y, rv, J);
+    double Phi[6][6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Phi[a][b] = (a == b) ? 1.0 : 0.0;
+    for (int f = 0; f < nfr; ++f) {
+        double *Ao = d_A + ((size_t)f*n + idx)*18;
+        #pragma unroll
+        for (int a = 0; a < 3; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) { double s = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += J[a*6+c]*Phi[c][b]; Ao[a*6+b] = s; }
+        if (d_phi_all) {
+            double *Po = d_phi_all + ((size_t)f*n + idx)*36;
+            #pragma unroll
+            for (int a = 0; a < 36; ++a) Po[a] = ((const double*)Phi)[a];
+        }
+        if (rv_all) {
+            double *Ro = rv_all + ((size_t)f*n + idx)*6;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) Ro[c] = rv[c];
+        }
+        if (f + 1 < nfr) {
+            double Ps[6][6];
+            gveStmStepSub_dev(y, beta, dt, nsub, Ps);
+            double Pn[6][6];
+            #pragma unroll
+            for (int a = 0; a < 6; ++a)
+                #pragma unroll
+                for (int b = 0; b < 6; ++b) { double s = 0.0;
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) s += Ps[a][c]*Phi[c][b]; Pn[a][b] = s; }
+            #pragma unroll
+            for (int a = 0; a < 6; ++a)
+                #pragma unroll
+                for (int b = 0; b < 6; ++b) Phi[a][b] = Pn[a][b];
+            rvJac_dev(y, rv, J);
+        }
+    }
+}
+
+void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta, double *d_A) {
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    stmFoldGveKernel<<<blocks, threads>>>(d_oe, n, nfr, dt, 1, beta, d_A, nullptr, nullptr);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[stmFoldGveDevice] %s\n", cudaGetErrorString(err));
+}
+
+// 段级 GVE 传播：每输出帧=一段，内部 nsub 个 dt/nsub 子步的精确 3/8-RK4；输出每帧 rv（nfr,n,6）。
+__global__ void gvePropagateSubKernel(const double *oe0, int n, int nfr, double dt, int nsub, double beta,
+                                      double *rv_all) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const int nsub1 = (nsub > 1 ? nsub : 1);
+    double y[6], rv[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    oe2rv_dev(y, rv);
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) rv_all[((size_t)0*n + idx)*6 + c] = rv[c];
+    for (int f = 1; f < nfr; ++f) {
+        gveStepSub_dev(y, beta, dt, nsub1);
+        oe2rv_dev(y, rv);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) rv_all[((size_t)f*n + idx)*6 + c] = rv[c];
+    }
+}
+
+}  // namespace qoejopt
 
 // Host 包装：对 n 个 QOE 各做一次 dt 单步（链式调用即得整弧）。t0 保留接口（RHS 自治，未用）。
 namespace kep3 {
@@ -1413,6 +1611,34 @@ __global__ void ssPriorAsmKernel(const double *fac, const double *z, const doubl
 // 单发窗口协方差（rv 空间，**状态与 STM 同源=二体解析**）：边界 QOE oe0 + QOE 先验 P0 →
 // 每帧 rv_f(m) 与 P_f^rv = Φ_rv,f P0rv Φ_rv,fᵀ + Q_f（过程噪声在 rv 空间，物理）。
 // 状态用 twoBodyRvDev、协方差用 stmTwoBodyDev，二者同一二体模型 → 一致、不发散、保留全 6×6。
+__device__ __forceinline__ void mm6_dev(const double *A, const double *B, double *C) {
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) { double s = 0.0;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) s += A[a*6+c]*B[c*6+b]; C[a*6+b] = s; }
+}
+__device__ __forceinline__ void mm6t_dev(const double *A, const double *B, double *C) {
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) { double s = 0.0;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) s += A[a*6+c]*B[b*6+c]; C[a*6+b] = s; }
+}
+// 过程噪声 Q = kron(Q3, I3)（Q3 为 CWNA 块 q00,q01,q11）；叠加到已对称的 6×6（rv 空间）。
+__device__ __forceinline__ void addProcNoise6_dev(double *P, double dt, double sigma_a) {
+    const double s2 = sigma_a * sigma_a;
+    const double q00 = s2 * dt * dt * dt / 3.0, q01 = s2 * dt * dt / 2.0, q11 = s2 * dt;
+    #pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        P[k * 6 + k] += q00;
+        P[(k + 3) * 6 + (k + 3)] += q11;
+        P[k * 6 + (k + 3)] += q01;
+        P[(k + 3) * 6 + k] += q01;
+    }
+}
 __global__ void ssCovKernel(const double *oe0, const double *P0b, int n, int nfr, double dt,
                             double sigma_a, double *rv_all, double *P_all) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1462,9 +1688,6 @@ __global__ void ssCovKernel(const double *oe0, const double *P0b, int n, int nfr
         double *rvp = rv_all + ((size_t)f * n + idx) * 6;
         rvp[0] = rf[0] * 1e3; rvp[1] = rf[1] * 1e3; rvp[2] = rf[2] * 1e3;
         rvp[3] = vf[0] * 1e3; rvp[4] = vf[1] * 1e3; rvp[5] = vf[2] * 1e3;
-        const double q00 = sigma_a * sigma_a * tof * tof * tof / 3.0;
-        const double q01 = sigma_a * sigma_a * tof * tof / 2.0;
-        const double q11 = sigma_a * sigma_a * tof;
         double A1[36], Prv[36];
         #pragma unroll
         for (int a = 0; a < 6; ++a)
@@ -1482,11 +1705,9 @@ __global__ void ssCovKernel(const double *oe0, const double *P0b, int n, int nfr
                 double s = 0.0;
                 #pragma unroll
                 for (int c = 0; c < 6; ++c) s += A1[a * 6 + c] * Phi[bb][c];
-                if (a < 3 && bb < 3) s += q00;
-                else if (a >= 3 && bb >= 3) s += q11;
-                else s += q01;
                 Prv[a * 6 + bb] = s;
             }
+        addProcNoise6_dev(Prv, tof, sigma_a);
         double *Po = P_all + ((size_t)f * n + idx) * 36;
         #pragma unroll
         for (int a = 0; a < 36; ++a) Po[a] = Prv[a];
@@ -1513,11 +1734,16 @@ __global__ void oeJacKernel(const double *X, int n, double *rv0, double *A0) {
 }
 
 void jointExpandDevice(Ctx &c) {
-    const int threads = 256;
+    const int threads = 32;                         // 小块多 block（n=1152 → 36 block）填满 SM；256 只有 5 block
     const int blocks = (c.n + threads - 1) / threads;
     const double t0 = _jnow();
-    oeJacKernel<<<blocks, threads>>>(c.d_X, c.n, c.d_rv0, c.d_A0);   // rv0/A0 设备端（免 host DACE）
-    gvePropagateKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, 1.0, c.d_P);
+    if (!(c.stm_gve && c.sub_steps > 1)) {          // 段级同源折叠时位置(与 rv0/A0)由 stmFoldGveKernel 一并输出
+        oeJacKernel<<<blocks, threads>>>(c.d_X, c.n, c.d_rv0, c.d_A0);   // rv0/A0 设备端（免 host DACE）
+        if (c.sub_steps > 1)
+            gvePropagateSubKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0, c.d_P);
+        else
+            gvePropagateKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, 1.0, c.d_P);
+    }
     cudaError_t err = cudaDeviceSynchronize();
     jt_expand += _jnow() - t0;
     if (err != cudaSuccess)
@@ -1525,10 +1751,14 @@ void jointExpandDevice(Ctx &c) {
 }
 
 void jointStmFoldDevice(Ctx &c) {
-    const int threads = 256;
+    const int threads = c.stm_gve ? 32 : 256;       // gve 折叠：小块多 block 填满 SM
     const int blocks = (c.n + threads - 1) / threads;
     const double t0 = _jnow();
-    stmFoldKernel<<<blocks, threads>>>(c.d_rv0, c.n, c.nfr, c.dt, c.d_A0, c.d_A);
+    if (c.stm_gve)
+        stmFoldGveKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0,
+                                              c.d_A, c.d_phi_all, c.d_P);
+    else
+        stmFoldKernel<<<blocks, threads>>>(c.d_rv0, c.n, c.nfr, c.dt, c.d_A0, c.d_A);
     cudaError_t err = cudaDeviceSynchronize();
     jt_stm += _jnow() - t0;
     if (err != cudaSuccess)
@@ -1608,6 +1838,7 @@ static void _asmKernels(Ctx &c, double *A_val, double *b) {
 double jointAssembleInto(Ctx &c, double *A_val, double *b) {
     jointExpandDevice(c);
     jointStmFoldDevice(c);
+    if (c.cov_mode == 2) ssFrameCovDevice(c, 3);      // 逐帧先验递推 d_Pm（白化 ISL/GTS 行）
     const double t_asm0 = _jnow();
     _asmKernels(c, A_val, b);
     jt_asm += _jnow() - t_asm0;
@@ -1624,12 +1855,234 @@ double jointAssembleCachedInto(Ctx &c, double *A_val, double *b) {
 double jointIslRes2(Ctx &c) {
     jointExpandDevice(c);
     jointStmFoldDevice(c);
+    if (c.cov_mode == 2) ssFrameCovDevice(c, 3);      // 逐帧先验递推 d_Pm（白化 ISL/GTS 行）
     return jointRes2Impl(c);
 }
 
 void jointCopyOut(const Ctx &c, double *host_rv) {
     cudaMemcpy(host_rv, c.d_P, (size_t)c.nfr * c.n * 6 * sizeof(double),
                cudaMemcpyDeviceToHost);
+}
+
+// ---- QOE 先验 → rv 边界 P0rv = J P0 Jᵀ（J=∂rv/∂oe，设备端对偶）----
+__global__ void priorQoeToRvKernel(const double *oe, const double *P0q, int n, double *P0rv) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    Dual6 OD[6];
+    #pragma unroll
+    for (int j = 0; j < 6; ++j) OD[j] = d6_var(oe[i*6+j], j);
+    Dual6 xd[6]; oe2rv_d_dev(OD, xd);
+    double J[36];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c)
+        #pragma unroll
+        for (int j = 0; j < 6; ++j) J[c*6+j] = xd[c].d[j];
+    const double *P = P0q + (size_t)i*36;
+    double tmp[36], out[36];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) { double s = 0.0;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) s += J[a*6+c]*P[c*6+b]; tmp[a*6+b] = s; }
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) { double s = 0.0;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) s += tmp[a*6+c]*J[b*6+c]; out[a*6+b] = s; }
+    double *Po = P0rv + (size_t)i*36;
+    #pragma unroll
+    for (int a = 0; a < 36; ++a) Po[a] = out[a];
+}
+
+void jointSetCov0(Ctx &c) {
+    const int threads = 256, blocks = (c.n + threads - 1) / threads;
+    priorQoeToRvKernel<<<blocks, threads>>>(c.d_zprior, c.d_P0, c.n, c.d_P0rv);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[jointSetCov0] %s\n", cudaGetErrorString(err));
+}
+
+// ---- K 帧单发窗口：P⁻ 跨窗递推 Pn = Φ_s Pp Φ_sᵀ + Q（QOE 空间，Φ_s=d_phi_all 第 stride 帧）----
+__global__ void winPriorPropKernel(const double *Phi, const double *Pp, const double *Q,
+                                   double *Pn, int n, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double *Ph = Phi + ((size_t)stride*n + i)*36;   // ∂oe_stride/∂oe_0
+    const double *Ppi = Pp + (size_t)i*36;
+    double tmp[36], out[36];
+    mm6t_dev(Ppi, Ph, tmp); mm6_dev(Ph, tmp, out);
+    const double *Qi = Q + (size_t)i*36;
+    double *Pni = Pn + (size_t)i*36;
+    #pragma unroll
+    for (int a = 0; a < 36; ++a) Pni[a] = out[a] + Qi[a];
+}
+
+void winPriorPropDevice(Ctx &c, const double *hPp, const double *hQ, int stride, double *hPn) {
+    const std::size_t bytes = (std::size_t)c.n * 36 * sizeof(double);
+    double *dPp = nullptr, *dQ = nullptr;
+    cudaMalloc(&dPp, bytes); cudaMalloc(&dQ, bytes);
+    cudaMemcpy(dPp, hPp, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(dQ, hQ, bytes, cudaMemcpyHostToDevice);
+    const int threads = 256, blocks = (c.n + threads - 1) / threads;
+    winPriorPropKernel<<<blocks, threads>>>(c.d_phi_all, dPp, dQ, c.d_Pw, c.n, stride > 0 ? stride : 0);
+    cudaMemcpy(hPn, c.d_Pw, bytes, cudaMemcpyDeviceToHost);
+    cudaFree(dPp); cudaFree(dQ);
+}
+
+// ---- 可观测性：装配 H=AᵀA（ISL 行 + 先验行）到 d_H（ncol×ncol 稠密，row-major）----
+__global__ void obsFormHKernel(const double *d_P, const double *d_A, const int *isl_i, const int *isl_jj,
+                               const double *isl_W, int n, int nfr, int E, double s_isl, int off_isl,
+                               double *d_H) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nfr * E) return;
+    if (isl_W[idx] <= 0.0) return;
+    const int f = idx / E;
+    const int i = isl_i[idx], j = isl_jj[idx];
+    const int ncol = 6 * n;
+    const double *pi = d_P + ((size_t)f*n + i)*6, *pj = d_P + ((size_t)f*n + j)*6;
+    double d0 = pi[0]-pj[0], d1 = pi[1]-pj[1], d2 = pi[2]-pj[2];
+    double r = sqrt(d0*d0 + d1*d1 + d2*d2); if (r < 1e-12) return;
+    double u0 = d0/r, u1 = d1/r, u2 = d2/r;
+    const double *Ai = d_A + ((size_t)f*n + i)*18;
+    const double *Aj = d_A + ((size_t)f*n + j)*18;
+    double Ji[6], Jj[6];
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        Ji[k] = u0*Ai[0*6+k] + u1*Ai[1*6+k] + u2*Ai[2*6+k];
+        Jj[k] = u0*Aj[0*6+k] + u1*Aj[1*6+k] + u2*Aj[2*6+k];
+    }
+    const double w = s_isl * s_isl;
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) {
+            atomicAdd(&d_H[(size_t)(i*6+a)*ncol + (i*6+b)], w * Ji[a] * Ji[b]);
+            atomicAdd(&d_H[(size_t)(j*6+a)*ncol + (j*6+b)], w * Jj[a] * Jj[b]);
+            double s = -w * Ji[a] * Jj[b];
+            atomicAdd(&d_H[(size_t)(i*6+a)*ncol + (j*6+b)], s);
+            atomicAdd(&d_H[(size_t)(j*6+b)*ncol + (i*6+a)], s);
+        }
+}
+
+__global__ void obsPriorHKernel(const double *fac, int n, int ncol, double *d_H) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double *F = fac + (size_t)i*36;   // 6 行 × 6 列（A_prior=chol(P0^-1)^T）
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) { double s = 0.0;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) s += F[c*6+a] * F[c*6+b];   // A_priorᵀ A_prior
+            atomicAdd(&d_H[(size_t)(i*6+a)*ncol + (i*6+b)], s); }
+}
+
+void obsFormHDevice(Ctx &c, double *d_H) {
+    const int ncol = c.ncol;
+    cudaMemset(d_H, 0, (std::size_t)ncol * ncol * sizeof(double));
+    const int threads = 256;
+    const int nISL = c.nfr * c.E;
+    if (nISL > 0)
+        obsFormHKernel<<<(nISL + threads - 1) / threads, threads>>>(
+            c.d_P, c.d_A, c.d_isl_i, c.d_isl_jj, c.d_isl_W, c.n, c.nfr, c.E, c.s_isl, c.off_isl, d_H);
+    if (c.prior_mode)
+        obsPriorHKernel<<<(c.n + threads - 1) / threads, threads>>>(c.d_prior_fac, c.n, ncol, d_H);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[obsFormHDevice] %s\n", cudaGetErrorString(err));
+}
+
+// 对称 6×6 循环 Jacobi（返回升序特征值）。
+__device__ __forceinline__ void jacobiEig6_dev(double A[6][6], double ev[6]) {
+    for (int sweep = 0; sweep < 40; ++sweep) {
+        double off = 0.0;
+        #pragma unroll
+        for (int p = 0; p < 6; ++p)
+            #pragma unroll
+            for (int q = p + 1; q < 6; ++q) off += A[p][q] * A[p][q];
+        if (off < 1e-30) break;
+        #pragma unroll
+        for (int p = 0; p < 6; ++p)
+            #pragma unroll
+            for (int q = p + 1; q < 6; ++q) {
+                if (fabs(A[p][q]) < 1e-300) continue;
+                double theta = (A[q][q] - A[p][p]) / (2.0 * A[p][q]);
+                double t = (theta >= 0.0 ? 1.0 : -1.0) / (fabs(theta) + sqrt(theta * theta + 1.0));
+                double c = 1.0 / sqrt(t * t + 1.0), s = t * c;
+                #pragma unroll
+                for (int k = 0; k < 6; ++k) { double akp = A[k][p], akq = A[k][q]; A[k][p] = c*akp - s*akq; A[k][q] = s*akp + c*akq; }
+                #pragma unroll
+                for (int k = 0; k < 6; ++k) { double apk = A[p][k], aqk = A[q][k]; A[p][k] = c*apk - s*aqk; A[q][k] = s*apk + c*aqk; }
+            }
+    }
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) ev[i] = A[i][i];
+    #pragma unroll
+    for (int i = 0; i < 6; ++i)
+        #pragma unroll
+        for (int j = i + 1; j < 6; ++j) if (ev[j] < ev[i]) { double t = ev[i]; ev[i] = ev[j]; ev[j] = t; }
+}
+
+// 逐星有效 Jacobian Gram（Σ_f (∂p_f/∂oe)ᵀ(∂p_f/∂oe)，6×6）的 6 特征（奇异值²，升序）：h_sv2 (n,6)。
+__global__ void obsPerStarKernel(const double *d_A, int n, int nfr, double *h_sv2) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double G[6][6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) G[a][b] = 0.0;
+    for (int f = 0; f < nfr; ++f) {
+        const double *Ao = d_A + ((size_t)f*n + i)*18;
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+                #pragma unroll
+                for (int k = 0; k < 3; ++k) s += Ao[k*6+a] * Ao[k*6+b];
+                G[a][b] += s;
+            }
+    }
+    double ev[6]; jacobiEig6_dev(G, ev);
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) h_sv2[(size_t)i*6 + a] = ev[a];
+}
+
+void obsPerStarDevice(Ctx &c, double *h_sv2) {
+    double *d_sv2 = nullptr;
+    cudaMalloc(&d_sv2, (std::size_t)c.n * 6 * sizeof(double));
+    const int threads = 256, blocks = (c.n + threads - 1) / threads;
+    obsPerStarKernel<<<blocks, threads>>>(c.d_A, c.n, c.nfr, d_sv2);
+    cudaMemcpy(h_sv2, d_sv2, (std::size_t)c.n * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(d_sv2);
+}
+
+// ---- H 对称特征分解（cuSOLVER syevd）：全谱升序 eval(ncol) + 最小 k 个特征向量 evec(ncol,k) ----
+void obsEigDevice(Ctx &c, const double *d_H, int k, std::vector<double> &eval,
+                  std::vector<double> &evec) {
+    const int ncol = c.ncol;
+    eval.assign(ncol, 0.0); evec.assign((std::size_t)ncol * k, 0.0);
+    cusolverDnHandle_t h; cusolverDnCreate(&h);
+    cudaStream_t st = nullptr;
+    double *d_eig = nullptr, *d_A2 = nullptr; int *d_info = nullptr;
+    cudaMalloc(&d_eig, (std::size_t)ncol * sizeof(double));
+    cudaMalloc(&d_A2, (std::size_t)ncol * ncol * sizeof(double));
+    cudaMalloc(&d_info, sizeof(int));
+    cudaMemcpy(d_A2, d_H, (std::size_t)ncol * ncol * sizeof(double), cudaMemcpyDeviceToDevice);
+    int lwork = 0;
+    cusolverDnDsyevd_bufferSize(h, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, ncol, d_A2, ncol, d_eig, &lwork);
+    double *d_work = nullptr; cudaMalloc(&d_work, (std::size_t)lwork * sizeof(double));
+    cusolverDnDsyevd(h, CUSOLVER_EIG_MODE_VECTOR, CUBLAS_FILL_MODE_LOWER, ncol, d_A2, ncol, d_eig, d_work, lwork, d_info);
+    cudaDeviceSynchronize();
+    std::vector<double> allv((std::size_t)ncol * ncol);
+    cudaMemcpy(allv.data(), d_A2, (std::size_t)ncol * ncol * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(eval.data(), d_eig, (std::size_t)ncol * sizeof(double), cudaMemcpyDeviceToHost);
+    // syevd 输出列主序：A2 的第 j 列（列主序为 allv[j*ncol + i]）为第 j 个特征向量；取最小 k 列
+    for (int j = 0; j < k && j < ncol; ++j)
+        for (int i = 0; i < ncol; ++i) evec[(std::size_t)j * ncol + i] = allv[(std::size_t)j * ncol + i];
+    cudaFree(d_eig); cudaFree(d_A2); cudaFree(d_info); cudaFree(d_work);
+    cusolverDnDestroy(h);
 }
 
 // ---- P4.2 前向敏度：S_f = ∂oe_f/∂κ（变分方程 + 同一 3/8-RK4）----
@@ -2053,22 +2506,6 @@ void gveRbfSensBatch(const std::vector<kep3::Vector6d> &oe0s, int nfr, double dt
 // ===================== 逐帧协方差（单发 ncol=6N）：rv 空间，状态与 STM 同源=二体 =====================
 // P_k^- = Φ_k P_{k-1}^+ Φ_kᵀ + Q(dt)（二体单步 Φ）；ISL/GTS 后验注入 H=[û,0]（rv 空间，测量仅位置）：
 // S_k = Σ Hᵀ R⁻¹ H；P_k^+ = (P_k^{-,-1}+S_k)^{-1}。迭代间 P_{k-1}^+ 取上一轮（Jacobi）→ 时间并行。
-__device__ __forceinline__ void mm6_dev(const double *A, const double *B, double *C) {
-    #pragma unroll
-    for (int a = 0; a < 6; ++a)
-        #pragma unroll
-        for (int b = 0; b < 6; ++b) { double s = 0.0;
-            #pragma unroll
-            for (int c = 0; c < 6; ++c) s += A[a*6+c]*B[c*6+b]; C[a*6+b] = s; }
-}
-__device__ __forceinline__ void mm6t_dev(const double *A, const double *B, double *C) {
-    #pragma unroll
-    for (int a = 0; a < 6; ++a)
-        #pragma unroll
-        for (int b = 0; b < 6; ++b) { double s = 0.0;
-            #pragma unroll
-            for (int c = 0; c < 6; ++c) s += A[a*6+c]*B[b*6+c]; C[a*6+b] = s; }
-}
 // 逐 (星 i, 帧 k) 的协方差步：Pprev(rv 6×6) → Pm=P_k^-、Pp=P_k^+（rv 空间）。
 __device__ __forceinline__ void frameCovStep_rv(
         const double *d_P, int i, int k, int n, double dt, double sigma_a,
@@ -2084,16 +2521,8 @@ __device__ __forceinline__ void frameCovStep_rv(
         const double r0k[3] = { rv0[0]*1e-3, rv0[1]*1e-3, rv0[2]*1e-3 };
         const double v0k[3] = { rv0[3]*1e-3, rv0[4]*1e-3, rv0[5]*1e-3 };
         double Phi[6][6]; stmTwoBodyDev(r0k, v0k, dt, MU_KM, Phi);
-        double tmp[36]; mm6t_dev((const double*)Phi, Pprev, tmp); mm6_dev(tmp, (const double*)Phi, Pmv);
-        double q00 = sigma_a*sigma_a*dt*dt*dt/3.0, q01 = sigma_a*sigma_a*dt*dt/2.0, q11 = sigma_a*sigma_a*dt;
-        #pragma unroll
-        for (int a = 0; a < 6; ++a)
-            #pragma unroll
-            for (int b = 0; b < 6; ++b) {
-                if (a < 3 && b < 3) Pmv[a*6+b] += q00;
-                else if (a >= 3 && b >= 3) Pmv[a*6+b] += q11;
-                else Pmv[a*6+b] += q01;
-            }
+        double tmp[36]; mm6t_dev(Pprev, (const double*)Phi, tmp); mm6_dev((const double*)Phi, tmp, Pmv);
+        addProcNoise6_dev(Pmv, dt, sigma_a);
     }
     double S[36];
     #pragma unroll

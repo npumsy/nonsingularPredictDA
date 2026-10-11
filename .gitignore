@@ -5,3 +5,4 @@ include/dace
 lib
 build
 *.pyc
+buildtmp

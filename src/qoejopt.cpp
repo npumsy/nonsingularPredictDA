@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <array>
@@ -32,7 +33,7 @@ static void _free_ctx() {
     cudaFree(c.d_P0rv); cudaFree(c.d_Pm); cudaFree(c.d_Pp); cudaFree(c.d_PpPrev);
     cudaFree(c.d_adj_j); cudaFree(c.d_adj_w);
     cudaFree(c.d_X); cudaFree(c.d_rv0); cudaFree(c.d_A0);
-    cudaFree(c.d_P); cudaFree(c.d_A); cudaFree(c.d_res);
+    cudaFree(c.d_P); cudaFree(c.d_A); cudaFree(c.d_phi_all); cudaFree(c.d_Pw); cudaFree(c.d_res);
     g_ctx = Ctx{};
 }
 
@@ -101,6 +102,8 @@ static void setup(int n, int nfr, int E, int G, int ncol, int nnz, int nrows,
     cudaMalloc(&c.d_A0, bA0);
     cudaMalloc(&c.d_P, bP);
     cudaMalloc(&c.d_A, bA);
+    cudaMalloc(&c.d_phi_all, (std::size_t)nfr * n * 36 * sizeof(double));
+    cudaMalloc(&c.d_Pw, (std::size_t)n * 36 * sizeof(double));
     cudaMalloc(&c.d_res, sizeof(double));
 }
 
@@ -440,6 +443,136 @@ static double win_assemble(py::array_t<double, py::array::c_style | py::array::f
                                       reinterpret_cast<double *>(b_ptr));
 }
 
+// ---- 整弧单发：先验协方差 / STM 同源切换 / 段级子步 / 可观测性 ----
+// host 6×6 对称特征分解（Jacobi），回 A_prior=chol(P0^-1)^T 的 (n,36) 因子（行 a 全 6 列）。
+static void _host_info_fac(const double *P, int n, std::vector<double> &fac) {
+    fac.assign((std::size_t)n * 36, 0.0);
+    for (int i = 0; i < n; ++i) {
+        double A[6][6], V[6][6];
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b) { A[a][b] = P[(std::size_t)i*36 + a*6 + b]; V[a][b] = (a == b) ? 1.0 : 0.0; }
+        for (int sweep = 0; sweep < 40; ++sweep) {
+            double off = 0.0;
+            for (int p = 0; p < 6; ++p) for (int q = p + 1; q < 6; ++q) off += A[p][q] * A[p][q];
+            if (off < 1e-30) break;
+            for (int p = 0; p < 6; ++p) for (int q = p + 1; q < 6; ++q) {
+                if (fabs(A[p][q]) < 1e-300) continue;
+                double theta = (A[q][q] - A[p][p]) / (2.0 * A[p][q]);
+                double t = (theta >= 0.0 ? 1.0 : -1.0) / (fabs(theta) + sqrt(theta * theta + 1.0));
+                double c = 1.0 / sqrt(t * t + 1.0), s = t * c;
+                for (int k = 0; k < 6; ++k) { double akp = A[k][p], akq = A[k][q]; A[k][p] = c*akp - s*akq; A[k][q] = s*akp + c*akq; }
+                for (int k = 0; k < 6; ++k) { double apk = A[p][k], aqk = A[q][k]; A[p][k] = c*apk - s*aqk; A[q][k] = s*apk + c*aqk; }
+                for (int k = 0; k < 6; ++k) { double vkp = V[k][p], vkq = V[k][q]; V[k][p] = c*vkp - s*vkq; V[k][q] = s*vkp + c*vkq; }
+            }
+        }
+        // w[a] = A[a][a]（特征值，升序无妨）；A_prior[a][b] = V[b][a]/sqrt(clip(w[a]))
+        for (int a = 0; a < 6; ++a) {
+            double w = A[a][a] < 1e-3 ? 1e-3 : A[a][a];
+            double si = 1.0 / sqrt(w);
+            for (int b = 0; b < 6; ++b) fac[(std::size_t)i*36 + a*6 + b] = V[b][a] * si;
+        }
+    }
+}
+
+static void set_stm_gve(int flag) { g_ctx.stm_gve = flag ? 1 : 0; }
+static void set_sub_steps(int nsub) { g_ctx.sub_steps = nsub > 0 ? nsub : 1; }
+
+static py::array_t<double> stm_fold_gve(py::array_t<double, py::array::c_style | py::array::forcecast> x,
+                                        int nfr, double dt, double beta) {
+    auto buf = x.request();
+    if (buf.ndim != 2 || buf.shape[1] != 6) throw std::runtime_error("qoejopt.stm_fold_gve: x 需 (n,6)");
+    const std::size_t n = (std::size_t)buf.shape[0];
+    double *dx = nullptr, *dA = nullptr;
+    cudaMalloc(&dx, n * 6 * sizeof(double));
+    cudaMalloc(&dA, (std::size_t)nfr * n * 18 * sizeof(double));
+    cudaMemcpy(dx, buf.ptr, n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    { py::gil_scoped_release rel; qoejopt::stmFoldGveDevice(dx, (int)n, nfr, dt, beta, dA); }
+    py::array_t<double> A({(py::ssize_t)nfr, (py::ssize_t)n, (py::ssize_t)18});
+    cudaMemcpy(A.mutable_data(), dA, (std::size_t)nfr * n * 18 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(dA);
+    return A;
+}
+
+static void set_prior_cov(py::array_t<double, py::array::c_style | py::array::forcecast> P0,
+                          py::array_t<double, py::array::c_style | py::array::forcecast> zprior,
+                          double sigma_a, int cov_mode) {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.set_prior_cov: 未先 setup");
+    c.sigma_a = sigma_a; c.prior_mode = 1; c.cov_mode = cov_mode;
+    if (!c.d_P0) cudaMalloc(&c.d_P0, (std::size_t)c.n * 36 * sizeof(double));
+    if (!c.d_prior_fac) cudaMalloc(&c.d_prior_fac, (std::size_t)c.n * 36 * sizeof(double));
+    if (!c.d_zprior) cudaMalloc(&c.d_zprior, (std::size_t)c.n * 6 * sizeof(double));
+    if (!c.d_P0rv) cudaMalloc(&c.d_P0rv, (std::size_t)c.n * 36 * sizeof(double));
+    if (!c.d_Pm) cudaMalloc(&c.d_Pm, (std::size_t)c.nfr * c.n * 36 * sizeof(double));
+    if (!c.d_Pp) cudaMalloc(&c.d_Pp, (std::size_t)c.nfr * c.n * 36 * sizeof(double));
+    if (!c.d_PpPrev) cudaMalloc(&c.d_PpPrev, (std::size_t)c.nfr * c.n * 36 * sizeof(double));
+    if (!c.d_cov) cudaMalloc(&c.d_cov, (std::size_t)c.nfr * c.n * 36 * sizeof(double));
+    if (!c.d_phi) cudaMalloc(&c.d_phi, (std::size_t)c.nfr * c.n * 36 * sizeof(double));
+    _copy_to_dev(c.d_P0, P0, (std::size_t)c.n * 36);
+    _copy_to_dev(c.d_zprior, zprior, (std::size_t)c.n * 6);
+    std::vector<double> fac;
+    _host_info_fac(static_cast<const double *>(P0.request().ptr), c.n, fac);
+    cudaMemcpy(c.d_prior_fac, fac.data(), (std::size_t)c.n * 36 * sizeof(double), cudaMemcpyHostToDevice);
+    { py::gil_scoped_release rel; qoejopt::jointSetCov0(c); }   // d_P0rv = J P0 Jᵀ
+}
+
+static py::array_t<double> win_prior_prop(py::array_t<double, py::array::c_style | py::array::forcecast> Pp,
+                                          py::array_t<double, py::array::c_style | py::array::forcecast> Q,
+                                          int stride) {
+    Ctx &c = g_ctx;
+    if (!c.d_phi_all) throw std::runtime_error("qoejopt.win_prior_prop: 未先 setup");
+    const std::size_t sz = (std::size_t)c.n * 36;
+    std::vector<double> Pn(sz);
+    {
+        py::gil_scoped_release rel;
+        qoejopt::winPriorPropDevice(c, static_cast<const double *>(Pp.request().ptr),
+                                    static_cast<const double *>(Q.request().ptr), stride, Pn.data());
+    }
+    py::array_t<double> out({(py::ssize_t)c.n, (py::ssize_t)6, (py::ssize_t)6});
+    std::memcpy(out.mutable_data(), Pn.data(), sz * sizeof(double));
+    return out;
+}
+
+static py::tuple obs_spectrum(int k) {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.obs_spectrum: 未先 setup");
+    const int ncol = c.ncol;
+    double *d_H = nullptr;
+    cudaMalloc(&d_H, (std::size_t)ncol * ncol * sizeof(double));
+    std::vector<double> eval, evec;
+    {
+        py::gil_scoped_release rel;
+        qoejopt::obsFormHDevice(c, d_H);
+        qoejopt::obsEigDevice(c, d_H, k, eval, evec);
+    }
+    cudaFree(d_H);
+    py::array_t<double> EV((py::ssize_t)ncol);
+    std::memcpy(EV.mutable_data(), eval.data(), eval.size() * sizeof(double));
+    py::array_t<double> VEC({(py::ssize_t)ncol, (py::ssize_t)k});
+    std::memcpy(VEC.mutable_data(), evec.data(), evec.size() * sizeof(double));
+    return py::make_tuple(EV, VEC);
+}
+
+static py::array_t<double> obs_perstar() {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.obs_perstar: 未先 setup");
+    std::vector<double> sv((std::size_t)c.n * 6);
+    { py::gil_scoped_release rel; qoejopt::obsPerStarDevice(c, sv.data()); }
+    py::array_t<double> out({(py::ssize_t)c.n, (py::ssize_t)6});
+    std::memcpy(out.mutable_data(), sv.data(), sv.size() * sizeof(double));
+    return out;
+}
+
+static py::array_t<double> copy_rv() {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.copy_rv: 未先 setup");
+    std::vector<double> h((std::size_t)c.nfr * c.n * 6);
+    { py::gil_scoped_release rel; qoejopt::jointCopyOut(c, h.data()); }
+    py::array_t<double> out({(py::ssize_t)c.nfr, (py::ssize_t)c.n, (py::ssize_t)6});
+    std::memcpy(out.mutable_data(), h.data(), h.size() * sizeof(double));
+    return out;
+}
+
 PYBIND11_MODULE(qoejopt, m) {
     m.doc() = "joint 单发全局联合内环 C++/CUDA 核心（device 常驻装配；A_val/b 写调用方 torch cuda 缓冲）";
     m.def("setup", &setup, py::arg("n"), py::arg("nfr"), py::arg("E"), py::arg("G"),
@@ -495,6 +628,21 @@ PYBIND11_MODULE(qoejopt, m) {
     }, "细粒度计时 [expand(GVE), stmfold, assemble, res2]（秒）");
     m.def("reset_timing", &qoejopt::jointResetTiming, "清零 qoejopt 计时");
     m.def("free", &_free_ctx, "释放 device 缓冲");
+    m.def("set_stm_gve", &set_stm_gve, py::arg("flag"),
+          "joint d_A 折叠切换：1=同源全动力学变分 Φ_oe（stmFoldGveKernel），0=二体");
+    m.def("set_sub_steps", &set_sub_steps, py::arg("nsub"),
+          "段级：每输出帧=一段、内部 nsub 个 dt/sub 子步（大步长段级递推）");
+    m.def("stm_fold_gve", &stm_fold_gve, py::arg("x"), py::arg("nfr"), py::arg("dt"),
+          py::arg("beta") = 1.0, "同源全动力学 STM 折叠：x(n,6) → d_A(nfr,n,18)=∂p_f/∂oe_0");
+    m.def("set_prior_cov", &set_prior_cov, py::arg("P0"), py::arg("zprior"), py::arg("sigma_a"),
+          py::arg("cov_mode"),
+          "整弧单发先验：每星 QOE 6×6 P0 + 先验均值 zprior → 信息先验（+ cov_mode=2 逐帧递推白化）");
+    m.def("win_prior_prop", &win_prior_prop, py::arg("Pp"), py::arg("Q"), py::arg("stride") = 0,
+          "K 帧单发窗口：P⁻ 跨窗递推 Pn = Φ_s Pp Φ_sᵀ + Q（(n,36)×2 → (n,6,6)）");
+    m.def("obs_spectrum", &obs_spectrum, py::arg("k") = 32,
+          "可观测性：装配 H=AᵀA 的 (eval 升序 ncol, evec ncol×k)（cuSOLVER syevd）");
+    m.def("obs_perstar", &obs_perstar, "逐星有效 Jacobian Gram 的 6 特征（奇异值²，升序）(n,6)");
+    m.def("copy_rv", &copy_rv, "把当前 d_P（nfr,n,6）拷回 numpy（不重展开）");
 
     // 单发窗口（win_assemble_ss）：单发 L 帧 + 每星 6×6 先验 + 协方差白化
     m.def("setup_win_ss", &setup_win_ss, py::arg("n"), py::arg("L"), py::arg("E"), py::arg("G"),
