@@ -94,6 +94,28 @@ set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
 pybind11_add_module(qoejopt src/qoejopt.cpp)
 target_link_libraries(qoejopt PRIVATE qoe_core OpenMP::OpenMP_CXX CUDA::cudart CUDA::cusolver CUDA::cublas)
 target_include_directories(qoejopt PRIVATE ${PROJECT_SOURCE_DIR}/include)
+
+# qoefls：FLS 固定滞后平滑 C++ 核心（factor/滑窗/边缘化全在 C++）。
+# 链 qoe_core（GVE 核）+ torch + BaSpaCho（theseus/baspacho 构建产物）。
+list(APPEND CMAKE_PREFIX_PATH
+     "/home/msy/miniconda3/envs/rover_slam/lib/python3.10/site-packages/torch/share/cmake")
+find_package(Torch REQUIRED)
+set(BS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../theseus/baspacho")
+set(TH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../theseus/theseus")
+pybind11_add_module(qoefls src/fls_win.cpp src/dastate.cpp src/kepler.cpp src/elements.cpp src/integrater.cpp
+  "${TH_ROOT}/extlib/baspacho_solver.cpp"
+  "${TH_ROOT}/extlib/baspacho_solver_cuda.cu")
+target_link_directories(qoefls PRIVATE "/home/msy/miniconda3/envs/rover_slam/lib")
+target_link_libraries(qoefls PRIVATE qoe_core dace::dace torch
+  "/home/msy/miniconda3/envs/rover_slam/lib/python3.10/site-packages/torch/lib/libtorch_python.so"
+  "${BS_ROOT}/build/baspacho/baspacho/libBaSpaCho.a"
+  "${BS_ROOT}/build/_deps/dispenso-build/dispenso/libdispenso.a"
+  "-l:libopenblas.so.0"
+  OpenMP::OpenMP_CXX CUDA::cudart CUDA::cusolver CUDA::cublas)
+set_target_properties(qoefls PROPERTIES BUILD_RPATH "${BS_ROOT}/build/baspacho/baspacho;${BS_ROOT}/build/_deps/dispenso-build/dispenso;/home/msy/miniconda3/envs/rover_slam/lib;${DACE_LIBDIR}")
+target_include_directories(qoefls PRIVATE ${PROJECT_SOURCE_DIR}/include ${TH_ROOT} ${BS_ROOT}
+  "${BS_ROOT}/build/_deps/dispenso-src")
+target_compile_definitions(qoefls PRIVATE THESEUS_HAVE_CUDA)
 # 设置编译目标
 # add_executable(da src/dastate.cpp)
 # target_link_libraries(da dace)
@@ -113,3 +135,26 @@ add_executable(gtest_qoe test/test_qoe_gtest.cpp src/kepler.cpp src/elements.cpp
 target_link_libraries(gtest_qoe dastate GTest::gtest GTest::gtest_main)
 target_link_libraries(gtest_qoe dace::dace OpenMP::OpenMP_CXX)
 set_target_properties(gtest_qoe PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
+
+# --- gtest：FLS 逐星边缘核（P1'）——合成小例落盘 + 与同算法 host 参考对拍
+#     + 真实规模核计时 + 求解链（SymbolicDecomposition/add_MtM/factor/solve）耗时归因（glog 输出）---
+find_library(GLOG_LIB NAMES glog PATHS /usr/local/lib /usr/lib/x86_64-linux-gnu)
+add_executable(gtest_fls_marg test/test_fls_marg_gtest.cpp
+  "${TH_ROOT}/extlib/baspacho_solver.cpp"
+  "${TH_ROOT}/extlib/baspacho_solver_cuda.cu")
+target_link_directories(gtest_fls_marg PRIVATE "/home/msy/miniconda3/envs/rover_slam/lib")
+target_link_libraries(gtest_fls_marg qoe_core GTest::gtest pybind11::headers Python3::Python torch
+  "/home/msy/miniconda3/envs/rover_slam/lib/python3.10/site-packages/torch/lib/libtorch_python.so"
+  "${BS_ROOT}/build/baspacho/baspacho/libBaSpaCho.a"
+  "${BS_ROOT}/build/_deps/dispenso-build/dispenso/libdispenso.a"
+  "-l:libopenblas.so.0" OpenMP::OpenMP_CXX
+  CUDA::cudart CUDA::cusolver CUDA::cublas)
+set_target_properties(gtest_fls_marg PROPERTIES BUILD_RPATH
+  "${BS_ROOT}/build/baspacho/baspacho;${BS_ROOT}/build/_deps/dispenso-build/dispenso;/home/msy/miniconda3/envs/rover_slam/lib;${DACE_LIBDIR}")
+if(GLOG_LIB)
+  target_link_libraries(gtest_fls_marg ${GLOG_LIB})
+  target_include_directories(gtest_fls_marg PRIVATE /usr/local/include /usr/include)
+endif()
+target_include_directories(gtest_fls_marg PRIVATE ${PROJECT_SOURCE_DIR}/include ${TH_ROOT} ${BS_ROOT}
+  "${BS_ROOT}/build/_deps/dispenso-src")
+target_compile_definitions(gtest_fls_marg PRIVATE THESEUS_HAVE_CUDA)

@@ -1,6 +1,6 @@
 /build/**
-!/build/qoe.cpython-38-x86_64-linux-gnu.so
-!/build/libdastate.so
+# !/build/qoe.cpython-38-x86_64-linux-gnu.so
+# !/build/libdastate.so
 include/dace
 lib
 build

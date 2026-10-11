@@ -164,6 +164,98 @@ static py::tuple gve_stm(py::array_t<double, py::array::c_style | py::array::for
     return py::make_tuple(OE, PH);
 }
 
+static py::tuple gve_stm_ia(py::array_t<double, py::array::c_style | py::array::forcecast> x,
+                            double dt, double beta) {
+    auto buf = x.request();
+    if (buf.ndim != 2 || buf.shape[1] != 6)
+        throw std::runtime_error("qoejopt.gve_stm_ia: x 需 (n,6)");
+    const std::size_t n = (std::size_t)buf.shape[0];
+    double *dx = nullptr, *doe = nullptr, *dPhi = nullptr;
+    cudaMalloc(&dx, n * 6 * sizeof(double));
+    cudaMalloc(&doe, n * 6 * sizeof(double));
+    cudaMalloc(&dPhi, n * 36 * sizeof(double));
+    cudaMemcpy(dx, buf.ptr, n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    {
+        py::gil_scoped_release rel;
+        qoejopt::gveStmIADev(dx, (int)n, dt, beta, doe, dPhi);
+    }
+    py::array_t<double> OE({(py::ssize_t)n, (py::ssize_t)6});
+    py::array_t<double> PH({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)6});
+    cudaMemcpy(OE.mutable_data(), doe, n * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(PH.mutable_data(), dPhi, n * 36 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(doe); cudaFree(dPhi);
+    return py::make_tuple(OE, PH);
+}
+
+static py::array_t<double> gve_ctrl(py::array_t<double, py::array::c_style | py::array::forcecast> x) {
+    auto buf = x.request();
+    if (buf.ndim != 2 || buf.shape[1] != 6)
+        throw std::runtime_error("qoejopt.gve_ctrl: x 需 (n,6)");
+    const std::size_t n = (std::size_t)buf.shape[0];
+    double *dx = nullptr, *dB = nullptr;
+    cudaMalloc(&dx, n * 6 * sizeof(double));
+    cudaMalloc(&dB, n * 18 * sizeof(double));
+    cudaMemcpy(dx, buf.ptr, n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    {
+        py::gil_scoped_release rel;
+        qoejopt::gveCtrlDev(dx, (int)n, dB);
+    }
+    py::array_t<double> B({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)3});
+    cudaMemcpy(B.mutable_data(), dB, n * 18 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(dB);
+    return B;
+}
+
+static py::tuple gve_dyn_factor(py::array_t<double, py::array::c_style | py::array::forcecast> xlo,
+                                py::array_t<double, py::array::c_style | py::array::forcecast> xhi,
+                                double dt, double beta) {
+    auto bl = xlo.request(); auto bh = xhi.request();
+    if (bl.ndim != 3 || bl.shape[2] != 6)
+        throw std::runtime_error("qoejopt.gve_dyn_factor: x_lo 需 (nseg,n,6)");
+    const int nseg = (int)bl.shape[0], n = (int)bl.shape[1];
+    const std::size_t tot = (std::size_t)nseg * n;
+    double *dl = nullptr, *dh = nullptr, *dres = nullptr, *dphi = nullptr;
+    cudaMalloc(&dl, tot * 6 * sizeof(double)); cudaMalloc(&dh, tot * 6 * sizeof(double));
+    cudaMalloc(&dres, tot * 6 * sizeof(double)); cudaMalloc(&dphi, tot * 36 * sizeof(double));
+    cudaMemcpy(dl, bl.ptr, tot * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(dh, bh.ptr, tot * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    {
+        py::gil_scoped_release rel;
+        qoejopt::gveDynFactorDev(dl, dh, nseg, n, dt, beta, dres, dphi);
+    }
+    py::array_t<double> RES({(py::ssize_t)nseg, (py::ssize_t)n, (py::ssize_t)6});
+    py::array_t<double> PHI({(py::ssize_t)nseg, (py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)6});
+    cudaMemcpy(RES.mutable_data(), dres, tot * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(PHI.mutable_data(), dphi, tot * 36 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dl); cudaFree(dh); cudaFree(dres); cudaFree(dphi);
+    return py::make_tuple(RES, PHI);
+}
+
+static void win_prior_asm(py::array_t<double, py::array::c_style | py::array::forcecast> X,
+                          py::array_t<double, py::array::c_style | py::array::forcecast> pri_fac,
+                          py::array_t<double, py::array::c_style | py::array::forcecast> zp,
+                          int pnode, int off_pri, int base_b, uint64_t Aval_ptr, uint64_t b_ptr) {
+    auto bx = X.request(); auto bf = pri_fac.request(); auto bz = zp.request();
+    if (bx.ndim != 3 || bx.shape[2] != 6) throw std::runtime_error("win_prior_asm: X 需 (L,n,6)");
+    const int L = (int)bx.shape[0], n = (int)bx.shape[1];
+    if (pnode < 0 || pnode >= L) throw std::runtime_error("win_prior_asm: pnode 越界");
+    if ((std::size_t)bf.size != (std::size_t)n * 36) throw std::runtime_error("win_prior_asm: pri_fac 需 (n,36)");
+    if ((std::size_t)bz.size != (std::size_t)n * 6) throw std::runtime_error("win_prior_asm: zp 需 (n,6)");
+    double *dX = nullptr, *dF = nullptr, *dZ = nullptr;
+    cudaMalloc(&dX, (std::size_t)L * n * 6 * sizeof(double));
+    cudaMalloc(&dF, (std::size_t)n * 36 * sizeof(double));
+    cudaMalloc(&dZ, (std::size_t)n * 6 * sizeof(double));
+    cudaMemcpy(dX, bx.ptr, (std::size_t)L * n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(dF, bf.ptr, (std::size_t)n * 36 * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(dZ, bz.ptr, (std::size_t)n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    {
+        py::gil_scoped_release rel;
+        qoejopt::winPriorAsmDevice(dX, dF, dZ, n, pnode, off_pri, base_b,
+                                   reinterpret_cast<double *>(Aval_ptr), reinterpret_cast<double *>(b_ptr));
+    }
+    cudaFree(dX); cudaFree(dF); cudaFree(dZ);
+}
+
 static py::tuple state_sens(py::array_t<double, py::array::c_style | py::array::forcecast> x, double beta) {
     Ctx &c = g_ctx;
     if (!c.d_X) throw std::runtime_error("qoejopt.state_sens: 未先 setup");
@@ -397,7 +489,7 @@ static void _free_wctx() {
 
 static void setup_win(int n, int L, int E, int G, int ncol, int nnz, int nrows,
                       int off_isl, int off_gts, int off_dyn, int off_damp,
-                      double dt, double s_isl, double s_gts, double issq,
+                      double dt, double s_isl, double s_gts, double issq, int prior, int q_perstar,
                       py::array_t<int, py::array::c_style | py::array::forcecast> isl_i,
                       py::array_t<int, py::array::c_style | py::array::forcecast> isl_jj,
                       py::array_t<double, py::array::c_style | py::array::forcecast> isl_D,
@@ -412,7 +504,8 @@ static void setup_win(int n, int L, int E, int G, int ncol, int nnz, int nrows,
     qoejopt::WinCtx &c = g_wctx;
     c.n = n; c.L = L; c.E = E; c.G = G; c.ncol = ncol; c.nnz = nnz; c.nrows = nrows;
     c.off_isl = off_isl; c.off_gts = off_gts; c.off_dyn = off_dyn; c.off_damp = off_damp;
-    c.dt = dt; c.s_isl = s_isl; c.s_gts = s_gts; c.issq = issq;
+    c.dt = dt; c.s_isl = s_isl; c.s_gts = s_gts; c.issq = issq; c.prior = prior ? 1 : 0;
+    c.q_perstar = q_perstar ? 1 : 0;
     c.d_isl_i = _upload(isl_i); c.d_isl_jj = _upload(isl_jj);
     c.d_isl_D = _upload(isl_D); c.d_isl_W = _upload(isl_W);
     c.d_gts_a = _upload(gts_a); c.d_gts_D = _upload(gts_D);
@@ -472,6 +565,19 @@ static void _host_info_fac(const double *P, int n, std::vector<double> &fac) {
             for (int b = 0; b < 6; ++b) fac[(std::size_t)i*36 + a*6 + b] = V[b][a] * si;
         }
     }
+}
+
+// FLS：逐星边缘协方差 P(n,6,6) → 白化因子 Lp(n,6,6)（Lpᵀ·Lp = P^{-1}），供 win_prior_asm。
+static py::array_t<double> prior_fac_ss(py::array_t<double, py::array::c_style | py::array::forcecast> P) {
+    auto b = P.request();
+    if (b.ndim != 3 || b.shape[1] != 6 || b.shape[2] != 6)
+        throw std::runtime_error("prior_fac_ss: P 需 (n,6,6)");
+    const int n = (int)b.shape[0];
+    std::vector<double> fac;
+    _host_info_fac(static_cast<const double *>(b.ptr), n, fac);
+    py::array_t<double> out({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)6});
+    std::memcpy(out.mutable_data(), fac.data(), fac.size() * sizeof(double));
+    return out;
 }
 
 static void set_stm_gve(int flag) { g_ctx.stm_gve = flag ? 1 : 0; }
@@ -610,6 +716,19 @@ PYBIND11_MODULE(qoejopt, m) {
     "设定 qoejopt 侧 RBF 力场（静态库使 __constant__ 在 qoe/qoejopt 各一份，需各自设定）");
     m.def("gve_stm", &gve_stm, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
           "单步 GVE + 全动力学变分 STM：x(n,6) oe → (oef(n,6), Φ_oe(n,6,6))");
+    m.def("gve_stm_ia", &gve_stm_ia, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
+          "一阶同源 STM：Φ≈I+A·dt（A=∂f/∂oe 解析）→ (oef(n,6), Φ(n,6,6))");
+    m.def("gve_ctrl", &gve_ctrl, py::arg("x"),
+          "GVE 控制矩阵 B=∂(oe_dot)/∂a(ECI)：x(n,6) oe → B(n,6,3)");
+    m.def("gve_dyn_factor", &gve_dyn_factor, py::arg("x_lo"), py::arg("x_hi"),
+          py::arg("dt"), py::arg("beta") = 1.0,
+          "窗内 dyn 二因子（3N 并行）：x_lo/x_hi (nseg,n,6) → (res(nseg,n,6), Φ(nseg,n,6,6))");
+    m.def("win_prior_asm", &win_prior_asm, py::arg("X"), py::arg("pri_fac"), py::arg("zp"),
+          py::arg("pnode"), py::arg("off_pri"), py::arg("base_b"),
+          py::arg("Aval_ptr"), py::arg("b_ptr"),
+          "FLS 逐星边缘先验行：pri_fac(n,36)=chol(Λ_marg)^T、zp(n,6) → A_val/b 先验组");
+    m.def("prior_fac_ss", &prior_fac_ss, py::arg("P"),
+          "FLS: 逐星边缘协方差 P(n,6,6) → 白化因子 Lp(n,6,6)，LpᵀLp=P^{-1}");
     m.def("dbg_jac", [](py::array_t<double, py::array::c_style | py::array::forcecast> x, double beta) {
         auto buf = x.request();
         if ((std::size_t)buf.size % 6 != 0) throw std::runtime_error("dbg_jac: x 需 (n,6)");
@@ -681,10 +800,11 @@ PYBIND11_MODULE(qoejopt, m) {
     m.def("setup_win", &setup_win, py::arg("n"), py::arg("L"), py::arg("E"), py::arg("G"),
           py::arg("ncol"), py::arg("nnz"), py::arg("nrows"),
           py::arg("off_isl"), py::arg("off_gts"), py::arg("off_dyn"), py::arg("off_damp"),
-          py::arg("dt"), py::arg("s_isl"), py::arg("s_gts"), py::arg("issq"),
+          py::arg("dt"), py::arg("s_isl"), py::arg("s_gts"), py::arg("issq"), py::arg("prior") = 0,
+          py::arg("q_perstar") = 0,
           py::arg("isl_i"), py::arg("isl_jj"), py::arg("isl_D"), py::arg("isl_W"),
           py::arg("gts_a"), py::arg("gts_D"), py::arg("gts_W"), py::arg("gts_Q"),
-          py::arg("ctr"), py::arg("qingt"), "L 节点批量窗口：一次注册结构/观测到 device");
+          py::arg("ctr"), py::arg("qingt"), "L 节点批量窗口：一次注册结构/观测到 device（prior=1 时末组为 6×6 先验行）");
     m.def("win_assemble", &win_assemble, py::arg("X"), py::arg("rv"), py::arg("Ap"),
           py::arg("A_val_ptr"), py::arg("b_ptr"),
           "L 节点批量窗口装配：X(Ln,6) QOE、rv(Ln,6)、Ap(Ln,18)；dyn 单步 φ/Φ + ISL/GTS/damp；返回 ISL res2");

@@ -120,6 +120,33 @@ void dbgJac(const double *oe_host, int n, double beta, double *Aout, double *Fou
 // 单步 GVE + 全动力学变分 STM（Φ_oe=∂oe(dt)/∂oe(0)，设备端中心差分 Jacobian）；供 EKF-qoe 预测。
 // d_oe (n×6) → d_oef (n×6) 与 d_Phi (n×36)。
 void gveStmDevice(const double *d_oe, int n, double dt, double beta, double *d_oef, double *d_Phi);
+// 优化版（6 线程/星，按变分列拆分；数值与 gveStmDevice 一致）
+void gveStmDeviceGrp(const double *d_oe, int n, double dt, double beta, double *d_oef,
+                     double *d_Phi);
+
+// 一阶同源 STM：Φ ≈ I + A·Δt（A=∂f/∂oe 解析，段首求一次）。FLS 的 dyn 因子雅可比用。
+void gveStmIADev(const double *d_oe, int n, double dt, double beta, double *d_oef, double *d_Phi);
+
+// GVE 控制矩阵 B=∂(oe_dot)/∂a（ECI 3 轴，每星 6×3）：FLS 过程噪声 x_dot=A·x+B·u。d_B=(n,6,3)。
+void gveCtrlDev(const double *d_oe, int n, double *d_B);
+
+// 窗内 dyn 二因子（3N 并行）：x_lo/x_hi (nseg,n,6) → res(nseg,n,6)、Φ(nseg,n,36)。
+void gveDynFactorDev(const double *d_xlo, const double *d_xhi, int nseg, int n,
+                     double dt, double beta, double *d_res, double *d_Phi);
+
+// FLS 逐星边缘先验行写入（n 星，pnode 节点，A_val/b 的 off_pri/base_b 处）。
+void winPriorAsmDevice(const double *d_X, const double *d_pri_fac, const double *d_zp, int n,
+                       int pnode, int off_pri, int base_b, double *A_val, double *b);
+
+// FLS 每步几何（全 CUDA）：QOE(n,6,device) → rv(n,6)、∂p/∂oe 前三行((n,18))。
+void oeRvJacDevice(const double *d_oe, int n, double *d_rv, double *d_Ap);
+
+// FLS 逐星边缘（P1'，每星一线程）：装配值/列均衡 + 三组行表（Λ00/Λ11 贡献、Λ10 配对）→ Lp、Pmarg。
+void flsMargDevice(const double *d_Aval, const double *d_sc,
+                   const int64_t *d00_p, const int64_t *d00_s, const int64_t *d00_c,
+                   const int64_t *d11_p, const int64_t *d11_s, const int64_t *d11_c,
+                   const int64_t *d_prs1, const int64_t *d_prs0, int n,
+                   double *d_Lp, double *d_Pm);
 
 // 同源全动力学 STM 折叠：d_A(nfr,n,18)=∂p_f/∂oe_0（链式变分 Φ_oe，`gveStmStep_dev`）。
 void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta, double *d_A);
@@ -136,6 +163,8 @@ struct WinCtx {
     int n = 0, L = 0, E = 0, G = 0, ncol = 0, nnz = 0, nrows = 0;
     int off_isl = 0, off_gts = 0, off_dyn = 0, off_damp = 0;
     double dt = 0.0, s_isl = 1.0, s_gts = 1.0, issq = 0.0;
+    int prior = 0;                                             // 1 = 末组为每星 6×6 先验行（win_assemble 不写 damp）
+    int q_perstar = 0;                                         // 1 = qingt 为 (n,36) 按星索引（否则共享 6×6）
     int *d_isl_i = nullptr, *d_isl_jj = nullptr, *d_gts_a = nullptr;
     double *d_isl_D = nullptr, *d_isl_W = nullptr;
     double *d_gts_D = nullptr, *d_gts_W = nullptr, *d_gts_Q = nullptr;
@@ -150,6 +179,29 @@ double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const d
                          double *A_val, double *b);
 void winResetTiming();
 std::vector<double> winGetTiming();
+// 仅算 ISL res2（线搜索用）：假定 WinCtx.d_rv 已刷新；不做 A/b 装配、不算 STM。
+double winRes2Only(WinCtx &c);
+
+// FLS 逐帧消去（sweep，scaled 空间）：每星一线程，装本帧 S_m,ii = ISL@m+GTS@m+dynNext 本帧侧
+// +dynPrev 上帧侧+先验(m=0)−Δ_{m-1} → 6×6 逆 → 输出 dlt_out = −Cᵀ S_m,ii⁻¹ C（C = A_mᵀ A_n，
+// A_m/A_n = dynNext 行两侧 6×6）与 gam_out = Cᵀ y（y = 本帧解）。m = L−1（末帧）时不写 Δ/γ。
+void flsFrameSweepDevice(const double *d_Aval, const double *d_sc, int n, int L, int E, int G,
+                         int m, int off_isl, int off_gts, int off_dyn, int off_damp,
+                         const int64_t *isl_p, const int64_t *isl_s, const int64_t *isl_c,
+                         const int64_t *gts_p, const int64_t *gts_s, const int64_t *gts_c,
+                         const double *d_dlt_prev, const double *d_y,
+                         double *d_dlt_out, double *d_gam_out);
+// 回代：out = C_m·z（C_m = dyn(m→m+1) 行两侧 6×6 的耦合；scaled 空间）。
+void flsCouplingDevice(const double *d_Aval, const double *d_sc, int n, int m, int off_dyn,
+                       const double *d_z, double *d_out);
+
+// FLS L=1（EKF 式单帧交接）：每星 P⁺=(prior+ISL+GTS)⁻¹（scaled→物理）→ P⁻=ΦP⁺Φᵀ+Q → 白化 Lp＝chol⁻ᵀ(P⁻)。
+// d00 行表复用（prior@0+ISL@0+GTS@0+dyn），核内跳过每星最后一条（dyn(0→1)，L=1 无该行）。
+// d_phi=(n,6,6) 单步同源 Φ；d_linv=(n,6,6) 为 Q^{-1/2}（Linv = Lq⁻¹，Q=Linv⁻¹Linv⁻ᵀ）。
+void flsEkfHandoffDevice(const double *d_Aval, const double *d_sc,
+                         const int64_t *d00_p, const int64_t *d00_s, const int64_t *d00_c,
+                         const double *d_phi, const double *d_linv, int n,
+                         double *d_Lp, double *d_Pm);
 
 }  // namespace qoejopt
 

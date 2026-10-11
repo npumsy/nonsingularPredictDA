@@ -525,9 +525,15 @@ Eigen::VectorXd rv2OEOsc(const Eigen::VectorXd &x) {
     // Angular momentum vector
     Eigen::Vector3d h = r0.cross(v0);
     
-    // Line of nodes unit vector
+    // 线节点单位向量（退化保护：赤道附近 ẑ×h≈0 时取 x 轴，避免 NaN）
     Eigen::Vector3d n = Eigen::Vector3d::UnitZ().cross(h);
-    n.normalize();
+    double n_nrm = n.norm();
+    if (n_nrm < 1e-150) {
+        n = Eigen::Vector3d::UnitX();
+    } else {
+        n /= n_nrm;
+    }
+    auto clamp1 = [](double t) { return t > 1.0 ? 1.0 : (t < -1.0 ? -1.0 : t); };
     
     Eigen::Vector3d n_cross_h = h.normalized().cross(n);
     n_cross_h.normalize();
@@ -537,7 +543,7 @@ Eigen::VectorXd rv2OEOsc(const Eigen::VectorXd &x) {
     
     if (e < 1e3 * std::numeric_limits<double>::epsilon()) {
         omega = 0;
-        nu = std::acos(n.dot(r0.normalized()));
+        nu = std::acos(clamp1(n.dot(r0.normalized())));      // 夹紧：舍入可使 |arg|>1 → NaN（近圆星 530 实测）
         if (r0.normalized().dot(h.normalized().cross(n)) < 0) {
             nu = 2 * M_PI - nu;
         }
@@ -545,11 +551,11 @@ Eigen::VectorXd rv2OEOsc(const Eigen::VectorXd &x) {
         M = E - e * std::sin(E);
         u = M + omega;
     } else {
-        omega = std::acos(n.dot(e_vec / e));
+        omega = std::acos(clamp1(n.dot(e_vec / e)));
         if (e_vec(2) < 0) {
             omega = 2 * M_PI - omega;
         }
-        nu = std::acos((e_vec / e).dot(r0.normalized()));
+        nu = std::acos(clamp1((e_vec / e).dot(r0.normalized())));
         if (r0.dot(v0) < 0) {
             nu = 2 * M_PI - nu;
         }
@@ -566,8 +572,8 @@ Eigen::VectorXd rv2OEOsc(const Eigen::VectorXd &x) {
     
     double ex = n.dot(e_vec);
     double ey = n_cross_h.dot(e_vec);
-    double i = std::acos(h(2) / h.norm());
-    double Omega = std::acos(n(0));
+    double i = std::acos(clamp1(h(2) / h.norm()));
+    double Omega = std::acos(clamp1(n(0)));
     if (n(1) < 0) {
         Omega = 2 * M_PI - Omega;
     }
