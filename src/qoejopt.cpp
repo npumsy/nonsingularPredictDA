@@ -718,6 +718,17 @@ PYBIND11_MODULE(qoejopt, m) {
           "单步 GVE + 全动力学变分 STM：x(n,6) oe → (oef(n,6), Φ_oe(n,6,6))");
     m.def("gve_stm_ia", &gve_stm_ia, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
           "一阶同源 STM：Φ≈I+A·dt（A=∂f/∂oe 解析）→ (oef(n,6), Φ(n,6,6))");
+    m.def("oe2rv_jac", [](py::array_t<double, py::array::c_style | py::array::forcecast> X) {
+            auto buf = X.request();
+            if (buf.ndim != 2 || buf.shape[1] != 6)
+                throw std::runtime_error("qoejopt.oe2rv_jac: 需 (n,6) 数组");
+            const int n = (int)buf.shape[0];
+            py::array_t<double> rv({(py::ssize_t)n, (py::ssize_t)6});
+            py::array_t<double> J({(py::ssize_t)n, (py::ssize_t)36});
+            { py::gil_scoped_release rel;
+              qoejopt::oe2rvJacHost((const double *)buf.ptr, n, rv.mutable_data(), J.mutable_data()); }
+            return py::make_tuple(rv, J);
+          }, py::arg("X"), "CUDA 批量 QOE→rv 与解析 J=∂rv/∂oe：(n,6) → (rv (n,6), J (n,36))");
     m.def("gve_ctrl", &gve_ctrl, py::arg("x"),
           "GVE 控制矩阵 B=∂(oe_dot)/∂a(ECI)：x(n,6) oe → B(n,6,3)");
     m.def("gve_dyn_factor", &gve_dyn_factor, py::arg("x_lo"), py::arg("x_hi"),

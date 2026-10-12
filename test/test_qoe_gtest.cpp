@@ -181,11 +181,105 @@ TEST(LongProp, LongArcFinite) {
     }
 }
 
-// 阻力长期传播：有限、非零效应
+// 阻力长期传播：有限、非零效应（rp0 为近地点地心距）
 TEST(LongProp, DragFinite) {
     VectorXd om = osculating::OEOsc2OEMeanEU(sample_oe()[0], 200, 1e-9, 1e-11);
-    VectorXd op = osculating::OscElemsLongDrag_BCrho0(om, 1440.0, 535e3, 65.35644970323516e3, bddd::MU);
+    VectorXd op = osculating::OscElemsLongDrag_BCrho0(om, 1440.0, bddd::RE + 535e3,
+                                                      65.35644970323516e3, bddd::MU);
     EXPECT_TRUE(op.allFinite());
+    EXPECT_LT(op(0), 0.0);                       // da < 0（衰减）
+    // SI 折算：×rho_p(3e-13 kg/m³)×CDA/m(4.4e-3 m²/kg) → ~0.08 m/1440s（≈5 m/day 量级）
+    EXPECT_GT(std::fabs(op(0)) * 3.0e-13 * 0.0044, 1e-3);
+}
+
+// terms 位掩码选择长期项：只考虑 J2（terms=1）== 显式 J3=J4=0；默认（terms=7）== 显式 J234
+TEST(LongProp, TermsMaskSelects) {
+    for (const auto &oe : sample_oe()) {
+        VectorXd om = osculating::OEOsc2OEMeanEU(oe, 200, 1e-9, 1e-11);
+        double tf = 3000.0;
+        VectorXd a = osculating::OscElemsLongpropagate(tf, om, bddd::RE, bddd::MU, 1e-9,
+                                                       bddd::J2, 0.0, 0.0, 1);          // J2 only
+        VectorXd b = osculating::OscElemsLongpropagate(tf, om, bddd::RE, bddd::MU, 1e-9,
+                                                       bddd::J2, 0.0, 0.0, 7);          // 掩码无 J3/J4 -> 同 J2
+        VectorXd c = osculating::OscElemsLongpropagate(tf, om, bddd::RE, bddd::MU, 1e-9,
+                                                       bddd::J2, bddd::J3, bddd::J4);   // 默认 terms=7
+        VectorXd d = osculating::OscElemsLongpropagate(tf, om, bddd::RE, bddd::MU, 1e-9,
+                                                       bddd::J2, bddd::J3, bddd::J4, 7);
+        EXPECT_TRUE(a.allFinite());
+        EXPECT_LT((a - b).norm(), 1e-12);
+        EXPECT_LT((c - d).norm(), 1e-12);
+    }
+}
+
+// J2 长期主项 = 升交点漂移 Ω + 相位进动 λ：有限差分速率与闭式公式逐项对拍
+// λ̇ = n + (3/4) n γ [η(3cos²i−1) + (5cos²i−1)]，Ω̇ = −(3/2) n γ cos i，γ = J2 (RE/p)²
+TEST(LongProp, J2MainTermsClosedForm) {
+    for (const auto &oe : sample_oe()) {
+        VectorXd om = osculating::OEOsc2OEMeanEU(oe, 200, 1e-9, 1e-11);
+        double dt = 1.0;
+        VectorXd op = osculating::OscElemsLongpropagate(dt, om, bddd::RE, bddd::MU, 1e-9,
+                                                        bddd::J2, 0.0, 0.0, 1);
+        VectorXd r = (op - om) / dt;                    // 速率：a, λ, ex, ey, i, Ω
+        double a = om(0), q1 = om(2), q2 = om(3), inc = om(4);
+        double e2 = q1 * q1 + q2 * q2, eta = std::sqrt(1 - e2), p = a * (1 - e2);
+        double n = std::sqrt(bddd::MU / (a * a * a)), g = bddd::J2 * (bddd::RE / p) * (bddd::RE / p);
+        double ci2 = std::cos(inc) * std::cos(inc), ci = std::cos(inc);
+        double lam_dot = n + 0.75 * n * g * (eta * (3 * ci2 - 1) + (5 * ci2 - 1));
+        double w_dot = 0.75 * n * g * (5 * ci2 - 1);
+        EXPECT_NEAR(r(1), lam_dot, 1e-14);              // 相位进动（主项）
+        EXPECT_NEAR(r(5), -1.5 * n * g * ci, 1e-14);    // 升交点漂移（主项）
+        EXPECT_NEAR(r(2), -q2 * w_dot, 1e-14);          // ex' = -ey ω̇
+        EXPECT_NEAR(r(3), q1 * w_dot, 1e-14);           // ey' = +ex ω̇
+        EXPECT_NEAR(r(0), 0.0, 1e-18);                  // a 无长期项
+        EXPECT_NEAR(r(4), 0.0, 1e-18);                  // i 无长期项（J2）
+    }
+}
+
+// J3/J4 相对 J2 的长期贡献应为小修正：1T 内 |Δλ_J34| ≪ |Δλ_J2|，且 J34 差非零
+TEST(LongProp, J34SmallVsJ2) {    for (int i = 0; i < 2; ++i) {
+        VectorXd om = osculating::OEOsc2OEMeanEU(sample_oe()[i], 200, 1e-9, 1e-11);
+        double T = 5769.0;
+        VectorXd j2 = osculating::OscElemsLongpropagate(T, om, bddd::RE, bddd::MU, 1e-9,
+                                                        bddd::J2, 0.0, 0.0, 1);
+        VectorXd j234 = osculating::OscElemsLongpropagate(T, om, bddd::RE, bddd::MU, 1e-9,
+                                                          bddd::J2, bddd::J3, bddd::J4, 7);
+        double dlam_j2 = std::fabs(j2(1) - om(1));
+        double dlam_j34 = std::fabs((j234(1) - om(1)) - (j2(1) - om(1)));
+        EXPECT_GT(dlam_j2, 1e-4);                       // J2 相位进动显著（rad/T）
+        EXPECT_GT(dlam_j34, 0.0);                       // J3/J4 有非零贡献
+        EXPECT_LT(dlam_j34 / dlam_j2, 5e-3);            // 但相对 J2 为小量
+    }
+}
+
+// 长期项欧拉单步（解析基准层）：与「长期传播 + rho*CDA_m*阻力增量」显式组合逐位一致；批 == 标量
+TEST(LongProp, StepCombinedMatchesPropagatePlusDrag) {
+    VectorXd om = osculating::OEOsc2OEMeanEU(sample_oe()[1], 200, 1e-9, 1e-11);
+    double dt = 1000.0, H0 = 65.0e3, rho = 3e-13, cda = 4.4e-3;
+    double rp0 = om(0) * (1 - std::hypot(om(2), om(3)));
+    VectorXd step = osculating::OscElemsLongStep(om, dt, bddd::RE, bddd::MU, bddd::J2, bddd::J3, bddd::J4,
+                                                 7, rp0, H0, rho, cda);
+    VectorXd j234 = osculating::OscElemsLongpropagate(dt, om, bddd::RE, bddd::MU, 1e-9,
+                                                      bddd::J2, bddd::J3, bddd::J4, 7);
+    VectorXd drag = osculating::OscElemsLongDrag_BCrho0(j234, dt, rp0, H0, bddd::MU);
+    EXPECT_LT((step - (j234 + (rho * cda) * drag)).norm(), 1e-12);
+    // 无阻力（rho<=0）退化为纯长期传播
+    VectorXd jonly = osculating::OscElemsLongStep(om, dt, bddd::RE, bddd::MU, bddd::J2, bddd::J3, bddd::J4,
+                                                  7, rp0, H0, 0.0, cda);
+    EXPECT_LT((jonly - j234).norm(), 1e-12);
+    // 批 == 标量（rp0/H0/rho 广播）
+    std::vector<Eigen::Matrix<double,6,1>> oes(3), oef;
+    for (int i = 0; i < 3; ++i) {
+        Eigen::Matrix<double,6,1> v;
+        for (int c = 0; c < 6; ++c) v(c) = om(c) + 1e-6 * i;
+        oes[i] = v;
+    }
+    osculating::OscElemsLongStepBatch(oes, dt, bddd::RE, bddd::MU, bddd::J2, bddd::J3, bddd::J4, 7,
+                                      {rp0}, {H0}, {rho}, cda, 2, oef);
+    for (int i = 0; i < 3; ++i) {
+        VectorXd sm = osculating::OscElemsLongStep(Eigen::VectorXd(oes[i]), dt, bddd::RE, bddd::MU,
+                                                   bddd::J2, bddd::J3, bddd::J4, 7, rp0, H0, rho, cda);
+        EXPECT_LT((Eigen::VectorXd(oef[i]) - sm).norm(), 1e-12);
+    }
 }
 
 // 三体开关 + 历元：应产生有限、量级约 1 m / 1/4T 的确定性偏差
@@ -337,6 +431,135 @@ TEST(NOE, BackwardRoundtrip) {
     Vector6d back = bwd.bkpropNomJ234Drag(Pb, 1440.0, true, 2.0);
     EXPECT_LT(std::fabs(back(0) - oe0(0)), 1e-3);       // 半长轴闭环（m）
     EXPECT_LT((back - oe0).norm(), 1e-6);               // 全要素闭环
+}
+
+// ---------------------------------------------------------------- 批量解析接口（长周期 Mean QOE 参考层）
+
+namespace {
+// 取样本星的**平均**要素（真实口径：由样本密切要素转 mean）。
+std::vector<Eigen::Matrix<double,6,1>> sample_mean_oe() {
+    std::vector<Eigen::Matrix<double,6,1>> v;
+    for (const auto &oe : sample_oe()) {
+        VectorXd om = osculating::OEOsc2OEMeanEU(oe, 200, 1e-9, 1e-11);
+        Eigen::Matrix<double,6,1> m;
+        for (int c = 0; c < 6; ++c) m(c) = om(c);
+        v.push_back(m);
+    }
+    return v;
+}
+inline double wrap_pm_pi(double x) {
+    x = std::fmod(x + M_PI, 2.0 * M_PI);
+    if (x < 0.0) x += 2.0 * M_PI;
+    return x - M_PI;
+}
+}  // namespace
+
+// 解析速率 df/dt（dt=1 s 口径）：批量 == 标量 == OscElemsLongStep(oe,1)−oe。
+TEST(LongProp, RatesBatchMatchesStep) {
+    auto oes = sample_mean_oe();
+    double H0 = 65.0e3, rho = 3e-13, cda = 4.4e-3;
+    std::vector<double> rp0;
+    for (auto &v : oes) rp0.push_back(v(0) * (1 - std::hypot(v(2), v(3))));
+    std::vector<Eigen::Matrix<double,6,1>> rates;
+    osculating::OscElemsLongRatesBatch(oes, bddd::RE, bddd::MU, bddd::J2, bddd::J3, bddd::J4, 7,
+                                       rp0, {H0}, {rho}, cda, 2, rates);
+    ASSERT_EQ(rates.size(), oes.size());
+    for (size_t i = 0; i < oes.size(); ++i) {
+        VectorXd oe = oes[i];
+        VectorXd st = osculating::OscElemsLongStep(oe, 1.0, bddd::RE, bddd::MU, bddd::J2, bddd::J3,
+                                                   bddd::J4, 7, rp0[i], H0, rho, cda);
+        EXPECT_TRUE(Eigen::VectorXd(rates[i]).allFinite());
+        EXPECT_LT((Eigen::VectorXd(rates[i]) - (st - oe)).norm(), 1e-15);
+    }
+}
+
+// 单步 Jacobian 批：与**Richardson 外推**中心差分（对「增量映射 step−x」，不同步长）对拍。
+// 注：跳过 i=1e-6 近赤道样本——J3 长期项含 1/sin i、1/tan i（近赤道奇异，∂/∂i 量级 1e6，
+//     FD 不可用）；该样本的「批==标量」由 RatesBatchMatchesStep 与长弧 Python 侧覆盖。
+//     另：drag 内 Bessel/Kepler 级数有 ~1e-10 m 量化噪声，导数 FD 相对精度上限 ~1e-3。
+TEST(LongProp, StepJacBatchMatchesFD) {
+    auto oes = sample_mean_oe();
+    double dt = 960.0, H0 = 65.0e3, rho = 3e-13, cda = 4.4e-3;
+    std::vector<double> rp0;
+    for (auto &v : oes) rp0.push_back(v(0) * (1 - std::hypot(v(2), v(3))));
+    std::vector<double> J;
+    osculating::OscElemsLongStepJacBatch(oes, dt, bddd::RE, bddd::MU, bddd::J2, bddd::J3, bddd::J4, 7,
+                                         rp0, {H0}, {rho}, cda, 2, J);
+    const double h0[6] = {3e-2, 3e-6, 3e-6, 3e-6, 3e-6, 3e-6};
+    double worst = 0.0;
+    for (size_t i = 0; i < oes.size(); ++i) {
+        if (i == 2) continue;                                 // 近赤道：J3 1/sin i 奇异，跳过 FD 对比
+        VectorXd oe = oes[i];
+        double rp_i = rp0[i];
+        for (int c = 0; c < 6; ++c) {
+            auto Dv = [&](double h) -> VectorXd {
+                VectorXd xp = oe, xm = oe;
+                xp(c) += h; xm(c) -= h;
+                return (osculating::OscElemsLongStep(xp, dt, bddd::RE, bddd::MU, bddd::J2, bddd::J3, bddd::J4,
+                                                     7, rp_i, H0, rho, cda) - xp
+                        - (osculating::OscElemsLongStep(xm, dt, bddd::RE, bddd::MU, bddd::J2, bddd::J3, bddd::J4,
+                                                        7, rp_i, H0, rho, cda) - xm)) / (2.0 * h);
+            };
+            VectorXd fd = (4.0 * Dv(h0[c]) - Dv(2.0 * h0[c])) / 3.0;   // Richardson（消 h² 项）
+            for (int r = 0; r < 6; ++r) {
+                double fdr = fd(r) + (r == c ? 1.0 : 0.0);
+                double jj = J[i * 36 + r * 6 + c];
+                double tol = 1e-6 + 1e-3 * std::max(std::fabs(fdr), 1e-9);
+                worst = std::max(worst, std::fabs(jj - fdr) / std::max(std::fabs(fdr), 1e-9));
+                EXPECT_LT(std::fabs(jj - fdr), tol)
+                    << "i=" << i << " r=" << r << " c=" << c << " jac=" << jj << " fd=" << fdr;
+            }
+        }
+    }
+    printf("[LongProp.StepJac] 最差相对差 = %.3e\n", worst);
+}
+
+// mean→osc 批量：与标量逐位一致。
+TEST(Transform, MeanOscBatchMatchesScalar) {
+    auto oms = sample_mean_oe();
+    std::vector<Eigen::Matrix<double,6,1>> out;
+    osculating::OEMeanEU2OEOscBatch(oms, 2, out);
+    ASSERT_EQ(out.size(), oms.size());
+    for (size_t i = 0; i < oms.size(); ++i) {
+        VectorXd sc = osculating::OEMeanEU2OEOsc(Eigen::VectorXd(oms[i]));
+        EXPECT_TRUE(Eigen::VectorXd(out[i]).allFinite());
+        EXPECT_LT((Eigen::VectorXd(out[i]) - sc).norm(), 1e-15);
+    }
+}
+
+// ∂Osc/∂Mean 批：与 Richardson 外推中心差分（对「Eckstein-Ustinov 摄动」，不同步长）对拍。
+TEST(Transform, MeanOscJacBatchMatchesFD) {
+    auto oms = sample_mean_oe();
+    {   // 追加 u ≈ 2π 分支点用例（摄动差分不受 wrap 影响，应同样一致）
+        Eigen::Matrix<double,6,1> m = oms[0];
+        m(1) = 2.0 * M_PI - 1e-7;
+        oms.push_back(m);
+    }
+    std::vector<double> J;
+    osculating::OEMeanEU2OEOscJacBatch(oms, 2, J);
+    const double h0[6] = {3e-2, 3e-7, 3e-4, 3e-4, 3e-4, 3e-4};
+    double worst = 0.0;
+    for (size_t i = 0; i < oms.size(); ++i) {
+        VectorXd om = oms[i];
+        for (int c = 0; c < 6; ++c) {
+            auto Dv = [&](double h) -> VectorXd {
+                VectorXd xp = om, xm = om;
+                xp(c) += h; xm(c) -= h;
+                return (osculating::EcksteinUstinovPerturbations(xp)
+                        - osculating::EcksteinUstinovPerturbations(xm)) / (2.0 * h);
+            };
+            VectorXd fd = (4.0 * Dv(h0[c]) - Dv(2.0 * h0[c])) / 3.0;
+            for (int r = 0; r < 6; ++r) {
+                double fdr = fd(r) + (r == c ? 1.0 : 0.0);
+                double jj = J[i * 36 + r * 6 + c];
+                double tol = 1e-7 + 1e-4 * std::max(std::fabs(fdr), 1e-9);
+                worst = std::max(worst, std::fabs(jj - fdr) / std::max(std::fabs(fdr), 1e-9));
+                EXPECT_LT(std::fabs(jj - fdr), tol)
+                    << "i=" << i << " r=" << r << " c=" << c << " jac=" << jj << " fd=" << fdr;
+            }
+        }
+    }
+    printf("[Transform.MeanOscJac] 最差相对差 = %.3e\n", worst);
 }
 
 int main(int argc, char **argv) {

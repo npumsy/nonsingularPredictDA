@@ -627,7 +627,7 @@ Eigen::VectorXd OEOsc2rv(const Eigen::VectorXd &OE, int MaxIt = 100, double epsl
     double p = a * (1 - e * e);
 
     double omega, nu;
-    if (e < 1e-5) {
+    if (e <= 0.0) {
         omega = 0;
         nu = u;
     } else {
@@ -676,7 +676,7 @@ Eigen::Vector3d oe2eciPos(const Eigen::VectorXd &OE, int MaxIt, double epsl) {
     const double e = std::sqrt(ex * ex + ey * ey);
     const double p = a * (1 - e * e);
     double omega, nu;
-    if (e < 1e-5) {
+    if (e <= 0.0) {
         omega = 0; nu = u;
     } else {
         omega = std::atan2(ey, ex);
@@ -960,7 +960,7 @@ double modified_bessel_first_kind(int n, double x) {
 // OE: a, lambda (mean anomaly + arg perigee), ex, ey, i, longitude of asceding node
 //    cond_c(1)= a,    cond_c(2)= lambda,    cond_c(4)= q1,    cond_c(5)= q2,  
 //    cond_c(3)= i  cond_c(6)= Omega
-Eigen::VectorXd OscElemsLongpropagate( double tf, const Eigen::VectorXd OEm, double RE=osculating::RE, double mu=osculating::MU, double tol=1e-9,double J2=osculating::J2,double J3=osculating::J3,double J4=osculating::J4){
+Eigen::VectorXd OscElemsLongpropagate( double tf, const Eigen::VectorXd OEm, double RE=osculating::RE, double mu=osculating::MU, double tol=1e-9,double J2=osculating::J2,double J3=osculating::J3,double J4=osculating::J4, int terms){
     Eigen::VectorXd OE_osc(6);
 
     // Constants
@@ -992,70 +992,83 @@ Eigen::VectorXd OscElemsLongpropagate( double tf, const Eigen::VectorXd OEm, dou
     double e_x2_minus_e_y2 = q10 * q10 - q20 * q20; // e_x^2 - e_y^2
 
     // 导数公式
-    // Secular variations by J2
-    // 导数公式
-    // J2
+    // Secular variations by J2/J3/J4（terms 位掩码选择：bit0=J2, bit1=J3, bit2=J4）
+    const bool useJ2 = (terms & 1) != 0;
+    const bool useJ3 = (terms & 2) != 0;
+    const bool useJ4 = (terms & 4) != 0;
     double aDot = 0;
-    double argLatDot = (3.0 / 4.0) * n0 * gamma_J2 * (eta * (3 * cos_i2 - 1) + (5 * cos_i2 - 1));
-    double q10Dot = -(3.0 / 4.0) * n0 * gamma_J2 * q20 * (5 * cos_i2 - 1);
-    double q20Dot = (3.0 / 4.0) * n0 * gamma_J2 * q10 * (5 * cos_i2 - 1);
+    double argLatDot = 0;
+    double q10Dot = 0;
+    double q20Dot = 0;
     double iDot = 0;
-    double RAANDot = -(3.0 / 2.0) * n0 * gamma_J2 * cos_i;
+    double RAANDot = 0;
+
+    // J2
+    if (useJ2) {
+        argLatDot += (3.0 / 4.0) * n0 * gamma_J2 * (eta * (3 * cos_i2 - 1) + (5 * cos_i2 - 1));
+        q10Dot += -(3.0 / 4.0) * n0 * gamma_J2 * q20 * (5 * cos_i2 - 1);
+        q20Dot += (3.0 / 4.0) * n0 * gamma_J2 * q10 * (5 * cos_i2 - 1);
+        RAANDot += -(3.0 / 2.0) * n0 * gamma_J2 * cos_i;
+    }
 
     // J3
-    aDot += 0;
+    if (useJ3) {
+        aDot += 0;
 
-    argLatDot += (3.0 / 8.0) * n0 * gamma_J3 * (
-        ((4 - 5 * sin_i2) * ((sin_i2 - e2 * cos_i2) / (e * sin_i)) + 2 * sin_i * (13 - 15 * sin_i2) * e) * (q20 / e) 
-        - sin_i * (4 - 5 * sin_i2) * ((1 - 4 * e2) / e2) * q20 * eta
-    );
+        argLatDot += (3.0 / 8.0) * n0 * gamma_J3 * (
+            ((4 - 5 * sin_i2) * ((sin_i2 - e2 * cos_i2) / (e * sin_i)) + 2 * sin_i * (13 - 15 * sin_i2) * e) * (q20 / e) 
+            - sin_i * (4 - 5 * sin_i2) * ((1 - 4 * e2) / e2) * q20 * eta
+        );
 
-    q10Dot += -(3.0 / 8.0) * n0 * gamma_J3 * (
-        sin_i * (4 - 5 * sin_i2) * (1 - e2) * (q10 * q10 / e2) 
-        + ((4 - 5 * sin_i2) * ((sin_i2 - e2 * cos_i2) / (e * sin_i)) + 2 * sin_i * (13 - 15 * sin_i2) * e) * (q20 * q20 / e)
-    );
+        q10Dot += -(3.0 / 8.0) * n0 * gamma_J3 * (
+            sin_i * (4 - 5 * sin_i2) * (1 - e2) * (q10 * q10 / e2) 
+            + ((4 - 5 * sin_i2) * ((sin_i2 - e2 * cos_i2) / (e * sin_i)) + 2 * sin_i * (13 - 15 * sin_i2) * e) * (q20 * q20 / e)
+        );
 
-    q20Dot += -(3.0 / 8.0) * n0 * gamma_J3 * (
-        sin_i * (4 - 5 * sin_i2) * (1 - e2) * (q10 * q20 / e2) 
-        - ((4 - 5 * sin_i2) * ((sin_i2 - e2 * cos_i2) / (e * sin_i)) + 2 * sin_i * (13 - 15 * sin_i2) * e) * (q10 * q20 / e)
-    );
+        q20Dot += -(3.0 / 8.0) * n0 * gamma_J3 * (
+            sin_i * (4 - 5 * sin_i2) * (1 - e2) * (q10 * q20 / e2) 
+            - ((4 - 5 * sin_i2) * ((sin_i2 - e2 * cos_i2) / (e * sin_i)) + 2 * sin_i * (13 - 15 * sin_i2) * e) * (q10 * q20 / e)
+        );
 
-    iDot += (3.0 / 8.0) * n0 * gamma_J3 * cos_i * (4 - 5 * sin_i2) * q10;
+        iDot += (3.0 / 8.0) * n0 * gamma_J3 * cos_i * (4 - 5 * sin_i2) * q10;
 
-    RAANDot += -(3.0 / 8.0) * n0 * gamma_J3 * (15 * sin_i2 - 4) * q20 / tan_i;
+        RAANDot += -(3.0 / 8.0) * n0 * gamma_J3 * (15 * sin_i2 - 4) * q20 / tan_i;
+    }
 
     double gamma_J4 = J4 * pow(RE / p0, 4);
 
-// J4
-aDot += 0;
+    // J4
+    if (useJ4) {
+        aDot += 0;
 
-argLatDot += -(45.0 / 128.0) * n0 * gamma_J4 * (
-    (8 - 40 * sin_i2 + 35 * sin_i2 * sin_i2) * e2 * eta
-    - (2.0 / 3.0) * sin_i2 * (6 - 7 * sin_i2) * (2 - 5 * e2) * eta * (e_x2_minus_e_y2 / e2)
-    + (4.0 / 3.0) * (
-        (16 - 62 * sin_i2 + 49 * sin_i2 * sin_i2 + 0.75 * (24 - 84 * sin_i2 + 63 * sin_i2 * sin_i2) * e2)
-        + (sin_i2 * (6 - 7 * sin_i2) - 0.5 * (12 - 70 * sin_i2 + 63 * sin_i2 * sin_i2) * e2) * (e_x2_minus_e_y2 / e2)
-    )
-);
+        argLatDot += -(45.0 / 128.0) * n0 * gamma_J4 * (
+            (8 - 40 * sin_i2 + 35 * sin_i2 * sin_i2) * e2 * eta
+            - (2.0 / 3.0) * sin_i2 * (6 - 7 * sin_i2) * (2 - 5 * e2) * eta * (e_x2_minus_e_y2 / e2)
+            + (4.0 / 3.0) * (
+                (16 - 62 * sin_i2 + 49 * sin_i2 * sin_i2 + 0.75 * (24 - 84 * sin_i2 + 63 * sin_i2 * sin_i2) * e2)
+                + (sin_i2 * (6 - 7 * sin_i2) - 0.5 * (12 - 70 * sin_i2 + 63 * sin_i2 * sin_i2) * e2) * (e_x2_minus_e_y2 / e2)
+            )
+        );
 
-q10Dot += -(15.0 / 32.0) * n0 * gamma_J4 * (
-    sin_i2 * (6 - 7 * sin_i2) * (1 - e2) * (2 * q10 * q20 * q20 / e2)
-    - (16 - 62 * sin_i2 + 49 * sin_i2 * sin_i2 + 0.75 * (24 - 84 * sin_i2 + 63 * sin_i2 * sin_i2) * e2
-    + (sin_i2 * (6 - 7 * sin_i2) - 0.5 * (12 - 70 * sin_i2 + 63 * sin_i2 * sin_i2) * e2) * (e_x2_minus_e_y2 / e2)) * q20
-);
+        q10Dot += -(15.0 / 32.0) * n0 * gamma_J4 * (
+            sin_i2 * (6 - 7 * sin_i2) * (1 - e2) * (2 * q10 * q20 * q20 / e2)
+            - (16 - 62 * sin_i2 + 49 * sin_i2 * sin_i2 + 0.75 * (24 - 84 * sin_i2 + 63 * sin_i2 * sin_i2) * e2
+            + (sin_i2 * (6 - 7 * sin_i2) - 0.5 * (12 - 70 * sin_i2 + 63 * sin_i2 * sin_i2) * e2) * (e_x2_minus_e_y2 / e2)) * q20
+        );
 
-q20Dot += -(15.0 / 32.0) * n0 * gamma_J4 * (
-    sin_i2 * (6 - 7 * sin_i2) * (1 - e2) * (2 * q20 * q20 * q10 / e2)
-    + (16 - 62 * sin_i2 + 49 * sin_i2 * sin_i2 + 0.75 * (24 - 84 * sin_i2 + 63 * sin_i2 * sin_i2) * e2
-    + (sin_i2 * (6 - 7 * sin_i2) - 0.5 * (12 - 70 * sin_i2 + 63 * sin_i2 * sin_i2) * e2) * (e_x2_minus_e_y2 / e2)) * q10
-);
+        q20Dot += -(15.0 / 32.0) * n0 * gamma_J4 * (
+            sin_i2 * (6 - 7 * sin_i2) * (1 - e2) * (2 * q20 * q20 * q10 / e2)
+            + (16 - 62 * sin_i2 + 49 * sin_i2 * sin_i2 + 0.75 * (24 - 84 * sin_i2 + 63 * sin_i2 * sin_i2) * e2
+            + (sin_i2 * (6 - 7 * sin_i2) - 0.5 * (12 - 70 * sin_i2 + 63 * sin_i2 * sin_i2) * e2) * (e_x2_minus_e_y2 / e2)) * q10
+        );
 
-iDot += (15.0 / 64.0) * n0 * gamma_J4 * sin2_i * (6 - 7 * sin_i2) * 2 * q10 * q20;
+        iDot += (15.0 / 64.0) * n0 * gamma_J4 * sin2_i * (6 - 7 * sin_i2) * 2 * q10 * q20;
 
-RAANDot += (15.0 / 16.0) * n0 * gamma_J4 * cos_i * (
-    (4 - 7 * sin_i2) * (1 + 1.5 * e2)
-    - (3 - 7 * sin_i2) * e_x2_minus_e_y2
-);
+        RAANDot += (15.0 / 16.0) * n0 * gamma_J4 * cos_i * (
+            (4 - 7 * sin_i2) * (1 + 1.5 * e2)
+            - (3 - 7 * sin_i2) * e_x2_minus_e_y2
+        );
+    }
 
     // Drag
 
@@ -1071,8 +1084,10 @@ RAANDot += (15.0 / 16.0) * n0 * gamma_J4 * cos_i * (
 return OE_osc;
 }
 // double rho0 = 3.003075e-4, double CDA_m=0.0044,
+// rp0 为**近地点地心距**（m，默认 535 km 高度），H0 为该高度大气标高（m）；
+// 返回的是「去除 ρ·CD_A/m 因子」的增量 dOE，调用侧乘 Dragbeta(rho_p_SI, CDA_m)（SI：kg/m³, m²/kg）。
 Eigen::VectorXd OscElemsLongDrag_BCrho0( const Eigen::VectorXd OEm,double dt,
-    double rp0 = 535e3, double H0 =65.35644970323516e3, double mu=osculating::MU){
+    double rp0 = osculating::RE + 535e3, double H0 =65.35644970323516e3, double mu=osculating::MU){
     Eigen::VectorXd dOE_osc(6);
     // double tf = t(1);
     // double q10 = ex, q20=ey, lambda0=u=Mean anomaly + omega;
@@ -1105,6 +1120,149 @@ Eigen::VectorXd OscElemsLongDrag_BCrho0( const Eigen::VectorXd OEm,double dt,
     double dM = 3.0/4.0 /a0*da *(n0 * dt );
     dOE_osc << da,dM,0,0,0,0;
     return dOE_osc;
+}
+
+// 平均要素长期项欧拉单步：J2/J3/J4 长期 + 大气阻力（drag 在 J2 更新后的要素上取增量，与 Python 侧口径一致）。
+Eigen::VectorXd OscElemsLongStep(const Eigen::VectorXd &OEm, double dt, double RE, double mu,
+                                 double J2, double J3, double J4, int terms,
+                                 double rp0, double H0, double rho, double CDA_m){
+    Eigen::VectorXd oe = OscElemsLongpropagate(dt, OEm, RE, mu, 1e-9, J2, J3, J4, terms);
+    if(rho > 0.0 && CDA_m > 0.0)
+        oe += (rho * CDA_m) * OscElemsLongDrag_BCrho0(oe, dt, rp0, H0, mu);
+    return oe;
+}
+
+void OscElemsLongStepBatch(const std::vector<Eigen::Matrix<double,6,1>> &oes, double dt,
+                           double RE, double mu, double J2, double J3, double J4, int terms,
+                           const std::vector<double> &rp0, const std::vector<double> &H0,
+                           const std::vector<double> &rho, double CDA_m,
+                           int nthreads, std::vector<Eigen::Matrix<double,6,1>> &oef){
+    const int n = (int)oes.size();
+    oef.assign(n, Eigen::Matrix<double,6,1>::Zero());
+    if(n <= 0) return;
+    if(nthreads <= 0) nthreads = 1;
+    const bool br = (rp0.size() == 1), bh = (H0.size() == 1), brho = (rho.size() == 1);
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for(int i = 0; i < n; ++i){
+        Eigen::VectorXd oe(6);
+        for(int c = 0; c < 6; ++c) oe(c) = oes[i](c);
+        Eigen::VectorXd o2 = OscElemsLongStep(oe, dt, RE, mu, J2, J3, J4, terms,
+                                              rp0[br ? 0 : i], H0[bh ? 0 : i], rho[brho ? 0 : i], CDA_m);
+        for(int c = 0; c < 6; ++c) oef[i](c) = o2(c);
+    }
+}
+
+// ---------------------------------------------------------------- 批量解析接口（长周期 Mean QOE 参考层）
+// 逐分量中心差分步长（按列的量纲与函数结构分组）：
+//  - a 列：幂律依赖（无振荡）→ 可大步长；
+//  - u 列：摄动含 λ 的 1..4 次谐波 → 需小步长；
+//  - ex/ey 列：Eckstein-Ustinov 一阶摄动对 (ex,ey) **线性** → 大步长无截断；
+//  - i 列：仅经 β²=sin²i/ξ0/λ* 的平滑依赖 → 中等步长；
+//  - Ω 列：完全无依赖（单步无振荡）→ 任意步长。
+static const double _JAC_H_OSC[6]  = {1e-1, 1e-7, 1e-4, 1e-4, 1e-4, 1e-4};   // ∂Osc/∂Mean
+// ∂step/∂oe：长期项速率对 u、Ω **无依赖**（列 1/5 理论为 0），对 i 平滑（sin/cos/tan），
+// 故这些列取大步长以压低 drag 级数量化噪声（~1e-9 m/(2h)）；ex/ey 经 e=√(e_x²+e_y²) 进入
+// （J3 项 ~1/e²），需小步长以免截断。
+static const double _JAC_H_STEP[6] = {1e-1, 1e-4, 1e-5, 1e-5, 1e-4, 1e-4};   // ∂step/∂oe
+
+void OscElemsLongRatesBatch(const std::vector<Eigen::Matrix<double,6,1>> &oes,
+                            double RE, double mu, double J2, double J3, double J4, int terms,
+                            const std::vector<double> &rp0, const std::vector<double> &H0,
+                            const std::vector<double> &rho, double CDA_m,
+                            int nthreads, std::vector<Eigen::Matrix<double,6,1>> &rates){
+    const int n = (int)oes.size();
+    rates.assign(n, Eigen::Matrix<double,6,1>::Zero());
+    if(n <= 0) return;
+    if(nthreads <= 0) nthreads = 1;
+    const bool br = (rp0.size() == 1), bh = (H0.size() == 1), brho = (rho.size() == 1);
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for(int i = 0; i < n; ++i){
+        Eigen::VectorXd oe(6);
+        for(int c = 0; c < 6; ++c) oe(c) = oes[i](c);
+        Eigen::VectorXd o1 = OscElemsLongStep(oe, 1.0, RE, mu, J2, J3, J4, terms,
+                                              rp0[br ? 0 : i], H0[bh ? 0 : i], rho[brho ? 0 : i], CDA_m);
+        for(int c = 0; c < 6; ++c) rates[i](c) = o1(c) - oe(c);
+    }
+}
+
+void OscElemsLongStepJacBatch(const std::vector<Eigen::Matrix<double,6,1>> &oes, double dt,
+                              double RE, double mu, double J2, double J3, double J4, int terms,
+                              const std::vector<double> &rp0, const std::vector<double> &H0,
+                              const std::vector<double> &rho, double CDA_m,
+                              int nthreads, std::vector<double> &J){
+    const int n = (int)oes.size();
+    J.assign((std::size_t)n * 36, 0.0);
+    if(n <= 0) return;
+    if(nthreads <= 0) nthreads = 1;
+    const bool br = (rp0.size() == 1), bh = (H0.size() == 1), brho = (rho.size() == 1);
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for(int i = 0; i < n; ++i){
+        Eigen::VectorXd oe(6);
+        for(int c = 0; c < 6; ++c) oe(c) = oes[i](c);
+        const double rp = rp0[br ? 0 : i], H0v = H0[bh ? 0 : i], rhov = rho[brho ? 0 : i];
+        for(int c = 0; c < 6; ++c){
+            const double h = _JAC_H_STEP[c];
+            Eigen::VectorXd xp = oe, xm = oe;
+            xp(c) += h; xm(c) -= h;
+            // 差分「增量映射」g(x)=step(x;dt)−x（消去输出中的大常数，数值噪声 ~eps·|g|）。
+            Eigen::VectorXd gp = OscElemsLongStep(xp, dt, RE, mu, J2, J3, J4, terms, rp, H0v, rhov, CDA_m) - xp;
+            Eigen::VectorXd gm = OscElemsLongStep(xm, dt, RE, mu, J2, J3, J4, terms, rp, H0v, rhov, CDA_m) - xm;
+            for(int r = 0; r < 6; ++r){
+                const double dg = (gp(r) - gm(r)) / (2.0 * h);
+                J[(std::size_t)i * 36 + r * 6 + c] = dg + (r == c ? 1.0 : 0.0);
+            }
+        }
+    }
+}
+
+void OEMeanEU2OEOscBatch(const std::vector<Eigen::Matrix<double,6,1>> &OEMeans,
+                         int nthreads, std::vector<Eigen::Matrix<double,6,1>> &OEoscs){
+    const int n = (int)OEMeans.size();
+    OEoscs.assign(n, Eigen::Matrix<double,6,1>::Zero());
+    if(n <= 0) return;
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for(int i = 0; i < n; ++i){
+        Eigen::VectorXd om(6);
+        for(int c = 0; c < 6; ++c) om(c) = OEMeans[i](c);
+        Eigen::VectorXd oe = OEMeanEU2OEOsc(om);
+        for(int c = 0; c < 6; ++c) OEoscs[i](c) = oe(c);
+    }
+}
+
+void OEMeanEU2OEOscJacBatch(const std::vector<Eigen::Matrix<double,6,1>> &OEMeans,
+                            int nthreads, std::vector<double> &J){
+    const int n = (int)OEMeans.size();
+    J.assign((std::size_t)n * 36, 0.0);
+    if(n <= 0) return;
+    if(nthreads <= 0) nthreads = 1;
+#ifdef _OPENMP
+    #pragma omp parallel for num_threads(nthreads) schedule(static)
+#endif
+    for(int i = 0; i < n; ++i){
+        Eigen::VectorXd om(6);
+        for(int c = 0; c < 6; ++c) om(c) = OEMeans[i](c);
+        for(int c = 0; c < 6; ++c){
+            const double h = _JAC_H_OSC[c];
+            Eigen::VectorXd xp = om, xm = om;
+            xp(c) += h; xm(c) -= h;
+            // 差分「Eckstein-Ustinov 摄动映射」（无输出 wrap、无大常数），J = I + ∂Δ/∂mean。
+            Eigen::VectorXd dp = EcksteinUstinovPerturbations(xp);
+            Eigen::VectorXd dm = EcksteinUstinovPerturbations(xm);
+            for(int r = 0; r < 6; ++r){
+                const double d = (dp(r) - dm(r)) / (2.0 * h);
+                J[(std::size_t)i * 36 + r * 6 + c] = d + (r == c ? 1.0 : 0.0);
+            }
+        }
+    }
 }
 
 Eigen::Matrix3d PQW2GCRF(double Omega, double omega, double i) {

@@ -218,6 +218,12 @@ Eigen::VectorXd OEOsc2OEMeanEU(const Eigen::VectorXd &OEosc, int MaxIt = 100, do
 
 // 转化 osculating 元素。为mean 轨道元素 OEMean 
 Eigen::VectorXd OEMeanEU2OEOsc(const Eigen::VectorXd &OEMean);
+// 整星座批（OpenMP）：OEoscs[i]=OEMeanEU2OEOsc(OEMeans[i])（含 Eckstein-Ustinov J2 一阶短周期，u/Ω wrap）。
+void OEMeanEU2OEOscBatch(const std::vector<Eigen::Matrix<double,6,1>> &OEMeans,
+                         int nthreads, std::vector<Eigen::Matrix<double,6,1>> &OEoscs);
+// 整星座批 ∂Osc/∂Mean（核内逐分量中心差分；u/Ω 输出差分按 (-π,π] wrap）；返回 n×36 行主序。
+void OEMeanEU2OEOscJacBatch(const std::vector<Eigen::Matrix<double,6,1>> &OEMeans,
+                            int nthreads, std::vector<double> &J);
 
 // 由于 $J_2$ 引起的 Eckstein-Ustinov 一阶扰动,从平均轨道元素转换为振荡轨道元素
 int testOEMean();
@@ -226,14 +232,43 @@ int testAll();
 
 // 平均轨道要素的长期变化
 // OE: a, lambda(Mean anomaly + arg perigee), ex, ey, i, longitude of asceding node
-Eigen::VectorXd OscElemsLongpropagate( double tf, const Eigen::VectorXd OEm, double RE, double mu, double tol,double J2,double J3,double J4);
+// terms: 长期项位掩码，bit0=J2, bit1=J3, bit2=J4（默认 7=全考虑；只考虑 J2 传 1，也可 J3=J4=0）
+// 注：闭式公式按 §HG-iod 符号约定（J3/J4 取负号）推导，输入 J3/J4 应传负值（同 bddd::J3/J4）。
+Eigen::VectorXd OscElemsLongpropagate( double tf, const Eigen::VectorXd OEm, double RE, double mu, double tol,double J2,double J3,double J4, int terms = 7);
 
-// 大气阻力除以这2项
-// double rho0 = 3.003075e-4, double CDA_m=0.0044,
+// 大气阻力除以这2项：返回 dOE 只含几何与轨道项，须再乘 Dragbeta(rho_p, CD_A/m)。
+// OscElemsLongDrag_BCrho0 的 rp0 为**近地点地心距**（m）。SI 口径：rho [kg/m³]、CDA_m [m²/kg]。
 Eigen::VectorXd OscElemsLongDrag_BCrho0( const Eigen::VectorXd OEm,double dt,    double rp0, double H0, double mu);
-inline double Dragbeta(double rho0 = 3.003075e-4, double CDA_m=0.0044){
+// 默认 rho0 = 535 km 高度密度（3.003075e-4 kg/km³ = 3.003075e-13 kg/m³，
+// 同 src/AtmosphericDensity1976.csv）；CDA_m = Cd·A/m = 2.2·2e-6 km²/1000 kg = 4.4e-3 m²/kg。
+inline double Dragbeta(double rho0 = 3.003075e-13, double CDA_m=0.0044){
     return rho0*CDA_m;
 }
+// 平均要素长期项（J2/J3/J4 长期 + 大气阻力）**欧拉单步**（解析基准层）：
+// oe(t+dt) = OscElemsLongpropagate(dt, oe) + (rho·CDA_m)·OscElemsLongDrag_BCrho0(oe_after)。
+// OEm=(a,u,ex,ey,i,Om)；terms 位掩码；rp0 近地点地心距(m)、H0 标高(m)、
+// rho 密度(kg/m³)、CDA_m=Cd·A/m(m²/kg)；rho<=0 或 CDA_m<=0 则关闭阻力。
+Eigen::VectorXd OscElemsLongStep(const Eigen::VectorXd &OEm, double dt, double RE, double mu,
+                                 double J2, double J3, double J4, int terms,
+                                 double rp0, double H0, double rho, double CDA_m);
+// 整星座批（OpenMP）：oef[i]=OscElemsLongStep(oes[i], ...)；rp0/H0/rho 长度 1（广播）或 n。
+void OscElemsLongStepBatch(const std::vector<Eigen::Matrix<double,6,1>> &oes, double dt,
+                           double RE, double mu, double J2, double J3, double J4, int terms,
+                           const std::vector<double> &rp0, const std::vector<double> &H0,
+                           const std::vector<double> &rho, double CDA_m,
+                           int nthreads, std::vector<Eigen::Matrix<double,6,1>> &oef);
+// 整星座批解析长期项速率 df/dt（单位时间增量，dt=1 s 口径，含阻力 = OscElemsLongStep(oe,1)−oe）。
+void OscElemsLongRatesBatch(const std::vector<Eigen::Matrix<double,6,1>> &oes,
+                            double RE, double mu, double J2, double J3, double J4, int terms,
+                            const std::vector<double> &rp0, const std::vector<double> &H0,
+                            const std::vector<double> &rho, double CDA_m,
+                            int nthreads, std::vector<Eigen::Matrix<double,6,1>> &rates);
+// 整星座批单步 Jacobian ∂oe(t+dt)/∂oe（核内逐分量中心差分，与 OscElemsLongStep 同口径）；返回 n×36 行主序。
+void OscElemsLongStepJacBatch(const std::vector<Eigen::Matrix<double,6,1>> &oes, double dt,
+                              double RE, double mu, double J2, double J3, double J4, int terms,
+                              const std::vector<double> &rp0, const std::vector<double> &H0,
+                              const std::vector<double> &rho, double CDA_m,
+                              int nthreads, std::vector<double> &J);
 //  Input: osculating OE: a, u (mean anomaly + arg perigee), ex, ey, i, longitude of asceding node
 Eigen::MatrixXd Jacobian_RV2OscElems(const Eigen::VectorXd OE, const Eigen::VectorXd &x,  double mu, double tol);
 

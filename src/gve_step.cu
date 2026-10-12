@@ -47,7 +47,7 @@ __device__ __forceinline__ void oe2rv_dev(const double* OE, double* x){
     double p = a * (1.0 - e * e);
     if(p < 1e-6) p = 1e-6;
     double omega, nu;
-    if(e < 1e-5){
+    if(e <= 0.0){
         omega = 0.0;
         nu = u;
     } else {
@@ -338,7 +338,7 @@ __device__ __forceinline__ void oe2rv_d_dev(const Dual6* OE, Dual6* x){
     Dual6 p = d6_mul(a, d6_sub(d6_c(1.0), d6_mul(e,e)));
     if(p.v < 1e-6) p = d6_c(1e-6);
     Dual6 omega, nu;
-    if(e.v < 1e-5){ omega = d6_c(0.0); nu = u; }
+    if(e.v <= 0.0){ omega = d6_c(0.0); nu = u; }
     else {
         omega = d6_atan2(ey, ex);
         Dual6 M = d6_sub(u, omega);
@@ -3481,6 +3481,31 @@ void flsEkfHandoffDevice(const double *d_Aval, const double *d_sc,
                                              d_Lp, d_Pm);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) fprintf(stderr, "[flsEkfHandoffDevice] %s\n", cudaGetErrorString(err));
+}
+
+// 独立批量 QOE→rv(+Jacobian)：复用本 TU 的 oeJacKernel，设备缓冲位常驻按需扩容。
+// 输入 h_X (n,6)，输出 h_rv (n,6) 与 h_J (n,36)（行主序 ∂rv_c/∂oe_j = J[c*6+j]）。
+void oe2rvJacHost(const double *h_X, int n, double *h_rv, double *h_J) {
+    static double *dX = nullptr, *drv = nullptr, *dJ = nullptr;
+    static int cap = 0;
+    if (n > cap) {
+        if (dX) { cudaFree(dX); cudaFree(drv); cudaFree(dJ); }
+        if (cudaMalloc(&dX, (std::size_t)n * 6 * sizeof(double)) != cudaSuccess ||
+            cudaMalloc(&drv, (std::size_t)n * 6 * sizeof(double)) != cudaSuccess ||
+            cudaMalloc(&dJ, (std::size_t)n * 36 * sizeof(double)) != cudaSuccess)
+            throw std::runtime_error("oe2rvJacHost: cudaMalloc 失败");
+        cap = n;
+    }
+    if (cudaMemcpy(dX, h_X, (std::size_t)n * 6 * sizeof(double), cudaMemcpyHostToDevice) != cudaSuccess)
+        throw std::runtime_error("oe2rvJacHost: H2D 失败");
+    const int threads = 128, blocks = (n + threads - 1) / threads;
+    oeJacKernel<<<blocks, threads>>>(dX, n, drv, dJ);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("oe2rvJacHost: ") + cudaGetErrorString(err));
+    if (cudaMemcpy(h_rv, drv, (std::size_t)n * 6 * sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(h_J, dJ, (std::size_t)n * 36 * sizeof(double), cudaMemcpyDeviceToHost) != cudaSuccess)
+        throw std::runtime_error("oe2rvJacHost: D2H 失败");
 }
 
 }  // namespace qoejopt

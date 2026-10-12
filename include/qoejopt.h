@@ -78,6 +78,10 @@ void ssCovDevice(const Ctx &c, const double *hX, double *hCov, double *hRv);
 // 展开：d_X -> d_P（GVE 多帧 rv）。实现于 gve_step.cu。
 void jointExpandDevice(Ctx &c);
 
+// 独立批量 QOE→rv(+Jacobian)（网络训练可微链路）：h_X (n,6) → h_rv (n,6)、h_J (n,36)。
+// 设备缓冲位常驻按需扩容（gve_step.cu 实现，复用 oeJacKernel）。
+void oe2rvJacHost(const double *h_X, int n, double *h_rv, double *h_J);
+
 // 两体 STM 折叠：d_rv0,d_A0 -> d_A（nfr*n*18）。
 void jointStmFoldDevice(Ctx &c);
 

@@ -237,7 +237,7 @@ AlgebraicVector<T> OEOsc2rvT(const AlgebraicVector<T> &OE, int MaxIt, double eps
     const T e = sqrt(ex * ex + ey * ey);
     const T p = atLeast((T)(a * (1 - e * e)), 1e-6);   // 防 RK4 子步 e>1 时 p<=0（sqrt 抛异常）
     T omega, nu;
-    if(cst(e) < 1e-5){
+    if(cst(e) <= 0.0){
         omega = T(0.0);
         nu = u;
     } else {

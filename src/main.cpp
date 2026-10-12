@@ -854,35 +854,157 @@ PYBIND11_MODULE(qoe, m)
             py::arg("J2") = osculating::J2, 
             py::arg("J3") = osculating::J3, 
             py::arg("J4") = osculating::J4,
+            py::arg("terms") = 7,
             R"pbdoc(
            平均轨道要素长期摄动影响. 考虑J2、J3、J4摄动
             Parameters
             Osc :
                   OE: (a,平纬度幅角 M + w,ecos(w),esin(w),i,RAAN) (6x1).
                   delta t
+            terms : 长期项位掩码 bit0=J2, bit1=J3, bit2=J4（默认 7 全考虑；只考虑 J2 传 1）
             Returns: numpy.ndarray
                   Array of mean elements (6x1).
             )pbdoc");
+      // 平均要素长期项（J2/J3/J4 长期 + 大气阻力）欧拉单步 / 整星座批（解析基准层）
+      m.def("OscElemsLongStep", &osculating::OscElemsLongStep, py::arg("OEm"), py::arg("dt"),
+            py::arg("RE") = osculating::RE, py::arg("mu") = osculating::MU,
+            py::arg("J2") = osculating::J2, py::arg("J3") = osculating::J3, py::arg("J4") = osculating::J4,
+            py::arg("terms") = 7, py::arg("rp0") = osculating::RE + 535e3,
+            py::arg("H0") = 65.35644970323516e3, py::arg("rho") = 3.003075e-13,
+            py::arg("CDA_m") = 4.4e-3,
+            "平均要素长期项（J2/J3/J4 长期 + 阻力）欧拉单步：oe(t+dt)=OscElemsLongpropagate(dt)+rho*CDA_m*drag");
+      m.def("OscElemsLongStepBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, double dt,
+                double RE, double mu, double J2, double J3, double J4, int terms,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rp0,
+                py::array_t<double, py::array::c_style | py::array::forcecast> H0,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rho,
+                double CDA_m, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "OscElemsLongStepBatchFlat");
+            auto cvt = [](py::array_t<double, py::array::c_style | py::array::forcecast> a){
+                auto b = a.request(); const double *p = static_cast<const double *>(b.ptr);
+                return std::vector<double>(p, p + b.size);
+            };
+            std::vector<double> Rp = cvt(rp0), Hp = cvt(H0), rhop = cvt(rho);
+            std::vector<Vector6d> of;
+            { py::gil_scoped_release release;
+              osculating::OscElemsLongStepBatch(v, dt, RE, mu, J2, J3, J4, terms,
+                                                Rp, Hp, rhop, CDA_m, nthreads, of); }
+            py::array_t<double> O({v.size(), (std::size_t)6});
+            double *p = O.mutable_data();
+            for(std::size_t i = 0; i < v.size(); ++i)
+                for(int c = 0; c < 6; ++c) p[i*6 + c] = of[i](c);
+            return O;
+            }, py::arg("oe"), py::arg("dt"), py::arg("RE") = osculating::RE, py::arg("mu") = osculating::MU,
+               py::arg("J2") = osculating::J2, py::arg("J3") = osculating::J3, py::arg("J4") = osculating::J4,
+               py::arg("terms") = 7,
+               py::arg("rp0") = py::array_t<double>(), py::arg("H0") = py::array_t<double>(),
+               py::arg("rho") = py::array_t<double>(), py::arg("CDA_m") = 4.4e-3, py::arg("nthreads") = 16,
+               "整星座批 平均要素长期项欧拉单步：(n,6)->(n,6)；rp0/H0/rho 长度 1 或 n");
+      // ---- 批量解析接口（长周期 Mean QOE 参考层）：解析速率 df/dt、单步 Jac、mean→osc 批与 Jac ----
+      auto _cvt_rp0h0rho = [&](py::array_t<double, py::array::c_style | py::array::forcecast> rp0,
+                               py::array_t<double, py::array::c_style | py::array::forcecast> H0,
+                               py::array_t<double, py::array::c_style | py::array::forcecast> rho,
+                               double RE){
+            auto cvt = [](py::array_t<double, py::array::c_style | py::array::forcecast> a){
+                auto b = a.request(); const double *p = static_cast<const double *>(b.ptr);
+                return std::vector<double>(p, p + b.size);
+            };
+            std::vector<double> Rp = cvt(rp0), Hp = cvt(H0), rhop = cvt(rho);
+            if(Rp.empty())   Rp.push_back(RE + 535e3);              // 默认近地点地心距
+            if(Hp.empty())   Hp.push_back(65.35644970323516e3);     // 默认标高
+            if(rhop.empty()) rhop.push_back(3.003075e-13);          // 默认密度 (kg/m^3)
+            return std::make_tuple(Rp, Hp, rhop);
+      };
+      m.def("OscElemsLongRatesBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                double RE, double mu, double J2, double J3, double J4, int terms,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rp0,
+                py::array_t<double, py::array::c_style | py::array::forcecast> H0,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rho,
+                double CDA_m, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "OscElemsLongRatesBatchFlat");
+            auto [Rp, Hp, rhop] = _cvt_rp0h0rho(rp0, H0, rho, RE);
+            std::vector<Vector6d> rt;
+            { py::gil_scoped_release release;
+              osculating::OscElemsLongRatesBatch(v, RE, mu, J2, J3, J4, terms, Rp, Hp, rhop, CDA_m, nthreads, rt); }
+            py::array_t<double> O({v.size(), (std::size_t)6});
+            double *p = O.mutable_data();
+            for(std::size_t i = 0; i < v.size(); ++i)
+                for(int c = 0; c < 6; ++c) p[i*6 + c] = rt[i](c);
+            return O;
+            }, py::arg("oe"), py::arg("RE") = osculating::RE, py::arg("mu") = osculating::MU,
+               py::arg("J2") = osculating::J2, py::arg("J3") = osculating::J3, py::arg("J4") = osculating::J4,
+               py::arg("terms") = 7,
+               py::arg("rp0") = py::array_t<double>(), py::arg("H0") = py::array_t<double>(),
+               py::arg("rho") = py::array_t<double>(), py::arg("CDA_m") = 4.4e-3, py::arg("nthreads") = 16,
+               "整星座批 解析长期项速率 df/dt（dt=1 s 口径，含阻力）：(n,6)->(n,6)");
+      m.def("OscElemsLongStepJacBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, double dt,
+                double RE, double mu, double J2, double J3, double J4, int terms,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rp0,
+                py::array_t<double, py::array::c_style | py::array::forcecast> H0,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rho,
+                double CDA_m, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "OscElemsLongStepJacBatchFlat");
+            auto [Rp, Hp, rhop] = _cvt_rp0h0rho(rp0, H0, rho, RE);
+            std::vector<double> J;
+            { py::gil_scoped_release release;
+              osculating::OscElemsLongStepJacBatch(v, dt, RE, mu, J2, J3, J4, terms, Rp, Hp, rhop, CDA_m, nthreads, J); }
+            py::array_t<double> O({v.size(), (std::size_t)6, (std::size_t)6});
+            std::memcpy(O.mutable_data(), J.data(), v.size() * 36 * sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("dt"), py::arg("RE") = osculating::RE, py::arg("mu") = osculating::MU,
+               py::arg("J2") = osculating::J2, py::arg("J3") = osculating::J3, py::arg("J4") = osculating::J4,
+               py::arg("terms") = 7,
+               py::arg("rp0") = py::array_t<double>(), py::arg("H0") = py::array_t<double>(),
+               py::arg("rho") = py::array_t<double>(), py::arg("CDA_m") = 4.4e-3, py::arg("nthreads") = 16,
+               "整星座批 长期项欧拉单步 Jacobian ∂oe(t+dt)/∂oe（核内中心差分）：(n,6)->(n,6,6)");
+      m.def("OEMeanEU2OEOscBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "OEMeanEU2OEOscBatchFlat");
+            std::vector<Vector6d> of;
+            { py::gil_scoped_release release;
+              osculating::OEMeanEU2OEOscBatch(v, nthreads, of); }
+            py::array_t<double> O({v.size(), (std::size_t)6});
+            double *p = O.mutable_data();
+            for(std::size_t i = 0; i < v.size(); ++i)
+                for(int c = 0; c < 6; ++c) p[i*6 + c] = of[i](c);
+            return O;
+            }, py::arg("oe"), py::arg("nthreads") = 16,
+               "整星座批 平均要素→密切要素（Eckstein-Ustinov J2 一阶短周期）：(n,6)->(n,6)");
+      m.def("OEMeanEU2OEOscJacBatchFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "OEMeanEU2OEOscJacBatchFlat");
+            std::vector<double> J;
+            { py::gil_scoped_release release;
+              osculating::OEMeanEU2OEOscJacBatch(v, nthreads, J); }
+            py::array_t<double> O({v.size(), (std::size_t)6, (std::size_t)6});
+            std::memcpy(O.mutable_data(), J.data(), v.size() * 36 * sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("nthreads") = 16,
+               "整星座批 ∂Osc/∂Mean（核内中心差分，u/Ω 差分 wrap）：(n,6)->(n,6,6)");
       // 
 // double rho0 = 3.003075e-4, double CDA_m=0.0044,
       m.def("OscElemsLongDrag_BCrho0", &osculating::OscElemsLongDrag_BCrho0, py::arg("OEm"),  py::arg("dt"),
-            py::arg("rp0") =  535e3,
+            py::arg("rp0") =  osculating::RE + 535e3,
             py::arg("H0") =65.35644970323516e3 , 
             py::arg("mu") = osculating::MU, 
             R"pbdoc(
-           大气阻力摄动平均轨道要素长期. 阻力除以Beta
+           大气阻力摄动平均轨道要素长期增量. 返回去除 rho*CD_A/m 因子的 dOE
             Parameters
-            Osc :
-                  Array of mean elements (6x1).
-                  delta t
-            Returns: 
-                  考虑时间的长期变化。 (6x1).
+            OEm : 平均要素 (a, lambda, ex, ey, i, Omega)
+            dt :  传播时长 (s)
+            rp0 : 近地点地心距 (m)；H0 : 标高 (m)
+            Returns:
+                  dOE (6x1)；调用侧应乘 Dragbeta(rho_p_SI, CDA_m)
             )pbdoc");
       m.def("Dragbeta",&osculating::Dragbeta,
-            py::arg("rho0") = 3.003075e-4,
-            py::arg("CDA_m")=4.4e-9,
+            py::arg("rho0") = 3.003075e-13,
+            py::arg("CDA_m")=0.0044,
             R"pbdoc(
-            轨道参数估计时，相乘的一项。基准参数可查询atmo1976. 单位为km
+            阻力缩乘因子 rho0 * CD_A/m（SI：rho [kg/m³]，CDA_m [m²/kg]）。
+            默认 rho0 = 535 km 高度密度 3.003075e-13 kg/m³（表值 3.003075e-4 kg/km³）；CDA_m = 4.4e-3 m²/kg
             )pbdoc");
             
       m.def("Jacobian_RV2OscElems", &osculating::Jacobian_RV2OscElems, py::arg("OE"), py::arg("RV"),
