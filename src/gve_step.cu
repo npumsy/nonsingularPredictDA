@@ -3508,4 +3508,409 @@ void oe2rvJacHost(const double *h_X, int n, double *h_rv, double *h_J) {
         throw std::runtime_error("oe2rvJacHost: D2H 失败");
 }
 
+// ===================== 子块内环（144 块锚帧 ΔQOE）device 常驻装配 =====================
+// 变量：每块 r=1 四节点锚帧 ΔQOE（24/块）；中心 = 网络 dq 固定、r2 = Q_anJ2 固定位置。
+// 轨迹：全动力学笛卡尔 RK4 10 s 后向 K 帧 + 前向 T/4；Jacobian = 两体解析 STM 折叠 × ∂rv/∂oe。
+// 行序（与 Python block_inner 一致）：ISL 16K | GTS gmax·K | Eph 锚 12 | Eph T/4 12 | 先验 24。
+static double _bn() {
+    using clk = std::chrono::steady_clock;
+    return std::chrono::duration<double>(clk::now().time_since_epoch()).count();
+}
+static double bt_pack = 0, bt_cbwd = 0, bt_fbwd = 0, bt_cfwd = 0, bt_ffwd = 0, bt_asm = 0;
+static double bt_copy = 0, bt_memset = 0, bt_sync = 0;
+
+// q = base + dq + [y;0]（(B,5,6) 行主序）
+__global__ void blkPackKernel(const double *base, const double *dq, const double *y, int B,
+                              double *q) {
+    const int m = blockIdx.x * blockDim.x + threadIdx.x;
+    if (m >= B * 5) return;
+    const int b = m / 5, l = m % 5;
+    const double *bb = base + (size_t)m * 6, *dd = dq + (size_t)m * 6;
+#pragma unroll
+    for (int c = 0; c < 6; ++c) {
+        double v = bb[c] + dd[c];
+        if (l < 4) v += y[(size_t)(b * 4 + l) * 6 + c];
+        q[(size_t)m * 6 + c] = v;
+    }
+}
+
+// 前向 T/4：只保留末帧 rv（n,6）
+__global__ void blkFwdLastKernel(const double *x0, int n, int nsteps, double dt, double beta,
+                                 double *xout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = x0[idx * 6 + c];
+    for (int s = 0; s < nsteps; ++s) {
+        cartRhsDev(y, beta, k1);
+#pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * k1[c] / 3.0;
+        cartRhsDev(tmp, beta, k2);
+#pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
+        cartRhsDev(tmp, beta, k3);
+#pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
+        cartRhsDev(tmp, beta, k4);
+#pragma unroll
+        for (int c = 0; c < 6; ++c)
+            y[c] = y[c] + dt * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    }
+#pragma unroll
+    for (int c = 0; c < 6; ++c) xout[idx * 6 + c] = y[c];
+}
+
+// T/4 末帧两体解析 STM 折叠：(Φ(n4·dt))[0:3,:]（n,18；与 stmFoldKernel 同口径，J0 在装配核内乘）
+__global__ void blkFoldLastKernel(const double *rv0, int n, double dt_total, double *Aout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double r0[3] = {rv0[idx * 6 + 0] * 1e-3, rv0[idx * 6 + 1] * 1e-3,
+                          rv0[idx * 6 + 2] * 1e-3};
+    const double v0[3] = {rv0[idx * 6 + 3] * 1e-3, rv0[idx * 6 + 4] * 1e-3,
+                          rv0[idx * 6 + 5] * 1e-3};
+    const double mu = MU_M * 1e-9;                       // km^3/s^2
+    double Phi[6][6];
+    stmTwoBodyDev(r0, v0, dt_total, mu, Phi);
+    double *Ao = Aout + (size_t)idx * 18;
+    for (int a = 0; a < 3; ++a)
+        for (int b = 0; b < 6; ++b) Ao[a * 6 + b] = Phi[a][b];
+}
+
+// 位置取用：loc<4 → 传播缓冲 P(f)；loc==12 → 中心（P 第 4 行）；4..11 → r2 固定位置
+__device__ __forceinline__ void blkPosDev(const double *P, const double *r2P, int B, int n5,
+                                          int b, int loc, int f, double *p) {
+    if (loc < 4) {
+        const double *q = P + ((size_t)f * n5 + (size_t)b * 5 + loc) * 6;
+        p[0] = q[0]; p[1] = q[1]; p[2] = q[2];
+    } else if (loc == 12) {
+        const double *q = P + ((size_t)f * n5 + (size_t)b * 5 + 4) * 6;
+        p[0] = q[0]; p[1] = q[1]; p[2] = q[2];
+    } else {
+        const double *q = r2P + ((size_t)f * (size_t)B * 8 + (size_t)b * 8 + (loc - 4)) * 3;
+        p[0] = q[0]; p[1] = q[1]; p[2] = q[2];
+    }
+}
+
+// w6 = uᵀ (A_f(3×6) · J0(6×6))
+__device__ __forceinline__ void blkJacVecDev(const double *A, const double *J0, int n5, int m,
+                                             int f, const double *u, double *w) {
+    const double *Af = A + ((size_t)f * n5 + m) * 18;
+    const double *Jm = J0 + (size_t)m * 36;
+    double v[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c)
+        v[c] = u[0] * Af[c] + u[1] * Af[6 + c] + u[2] * Af[12 + c];
+#pragma unroll
+    for (int e = 0; e < 6; ++e) {
+        double s = 0.0;
+#pragma unroll
+        for (int c = 0; c < 6; ++c) s += v[c] * Jm[c * 6 + e];
+        w[e] = s;
+    }
+}
+
+// 写入列块：loc<4 → A24/Apar 的 loc*6..；loc==12 → 仅 Apar 24..29；r2 → 无列
+__device__ __forceinline__ void blkWriteColDev(double *A24, double *Apar, int nrow, int b, int row,
+                                               int loc, const double *vals, double sgn) {
+    if (loc < 4) {
+        double *a24 = A24 + ((size_t)b * nrow + row) * 24 + loc * 6;
+        double *ap = Apar + ((size_t)b * nrow + row) * 30 + loc * 6;
+#pragma unroll
+        for (int c = 0; c < 6; ++c) { a24[c] = sgn * vals[c]; ap[c] = sgn * vals[c]; }
+    } else if (loc == 12) {
+        double *ap = Apar + ((size_t)b * nrow + row) * 30 + 24;
+#pragma unroll
+        for (int c = 0; c < 6; ++c) ap[c] = sgn * vals[c];
+    }
+}
+
+__global__ void blkIslAsmKernel(const double *P, const double *A, const double *J0,
+                                const double *r2P, const int *ea, const double *islD,
+                                const double *islM, int B, int K, int n5, int nrow,
+                                double inv_sig, double *A24, double *Apar, double *rres) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * 16 * K) return;
+    const int b = idx / (16 * K), rem = idx % (16 * K);
+    const int e = rem / K, k = rem % K;
+    const int f = K - 1 - k;                              // 历史序 k=0 最早 → 原始帧 f
+    const int li = ea[(b * 16 + e) * 2], lj = ea[(b * 16 + e) * 2 + 1];
+    double pi[3], pj[3];
+    blkPosDev(P, r2P, B, n5, b, li, f, pi);
+    blkPosDev(P, r2P, B, n5, b, lj, f, pj);
+    const double d0 = pi[0] - pj[0], d1 = pi[1] - pj[1], d2 = pi[2] - pj[2];
+    const double rr = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double ir = (rr > 1e-12) ? 1.0 / rr : 0.0;
+    const double u[3] = {d0 * ir, d1 * ir, d2 * ir};
+    const double M = islM[(b * 16 + e) * K + k];
+    const double D = islD[(b * 16 + e) * K + k];
+    const int row = e * K + k;
+    rres[(size_t)b * nrow + row] = (rr - D) * M * inv_sig;
+    const double vis = (M > 0.5) ? 1.0 : 0.0;
+    double w[6];
+    if (li < 4 || li == 12) {
+        blkJacVecDev(A, J0, n5, b * 5 + (li == 12 ? 4 : li), f, u, w);
+        blkWriteColDev(A24, Apar, nrow, b, row, li, w, vis * inv_sig);
+    }
+    if (lj < 4 || lj == 12) {
+        blkJacVecDev(A, J0, n5, b * 5 + (lj == 12 ? 4 : lj), f, u, w);
+        blkWriteColDev(A24, Apar, nrow, b, row, lj, w, -vis * inv_sig);
+    }
+}
+
+__global__ void blkGtsAsmKernel(const double *P, const double *A, const double *J0,
+                                const double *r2P, const int *lo, const int *gi,
+                                const double *gtsD, const double *gtsM, const double *gtsQ, int G,
+                                int B, int K, int n5, int gmax, int b_gts, int nrow,
+                                double inv_sig, double *A24, double *Apar, double *rres) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * gmax * K) return;
+    const int b = idx / (gmax * K), rem = idx % (gmax * K);
+    const int j = rem / K, k = rem % K;
+    const int loc = lo[b * gmax + j];
+    if (loc < 0) return;
+    const int g = gi[b * gmax + j];
+    const int f = K - 1 - k;
+    double p[3];
+    blkPosDev(P, r2P, B, n5, b, loc, f, p);
+    const double *q = gtsQ + ((size_t)k * G + g) * 3;
+    const double d0 = p[0] - q[0], d1 = p[1] - q[1], d2 = p[2] - q[2];
+    const double rr = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double ir = (rr > 1e-12) ? 1.0 / rr : 0.0;
+    const double u[3] = {d0 * ir, d1 * ir, d2 * ir};
+    const double M = gtsM[(size_t)k * G + g];
+    const double D = gtsD[(size_t)k * G + g];
+    const int row = b_gts + j * K + k;
+    rres[(size_t)b * nrow + row] = (rr - D) * M * inv_sig;
+    double w[6];
+    blkJacVecDev(A, J0, n5, b * 5 + (loc == 12 ? 4 : loc), f, u, w);
+    blkWriteColDev(A24, Apar, nrow, b, row, loc, w, M * inv_sig);
+}
+
+// Eph 行：P(fp) 位置 / A(fa) 折叠；truth (B,4,3)；b_off = b_ea 或 b_e4
+__global__ void blkEphAsmKernel(const double *P, int fp, const double *A, int fa,
+                                const double *J0, const double *truth, int B, int n5, int b_off,
+                                int nrow, double inv_sig, double *A24, double *Apar,
+                                double *rres) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * 12) return;
+    const int b = idx / 12, rem = idx % 12, i = rem / 3, c = rem % 3;
+    const int m = b * 5 + i;
+    const double p = P[((size_t)fp * n5 + m) * 6 + c];
+    const int row = b_off + i * 3 + c;
+    rres[(size_t)b * nrow + row] = (p - truth[(size_t)(b * 4 + i) * 3 + c]) * inv_sig;
+    const double *Af = A + ((size_t)fa * n5 + m) * 18;
+    const double *Jm = J0 + (size_t)m * 36;
+    double vals[6];
+#pragma unroll
+    for (int e = 0; e < 6; ++e) {
+        double s = 0.0;
+#pragma unroll
+        for (int cc = 0; cc < 6; ++cc) s += Af[c * 6 + cc] * Jm[cc * 6 + e];
+        vals[e] = s * inv_sig;
+    }
+    blkWriteColDev(A24, Apar, nrow, b, row, i, vals, 1.0);
+}
+
+__global__ void blkPriAsmKernel(const double *y, const double *Uti, const double *priSig,
+                                int B, int mode, int b_pri, int nrow, double *A24, double *Apar,
+                                double *rres) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= B * 24 || mode < 0) return;
+    const int b = idx / 24, rem = idx % 24, i = rem / 6, c = rem % 6;
+    const int row = b_pri + i * 6 + c;
+    if (mode == 1) {
+        const double *U = Uti + (size_t)b * 36 + c * 6;
+        double s = 0.0;
+#pragma unroll
+        for (int j = 0; j < 6; ++j) s += U[j] * y[(size_t)(b * 4 + i) * 6 + j];
+        rres[(size_t)b * nrow + row] = s;
+        double *a24 = A24 + ((size_t)b * nrow + row) * 24 + i * 6;
+#pragma unroll
+        for (int j = 0; j < 6; ++j) a24[j] = U[j];
+    } else {
+        const double sig = priSig[c];
+        rres[(size_t)b * nrow + row] = y[(size_t)(b * 4 + i) * 6 + c] / sig;
+        double *a24 = A24 + ((size_t)b * nrow + row) * 24 + i * 6;
+        a24[c] = 1.0 / sig;
+    }
+}
+
+void blkSetupDevice(BlkCtx &c, int B, int K, int n4, int gmax, int G,
+                    double s_isl, double s_gts, double s_eph, double s_eph4,
+                    int prior_mode, int use_eph,
+                    double sigma_prior, const int *hEa, const double *hIslD, const double *hIslM,
+                    const int *hLo, const int *hGi, const double *hGtsD, const double *hGtsM,
+                    const double *hGtsQ) {
+    const bool resize = (c.B != B || c.K != K || c.n4 != n4 || c.gmax != gmax || c.G != G);
+    c.B = B; c.K = K; c.n4 = n4; c.gmax = gmax; c.G = G;
+    c.s_isl = s_isl; c.s_gts = s_gts; c.s_eph = s_eph; c.s_eph4 = s_eph4;
+    c.prior_mode = prior_mode; c.use_eph = use_eph; c.sigma_prior = sigma_prior;
+    c.b_gts = 16 * K;
+    c.b_ea = c.b_gts + gmax * K;
+    c.b_e4 = c.b_ea + 12;
+    c.b_pri = c.b_e4 + 12;
+    c.nrow = c.b_pri + 24;
+    const int n5 = B * 5;
+    if (resize) {
+        if (c.d_ea) cudaFree(c.d_ea);
+        if (c.d_lo) cudaFree(c.d_lo);
+        if (c.d_gi) cudaFree(c.d_gi);
+        double *ptrs_d[] = {c.d_islD, c.d_islM, c.d_gtsD, c.d_gtsM, c.d_gtsQ,
+                            c.d_base, c.d_dq, c.d_Uti, c.d_priSig, c.d_r2P,
+                            c.d_truthA, c.d_truth4, c.d_y, c.d_q, c.d_rv0, c.d_J0, c.d_I36,
+                            c.d_P, c.d_A, c.d_Pf, c.d_A4};
+        for (auto p : ptrs_d) if (p) cudaFree(p);
+        c.d_ea = nullptr; c.d_lo = nullptr; c.d_gi = nullptr;
+        for (auto &p : ptrs_d) p = nullptr;
+        auto M = [](void **p, std::size_t bytes) {
+            if (cudaMalloc(p, bytes ? bytes : 8) != cudaSuccess)
+                throw std::runtime_error("BlkCtx: cudaMalloc 失败");
+        };
+        M((void **)&c.d_ea, (std::size_t)B * 16 * 2 * sizeof(int));
+        M((void **)&c.d_islD, (std::size_t)B * 16 * K * sizeof(double));
+        M((void **)&c.d_islM, (std::size_t)B * 16 * K * sizeof(double));
+        M((void **)&c.d_lo, (std::size_t)B * gmax * sizeof(int));
+        M((void **)&c.d_gi, (std::size_t)B * gmax * sizeof(int));
+        M((void **)&c.d_gtsD, (std::size_t)K * G * sizeof(double));
+        M((void **)&c.d_gtsM, (std::size_t)K * G * sizeof(double));
+        M((void **)&c.d_gtsQ, (std::size_t)K * G * 3 * sizeof(double));
+        M((void **)&c.d_base, (std::size_t)B * 5 * 6 * sizeof(double));
+        M((void **)&c.d_dq, (std::size_t)B * 5 * 6 * sizeof(double));
+        M((void **)&c.d_Uti, (std::size_t)B * 36 * sizeof(double));
+        M((void **)&c.d_priSig, 6 * sizeof(double));
+        M((void **)&c.d_r2P, (std::size_t)K * B * 8 * 3 * sizeof(double));
+        M((void **)&c.d_truthA, (std::size_t)B * 12 * sizeof(double));
+        M((void **)&c.d_truth4, (std::size_t)B * 12 * sizeof(double));
+        M((void **)&c.d_y, (std::size_t)B * 24 * sizeof(double));
+        M((void **)&c.d_q, (std::size_t)n5 * 6 * sizeof(double));
+        M((void **)&c.d_rv0, (std::size_t)n5 * 6 * sizeof(double));
+        M((void **)&c.d_J0, (std::size_t)n5 * 36 * sizeof(double));
+        M((void **)&c.d_I36, (std::size_t)n5 * 36 * sizeof(double));
+        M((void **)&c.d_P, (std::size_t)K * n5 * 6 * sizeof(double));
+        M((void **)&c.d_A, (std::size_t)K * n5 * 18 * sizeof(double));
+        M((void **)&c.d_Pf, (std::size_t)n5 * 6 * sizeof(double));
+        M((void **)&c.d_A4, (std::size_t)n5 * 18 * sizeof(double));
+        std::vector<double> I36((std::size_t)n5 * 36, 0.0);
+        for (int m = 0; m < n5; ++m)
+            for (int d = 0; d < 6; ++d) I36[(std::size_t)m * 36 + d * 6 + d] = 1.0;
+        cudaMemcpy(c.d_I36, I36.data(), I36.size() * sizeof(double), cudaMemcpyHostToDevice);
+    }
+    cudaMemcpy(c.d_ea, hEa, (std::size_t)B * 16 * 2 * sizeof(int), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_islD, hIslD, (std::size_t)B * 16 * K * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_islM, hIslM, (std::size_t)B * 16 * K * sizeof(double), cudaMemcpyHostToDevice);
+    if (gmax > 0) {
+        cudaMemcpy(c.d_lo, hLo, (std::size_t)B * gmax * sizeof(int), cudaMemcpyHostToDevice);
+        cudaMemcpy(c.d_gi, hGi, (std::size_t)B * gmax * sizeof(int), cudaMemcpyHostToDevice);
+    }
+    if (G > 0) {
+        cudaMemcpy(c.d_gtsD, hGtsD, (std::size_t)K * G * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(c.d_gtsM, hGtsM, (std::size_t)K * G * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(c.d_gtsQ, hGtsQ, (std::size_t)K * G * 3 * sizeof(double),
+                   cudaMemcpyHostToDevice);
+    }
+}
+
+void blkSetWindowDevice(BlkCtx &c, const double *hBase, const double *hDq, const double *hUti,
+                        const double *hPriSig, const double *hR2P,
+                        const double *hTruthA, const double *hTruth4) {
+    cudaMemcpy(c.d_base, hBase, (std::size_t)c.B * 30 * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(c.d_dq, hDq, (std::size_t)c.B * 30 * sizeof(double), cudaMemcpyHostToDevice);
+    if (hUti) cudaMemcpy(c.d_Uti, hUti, (std::size_t)c.B * 36 * sizeof(double),
+                         cudaMemcpyHostToDevice);
+    if (hPriSig) cudaMemcpy(c.d_priSig, hPriSig, 6 * sizeof(double), cudaMemcpyHostToDevice);
+    if (hR2P) cudaMemcpy(c.d_r2P, hR2P, (std::size_t)c.K * c.B * 24 * sizeof(double),
+                         cudaMemcpyHostToDevice);
+    if (hTruthA) cudaMemcpy(c.d_truthA, hTruthA, (std::size_t)c.B * 12 * sizeof(double),
+                            cudaMemcpyHostToDevice);
+    if (hTruth4) cudaMemcpy(c.d_truth4, hTruth4, (std::size_t)c.B * 12 * sizeof(double),
+                            cudaMemcpyHostToDevice);
+}
+
+void blkExpandDevice(BlkCtx &c, const double *hY, double *A24, double *Apar, double *rres) {
+    const int n5 = c.B * 5;
+    const int thr = 256;
+    const int blk_n5 = (n5 + thr - 1) / thr;
+    double t0 = _bn();
+    if (cudaMemcpy(c.d_y, hY, (std::size_t)c.B * 24 * sizeof(double), cudaMemcpyHostToDevice) !=
+        cudaSuccess)
+        throw std::runtime_error("blkExpandDevice: H2D y 失败");
+    bt_copy += _bn() - t0;
+
+    t0 = _bn();
+    blkPackKernel<<<blk_n5, thr>>>(c.d_base, c.d_dq, c.d_y, c.B, c.d_q);
+    oeJacKernel<<<blk_n5, thr>>>(c.d_q, n5, c.d_rv0, c.d_J0);
+    cudaError_t e1 = cudaDeviceSynchronize();
+    bt_pack += _bn() - t0;
+    t0 = _bn();
+    cartPropagateKernel<<<blk_n5, thr>>>(c.d_rv0, n5, c.K, -10.0, 1.0, c.d_P);
+    cudaError_t e2 = cudaDeviceSynchronize();
+    bt_cbwd += _bn() - t0;
+    t0 = _bn();
+    stmFoldKernel<<<blk_n5, thr>>>(c.d_rv0, n5, c.K, -10.0, c.d_I36, c.d_A);
+    cudaError_t e3 = cudaDeviceSynchronize();
+    bt_fbwd += _bn() - t0;
+    t0 = _bn();
+    blkFwdLastKernel<<<blk_n5, thr>>>(c.d_rv0, n5, c.n4, 10.0, 1.0, c.d_Pf);
+    cudaError_t e4 = cudaDeviceSynchronize();
+    bt_cfwd += _bn() - t0;
+    t0 = _bn();
+    blkFoldLastKernel<<<blk_n5, thr>>>(c.d_rv0, n5, (double)c.n4 * 10.0, c.d_A4);
+    cudaError_t err0 = cudaDeviceSynchronize();
+    bt_ffwd += _bn() - t0;
+    if (err0 | e1 | e2 | e3 | e4)
+        throw std::runtime_error(std::string("blkExpandDevice(prop): ") + cudaGetErrorString(err0));
+
+    t0 = _bn();
+    const std::size_t nB = (std::size_t)c.B;
+    cudaMemsetAsync(A24, 0, nB * c.nrow * 24 * sizeof(double));
+    cudaMemsetAsync(Apar, 0, nB * c.nrow * 30 * sizeof(double));
+    cudaMemsetAsync(rres, 0, nB * c.nrow * sizeof(double));
+    cudaError_t err1 = cudaDeviceSynchronize();
+    bt_memset += _bn() - t0;                    // 阶段 3：输出缓冲清零
+    if (err1 != cudaSuccess)
+        throw std::runtime_error(std::string("blkExpandDevice(memset): ") + cudaGetErrorString(err1));
+
+    t0 = _bn();
+    const int nIsl = c.B * 16 * c.K;
+    blkIslAsmKernel<<<(nIsl + thr - 1) / thr, thr>>>(c.d_P, c.d_A, c.d_J0, c.d_r2P, c.d_ea,
+                                                     c.d_islD, c.d_islM, c.B, c.K, n5, c.nrow,
+                                                     1.0 / c.s_isl, A24, Apar, rres);
+    const int nGts = c.B * c.gmax * c.K;
+    if (nGts > 0)
+        blkGtsAsmKernel<<<(nGts + thr - 1) / thr, thr>>>(c.d_P, c.d_A, c.d_J0, c.d_r2P, c.d_lo,
+                                                         c.d_gi, c.d_gtsD, c.d_gtsM, c.d_gtsQ,
+                                                         c.G, c.B, c.K, n5, c.gmax, c.b_gts,
+                                                         c.nrow, 1.0 / c.s_gts, A24, Apar, rres);
+    if (c.use_eph) {
+        const int nE = c.B * 12;
+        blkEphAsmKernel<<<(nE + thr - 1) / thr, thr>>>(c.d_P, 0, c.d_A, 0, c.d_J0, c.d_truthA,
+                                                       c.B, n5, c.b_ea, c.nrow, 1.0 / c.s_eph,
+                                                       A24, Apar, rres);
+        blkEphAsmKernel<<<(nE + thr - 1) / thr, thr>>>(c.d_Pf, 0, c.d_A4, 0, c.d_J0, c.d_truth4,
+                                                       c.B, n5, c.b_e4, c.nrow, 1.0 / c.s_eph4,
+                                                       A24, Apar, rres);
+    }
+    if (c.prior_mode >= 0)
+        blkPriAsmKernel<<<(c.B * 24 + thr - 1) / thr, thr>>>(
+            c.d_y, c.d_Uti, c.d_priSig, c.B, c.prior_mode, c.b_pri, c.nrow, A24, Apar, rres);
+    cudaError_t err = cudaDeviceSynchronize();
+    bt_asm += _bn() - t0;                       // 阶段 4：ISL/GTS/Eph/先验装配
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("blkExpandDevice: ") + cudaGetErrorString(err));
+}
+
+void blkCopyRvDevice(const BlkCtx &c, double *hRvK, double *hRv4) {
+    const std::size_t n5 = (std::size_t)c.B * 5;
+    cudaMemcpy(hRvK, c.d_P, (std::size_t)c.K * n5 * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(hRv4, c.d_Pf, n5 * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+}
+
+void blkResetTiming() {
+    bt_copy = bt_pack = bt_cbwd = bt_fbwd = bt_cfwd = bt_ffwd = bt_memset = bt_asm = 0;
+}
+std::vector<double> blkGetTiming() {
+    return {bt_copy, bt_pack, bt_cbwd, bt_fbwd, bt_cfwd, bt_ffwd, bt_memset, bt_asm};
+}
+
 }  // namespace qoejopt

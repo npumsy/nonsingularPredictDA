@@ -207,6 +207,56 @@ void flsEkfHandoffDevice(const double *d_Aval, const double *d_sc,
                          const double *d_phi, const double *d_linv, int n,
                          double *d_Lp, double *d_Pm);
 
+// ===================== 子块内环（144 块锚帧 ΔQOE）device 常驻装配 =====================
+// 变量：仅每块 r=1 的 4 节点锚帧 ΔQOE（B×24）；中心 = 网络 dq（固定）、r2 = Q_anJ2（固定位置）。
+// 轨迹：全动力学笛卡尔 RK4 10 s 后向 K 帧 + 前向 T/4（位置）；Jacobian = 两体解析 STM 折叠 × ∂rv/∂oe。
+// 行序（与 Python block_inner 一致）：ISL 16K | GTS gmax·K | Eph 锚 12 | Eph T/4 12 | 先验 24。
+struct BlkCtx {
+    int B = 0, K = 0, n4 = 0, gmax = 0, G = 0;
+    int nrow = 0, b_gts = 0, b_ea = 0, b_e4 = 0, b_pri = 0;
+    double s_isl = 30.0, s_gts = 30.0, s_eph = 1.0, s_eph4 = 1.0;   // s_eph4：T/4 行口径（按模型差随预测时间增长设）
+    int prior_mode = 0;      // 0=固定 σ_prior 对角；1=网络 Σ_q 白化（U_b^{-T}）；-1=无先验
+    int use_eph = 1;         // 0=部署（truth 置空，Eph 行零残差零雅可比）
+    double sigma_prior = 100.0;
+    // 结构（blk_setup 上传）
+    int *d_ea = nullptr;                    // (B,16,2) 局部节点号（0..3 r1; 4..11 r2; 12 中心）
+    double *d_islD = nullptr, *d_islM = nullptr;   // (B,16,K)
+    int *d_lo = nullptr, *d_gi = nullptr;          // (B,gmax)
+    double *d_gtsD = nullptr, *d_gtsM = nullptr;   // (K,G)
+    double *d_gtsQ = nullptr;                      // (K,G,3)
+    // 每窗（blk_set_window 上传）
+    double *d_base = nullptr, *d_dq = nullptr;     // (B,5,6)
+    double *d_Uti = nullptr;                       // (B,6,6) U_b^{-T}（prior_mode=1）
+    double *d_priSig = nullptr;                    // (6,) 位置等效 prior（prior_mode=0）
+    double *d_r2P = nullptr;                       // (K,B*8,3)
+    double *d_truthA = nullptr, *d_truth4 = nullptr;  // (B,4,3)
+    // scratch
+    double *d_y = nullptr;                         // (B,4,6)
+    double *d_q = nullptr;                         // (B*5,6)
+    double *d_rv0 = nullptr, *d_J0 = nullptr;      // (B*5,6) / (B*5,36)
+    double *d_I36 = nullptr;                       // (B*5,36) 单位阵
+    double *d_P = nullptr, *d_A = nullptr;         // (K,B*5,6) / (K,B*5,18)
+    double *d_Pf = nullptr, *d_A4 = nullptr;       // ((n4+1),B*5,6) / (B*5,18)
+};
+// 结构/观测 setup（尺寸/指针变化时重分配；观测表按窗重传）。
+void blkSetupDevice(BlkCtx &c, int B, int K, int n4, int gmax, int G,
+                    double s_isl, double s_gts, double s_eph, double s_eph4,
+                    int prior_mode, int use_eph,
+                    double sigma_prior, const int *hEa, const double *hIslD, const double *hIslM,
+                    const int *hLo, const int *hGi, const double *hGtsD, const double *hGtsM,
+                    const double *hGtsQ);
+// 每窗数据：base/dq(5 节点)、Uti 或固定 prior σ、r2 位置、Eph 真值（可空）。
+void blkSetWindowDevice(BlkCtx &c, const double *hBase, const double *hDq, const double *hUti,
+                        const double *hPriSig, const double *hR2P,
+                        const double *hTruthA, const double *hTruth4);
+// 一轮：y → pack+oe2rv+后向链+前向 T/4+装配；A24/Apar/r 为 Python 提供的 device 指针。
+void blkExpandDevice(BlkCtx &c, const double *hY, double *A24, double *Apar, double *rres);
+// 拷出后向链 rv（K,B*5,6）与前向 T/4 末帧 rv（B*5,6）。
+void blkCopyRvDevice(const BlkCtx &c, double *hRvK, double *hRv4);
+// 细粒度计时（秒，累计）：[pack, cartBwd, foldBwd, cartFwd, foldFwd, asm]
+void blkResetTiming();
+std::vector<double> blkGetTiming();
+
 }  // namespace qoejopt
 
 #endif  // QOEJOPT_H

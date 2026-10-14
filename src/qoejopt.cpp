@@ -679,6 +679,85 @@ static py::array_t<double> copy_rv() {
     return out;
 }
 
+// ---------------- 子块内环（144 块锚帧 ΔQOE）host 包装 ----------------
+static qoejopt::BlkCtx g_blk;
+
+static void blk_free() {
+    qoejopt::BlkCtx &c = g_blk;
+    if (c.d_ea) cudaFree(c.d_ea);
+    if (c.d_lo) cudaFree(c.d_lo);
+    if (c.d_gi) cudaFree(c.d_gi);
+    double *pd[] = {c.d_islD, c.d_islM, c.d_gtsD, c.d_gtsM, c.d_gtsQ, c.d_base, c.d_dq,
+                    c.d_Uti, c.d_priSig, c.d_r2P, c.d_truthA, c.d_truth4, c.d_y, c.d_q,
+                    c.d_rv0, c.d_J0, c.d_I36, c.d_P, c.d_A, c.d_Pf, c.d_A4};
+    for (auto p : pd)
+        if (p) cudaFree(p);
+    g_blk = qoejopt::BlkCtx{};
+}
+
+static void blk_setup(int B, int K, int n4, int gmax, int G, double s_isl, double s_gts,
+                      double s_eph, double s_eph4, int prior_mode, int use_eph, double sigma_prior,
+                      py::array_t<int, py::array::c_style | py::array::forcecast> ea,
+                      py::array_t<double, py::array::c_style | py::array::forcecast> isl_D,
+                      py::array_t<double, py::array::c_style | py::array::forcecast> isl_M,
+                      py::array_t<int, py::array::c_style | py::array::forcecast> lo,
+                      py::array_t<int, py::array::c_style | py::array::forcecast> gi,
+                      py::array_t<double, py::array::c_style | py::array::forcecast> gts_D,
+                      py::array_t<double, py::array::c_style | py::array::forcecast> gts_M,
+                      py::array_t<double, py::array::c_style | py::array::forcecast> gts_Q) {
+    auto pe = ea.request();
+    auto pID = isl_D.request();
+    auto pIM = isl_M.request();
+    auto pl = lo.request();
+    auto pg = gi.request();
+    auto pGD = gts_D.request();
+    auto pGM = gts_M.request();
+    auto pGQ = gts_Q.request();
+    qoejopt::blkSetupDevice(g_blk, B, K, n4, gmax, G, s_isl, s_gts, s_eph, s_eph4, prior_mode, use_eph,
+                            sigma_prior, static_cast<const int *>(pe.ptr),
+                            static_cast<const double *>(pID.ptr), static_cast<const double *>(pIM.ptr),
+                            static_cast<const int *>(pl.ptr), static_cast<const int *>(pg.ptr),
+                            static_cast<const double *>(pGD.ptr), static_cast<const double *>(pGM.ptr),
+                            static_cast<const double *>(pGQ.ptr));
+}
+
+static void blk_set_window(py::array_t<double, py::array::c_style | py::array::forcecast> base,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> dq,
+                           py::object Uti, py::object pri_sig, py::object r2P,
+                           py::object truth_a, py::object truth_4) {
+    auto pb = base.request();
+    auto pd = dq.request();
+    py::array_t<double, py::array::c_style | py::array::forcecast> aU, aS, aR, aTa, aT4;
+    const double *pU = nullptr, *pS = nullptr, *pR = nullptr, *pTa = nullptr, *pT4 = nullptr;
+    if (!Uti.is_none()) { aU = Uti.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); pU = static_cast<const double *>(aU.request().ptr); }
+    if (!pri_sig.is_none()) { aS = pri_sig.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); pS = static_cast<const double *>(aS.request().ptr); }
+    if (!r2P.is_none()) { aR = r2P.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); pR = static_cast<const double *>(aR.request().ptr); }
+    if (!truth_a.is_none()) { aTa = truth_a.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); pTa = static_cast<const double *>(aTa.request().ptr); }
+    if (!truth_4.is_none()) { aT4 = truth_4.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); pT4 = static_cast<const double *>(aT4.request().ptr); }
+    qoejopt::blkSetWindowDevice(g_blk, static_cast<const double *>(pb.ptr),
+                                static_cast<const double *>(pd.ptr), pU, pS, pR, pTa, pT4);
+}
+
+static void blk_expand(py::array_t<double, py::array::c_style | py::array::forcecast> y,
+                       uint64_t A24_ptr, uint64_t Apar_ptr, uint64_t r_ptr) {
+    auto py_ = y.request();
+    const double *hY = static_cast<const double *>(py_.ptr);
+    py::gil_scoped_release rel;
+    qoejopt::blkExpandDevice(g_blk, hY, reinterpret_cast<double *>(A24_ptr),
+                             reinterpret_cast<double *>(Apar_ptr),
+                             reinterpret_cast<double *>(r_ptr));
+}
+
+static py::tuple blk_copy_rv() {
+    qoejopt::BlkCtx &c = g_blk;
+    const int n5 = c.B * 5;
+    py::array_t<double> rvK({(py::ssize_t)c.K, (py::ssize_t)n5, (py::ssize_t)6});
+    py::array_t<double> rv4({(py::ssize_t)n5, (py::ssize_t)6});
+    double *pK = rvK.mutable_data(), *p4 = rv4.mutable_data();
+    { py::gil_scoped_release rel; qoejopt::blkCopyRvDevice(c, pK, p4); }
+    return py::make_tuple(rvK, rv4);
+}
+
 PYBIND11_MODULE(qoejopt, m) {
     m.doc() = "joint 单发全局联合内环 C++/CUDA 核心（device 常驻装配；A_val/b 写调用方 torch cuda 缓冲）";
     m.def("setup", &setup, py::arg("n"), py::arg("nfr"), py::arg("E"), py::arg("G"),
@@ -825,4 +904,25 @@ PYBIND11_MODULE(qoejopt, m) {
     }, "L 节点窗口计时 [dyn, assemble, res2]（秒）");
     m.def("win_reset_timing", &qoejopt::winResetTiming, "清零窗口计时");
     m.def("win_free", &_free_wctx, "释放窗口 device 缓冲");
+
+    // 子块内环（144 块锚帧 ΔQOE）device 常驻装配
+    m.def("blk_setup", &blk_setup, py::arg("B"), py::arg("K"), py::arg("n4"), py::arg("gmax"),
+          py::arg("G"), py::arg("s_isl"), py::arg("s_gts"), py::arg("s_eph"), py::arg("s_eph4"),
+          py::arg("prior_mode"), py::arg("use_eph"), py::arg("sigma_prior"),
+          py::arg("ea"), py::arg("isl_D"), py::arg("isl_M"), py::arg("lo"), py::arg("gi"),
+          py::arg("gts_D"), py::arg("gts_M"), py::arg("gts_Q"),
+          "子块内环结构/观测：ea(B,16,2) 局部节点、isl_D/M(B,16,K)、lo/gi(B,gmax)、gts_D/M(K,G)、gts_Q(K,G,3)");
+    m.def("blk_set_window", &blk_set_window, py::arg("base"), py::arg("dq"), py::arg("Uti"),
+          py::arg("pri_sig"), py::arg("r2P"), py::arg("truth_a"), py::arg("truth_4"),
+          "子块内环每窗数据：base/dq(B,5,6)、Uti(B,6,6) 或 pri_sig(6,)、r2P(K,B*8,3)、Eph 真值(B,4,3)（None=部署）");
+    m.def("blk_expand", &blk_expand, py::arg("y"), py::arg("A24_ptr"), py::arg("Apar_ptr"),
+          py::arg("r_ptr"),
+          "子块内环一轮：y(B,4,6) → pack+oe2rv+后向链+前向T/4+装配；A24/Apar/r 为 torch device 指针");
+    m.def("blk_copy_rv", &blk_copy_rv, "拷出后向链 rv (K,B*5,6) 与前向 T/4 末帧 rv (B*5,6)");
+    m.def("blk_timing", []() {
+        auto v = qoejopt::blkGetTiming();
+        py::list l; for (double x : v) l.append(x); return l;
+    }, "子块内环计时 [pack, cartBwd, foldBwd, cartFwd, foldFwd, asm]（秒）");
+    m.def("blk_reset_timing", &qoejopt::blkResetTiming, "清零子块内环计时");
+    m.def("blk_free", &blk_free, "释放子块内环 device 缓冲");
 }
