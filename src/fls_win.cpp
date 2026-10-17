@@ -21,6 +21,7 @@
 #include "extlib/baspacho_solver.h"
 #include "kepler.h"
 #include "qoejopt.h"
+#include "fls_lists.h"
 
 namespace py = pybind11;
 
@@ -375,64 +376,18 @@ class FlsWindow {
         auto bptr_t = torch::from_blob(S_.bptrs.data(), {(py::ssize_t)S_.bptrs.size()}, optsIcpu).clone();
         auto bind_t = torch::from_blob(S_.binds.data(), {(py::ssize_t)S_.binds.size()}, optsIcpu).clone();
         sym_ = std::make_unique<SymbolicDecomposition>(paramSize, bptr_t, bind_t, "cuda");
-        // ---- P1'（逐星 Schur）：逐星行表（device int64，一次构造）----
+        // ---- P1'（逐星 Schur）：行表由 fls_lists.h 统一构造（与 gtest 同源）----
         {
-            std::vector<int64_t> p00{0}, s00, c00, p11{0}, s11, c11, ps1, ps0;
-            for (int i = 0; i < n_; ++i) {
-                s00.push_back((int64_t)S_.off_damp + (int64_t)i * 36);        // prior@0
-                c00.push_back((int64_t)i * 6);
-                for (int e = 0; e < E_; ++e) {                                // ISL@0（关联到 i 的一侧）
-                    if (isl_i_[e] == i) {
-                        s00.push_back((int64_t)S_.off_isl + (int64_t)e * 12);
-                        c00.push_back((int64_t)i * 6);
-                    }
-                    if (isl_j_[e] == i) {
-                        s00.push_back((int64_t)S_.off_isl + (int64_t)e * 12 + 6);
-                        c00.push_back((int64_t)i * 6);
-                    }
-                }
-                for (int g = 0; g < G_; ++g)                                  // GTS@0
-                    if (gts_[g] == i) {
-                        s00.push_back((int64_t)S_.off_gts + (int64_t)g * 6);
-                        c00.push_back((int64_t)i * 6);
-                    }
-                s00.push_back((int64_t)S_.off_dyn + (int64_t)i * 72);         // dyn(0→1) 的节点 0（每行 12 非零）
-                c00.push_back((int64_t)i * 6);
-                p00.push_back((int64_t)s00.size());
-                for (int e = 0; e < E_; ++e) {                                // ISL@1
-                    if (isl_i_[e] == i) {
-                        s11.push_back((int64_t)S_.off_isl + ((int64_t)E_ + e) * 12);
-                        c11.push_back((int64_t)(n_ + i) * 6);
-                    }
-                    if (isl_j_[e] == i) {
-                        s11.push_back((int64_t)S_.off_isl + ((int64_t)E_ + e) * 12 + 6);
-                        c11.push_back((int64_t)(n_ + i) * 6);
-                    }
-                }
-                for (int g = 0; g < G_; ++g)                                  // GTS@1
-                    if (gts_[g] == i) {
-                        s11.push_back((int64_t)S_.off_gts + ((int64_t)G_ + g) * 6);
-                        c11.push_back((int64_t)(n_ + i) * 6);
-                    }
-                s11.push_back((int64_t)S_.off_dyn + (int64_t)i * 72 + 6);     // dyn(0→1) 的节点 1
-                c11.push_back((int64_t)(n_ + i) * 6);
-                // 说明：曾把 dyn(1→2)@1 当作节点 1 的信息（L≥3），实为"把 frame 2 的动力学当硬观测"的
-                // 不一致处理：先验过度自信 → 长弧上 gauge 漂移（L=4 127 帧 Kabsch 1800+ m）。改为保守的
-                // 成对（0,1）边缘：丢弃未来帧信息，先验略松但一致（L=2 无此项，原本即精确）。
-                p11.push_back((int64_t)s11.size());
-                for (int k = 0; k < 6; ++k) {                                 // Λ10 配对（dyn(0→1) 的 6 行）
-                    ps1.push_back((int64_t)S_.off_dyn + (int64_t)(i * 6 + k) * 12 + 6);
-                    ps0.push_back((int64_t)S_.off_dyn + (int64_t)(i * 6 + k) * 12);
-                }
-            }
-            d00_p_ = torch::tensor(p00, optsI);
-            d00_s_ = torch::tensor(s00, optsI);
-            d00_c_ = torch::tensor(c00, optsI);
-            d11_p_ = torch::tensor(p11, optsI);
-            d11_s_ = torch::tensor(s11, optsI);
-            d11_c_ = torch::tensor(c11, optsI);
-            pr_s1_ = torch::tensor(ps1, optsI);
-            pr_s0_ = torch::tensor(ps0, optsI);
+            FlsLists lists = fls_make_lists(n_, L_, E_, G_, isl_i_, isl_j_, gts_,
+                                            S_.off_isl, S_.off_gts, S_.off_dyn, S_.off_damp);
+            d00_p_ = torch::tensor(lists.d00_p, optsI);
+            d00_s_ = torch::tensor(lists.d00_s, optsI);
+            d00_c_ = torch::tensor(lists.d00_c, optsI);
+            d11_p_ = torch::tensor(lists.d11_p, optsI);
+            d11_s_ = torch::tensor(lists.d11_s, optsI);
+            d11_c_ = torch::tensor(lists.d11_c, optsI);
+            pr_s1_ = torch::tensor(lists.pr_s1, optsI);
+            pr_s0_ = torch::tensor(lists.pr_s0, optsI);
             d_PmMarg_ = mal((size_t)n_ * 36);
         }
         {

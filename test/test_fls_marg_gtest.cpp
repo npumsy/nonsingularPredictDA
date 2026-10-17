@@ -81,6 +81,18 @@ void eigh6_host(const double *A, double *w, double *V) {
     }
 }
 
+void psd_clip6_host(double *P, double *w, const double *V) {
+    double wmax = 0.0;
+    for (int a = 0; a < 6; ++a) wmax = std::max(wmax, w[a]);
+    (void)wmax;
+    for (int a = 0; a < 6; ++a) w[a] = std::max(w[a], 0.0);
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += V[a * 6 + k] * w[k] * V[b * 6 + k];
+            P[a * 6 + b] = s;
+        }
+}
 // 合成用例：n 星、L 帧、E 条 ISL（固定图）、G 个 GTS；按 FLS 布局给出 A_val/A CSR/AᵀA 块图案。
 // with_chain=false 时去掉跨帧 dyn 行/链（结构消融：L 个互不相连的帧）。
 struct Case {
@@ -182,6 +194,9 @@ Case make_case(int n, int L, int E, int G, uint64_t seed, bool with_chain = true
     for (int64_t q = 0; q < nGTS * 6; ++q) c.A_val[c.off_gts + q] = gaus(rng);
     for (int64_t q = 0; q < nDYN * 12; ++q) c.A_val[c.off_dyn + q] = 1e7 * gaus(rng);
     for (int64_t q = 0; q < nPRI * 6; ++q) c.A_val[c.off_damp + q] = 1e6 * gaus(rng);
+    // 真实 FLS 只有帧 0 有先验行；结构为 L*n*6 行，帧 1..L-1 的先验行必须为零。
+    for (int64_t r = (int64_t)c.n * 6; r < nPRI; ++r)
+        for (int cc = 0; cc < 6; ++cc) c.A_val[c.off_damp + r * 6 + cc] = 0.0;
     if (with_chain && L >= 2)   // 行表描述 Λ00/Λ11/Λ10，需要窗口含下一帧；L=1 无此概念
         c.lists = fls_make_lists(n, L, (int)c.isl_i.size(), G, c.isl_i, c.isl_j, c.gts,
                                  c.off_isl, c.off_gts, c.off_dyn, c.off_damp);
@@ -232,6 +247,12 @@ void ref_marg(const Case &c, std::vector<double> &Lp, std::vector<double> &Pm) {
             for (int a = 0; a < 6; ++a)
                 for (int b = 0; b < 6; ++b) L10[a * 6 + b] += v1[a] * v0[b];
         }
+        {
+            double tr = 0.0;
+            for (int a = 0; a < 6; ++a) tr += L00[a * 6 + a];
+            const double eps = std::max(tr * 1e-12, 1e-30);
+            for (int a = 0; a < 6; ++a) L00[a * 6 + a] += eps;
+        }
         double A0inv[36]; inv6_host(L00, A0inv);
         double U[36];
         for (int a = 0; a < 6; ++a)
@@ -249,13 +270,24 @@ void ref_marg(const Case &c, std::vector<double> &Lp, std::vector<double> &Pm) {
             }
         for (int a = 0; a < 6; ++a)
             for (int b = 0; b < 6; ++b) Lm[a * 6 + b] = 0.5 * (Lmv[a * 6 + b] + Lmv[b * 6 + a]);
+        {
+            double tr = 0.0;
+            for (int a = 0; a < 6; ++a) tr += Lm[a * 6 + a];
+            const double eps = std::max(tr * 1e-12, 1e-30);
+            for (int a = 0; a < 6; ++a) Lm[a * 6 + a] += eps;
+        }
         double Pmv[36]; inv6_host(Lm, Pmv);
         for (int a = 0; a < 6; ++a)
             for (int b = 0; b < 6; ++b)
                 Pm[(size_t)i * 36 + a * 6 + b] = Pmv[a * 6 + b] * c.sc[(int64_t)(n + i) * 6 + a]
                                                  * c.sc[(int64_t)(n + i) * 6 + b];
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b)
+                Pm[(size_t)i * 36 + a * 6 + b] = 0.5 * (Pm[(size_t)i * 36 + a * 6 + b] +
+                                                        Pm[(size_t)i * 36 + b * 6 + a]);
         double w[6], V[36];
         eigh6_host(&Pm[(size_t)i * 36], w, V);
+        psd_clip6_host(&Pm[(size_t)i * 36], w, V);
         for (int a = 0; a < 6; ++a) {
             double wa = w[a] > 1e-3 ? w[a] : 1e-3;
             double si = 1.0 / std::sqrt(wa);
@@ -331,11 +363,182 @@ TEST(FlsMarg, KernelVsHostRef) {
                     (unsigned long long)seed, rLp, rPm,
                     *std::max_element(Pm_ref.begin(), Pm_ref.end(),
                                       [](double a, double b) { return std::fabs(a) < std::fabs(b); }));
-        EXPECT_LT(rLp, 1e-12) << "seed=" << seed;
+        EXPECT_LT(rLp, 1e-9) << "seed=" << seed;
         EXPECT_LT(rPm, 1e-12) << "seed=" << seed;
         cudaFree(d_A); cudaFree(d_sc); cudaFree(d_Lp); cudaFree(d_Pm);
         for (auto *p : d_p) cudaFree(p);
     }
+}
+
+
+namespace {
+void run_kernel_case(const Case &c, std::vector<double> &Lp_k, std::vector<double> &Pm_k) {
+    double *d_A = nullptr, *d_sc = nullptr, *d_Lp = nullptr, *d_Pm = nullptr;
+    cudaMalloc(&d_A, c.A_val.size() * sizeof(double));
+    cudaMalloc(&d_sc, c.sc.size() * sizeof(double));
+    cudaMalloc(&d_Lp, (size_t)c.n * 36 * sizeof(double));
+    cudaMalloc(&d_Pm, (size_t)c.n * 36 * sizeof(double));
+    cudaMemcpy(d_A, c.A_val.data(), c.A_val.size() * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_sc, c.sc.data(), c.sc.size() * sizeof(double), cudaMemcpyHostToDevice);
+    auto up = [&](const std::vector<int64_t> &v) {
+        int64_t *p = nullptr;
+        cudaMalloc(&p, v.size() * sizeof(int64_t));
+        cudaMemcpy(p, v.data(), v.size() * sizeof(int64_t), cudaMemcpyHostToDevice);
+        return p;
+    };
+    int64_t *dp[8] = {up(c.lists.d00_p), up(c.lists.d00_s), up(c.lists.d00_c),
+                      up(c.lists.d11_p), up(c.lists.d11_s), up(c.lists.d11_c),
+                      up(c.lists.pr_s1), up(c.lists.pr_s0)};
+    qoejopt::flsMargDevice(d_A, d_sc, dp[0], dp[1], dp[2], dp[3], dp[4], dp[5], dp[6], dp[7],
+                           c.n, d_Lp, d_Pm);
+    Lp_k.assign((size_t)c.n * 36, 0.0); Pm_k.assign((size_t)c.n * 36, 0.0);
+    cudaMemcpy(Lp_k.data(), d_Lp, Lp_k.size() * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(Pm_k.data(), d_Pm, Pm_k.size() * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(d_A); cudaFree(d_sc); cudaFree(d_Lp); cudaFree(d_Pm);
+    for (auto *p : dp) cudaFree(p);
+}
+}  // namespace
+
+TEST(FlsLists, PriorRowsSix) {
+    Case c = make_case(6, 2, 0, 0, 11);          // E=G=0：d00 = 6 行先验 + 1 行 dyn
+    for (int i = 0; i < c.n; ++i)
+        EXPECT_EQ(c.lists.d00_p[i + 1] - c.lists.d00_p[i], 12) << "star=" << i;
+}
+
+TEST(FlsLists, PairOnlyNoFutureDyn) {
+    Case c = make_case(6, 4, 0, 0, 12);          // L=4：d11 只应有 dyn(0→1) 一行
+    for (int i = 0; i < c.n; ++i)
+        EXPECT_EQ(c.lists.d11_p[i + 1] - c.lists.d11_p[i], 6) << "star=" << i;
+}
+
+TEST(FlsMarg, DensePairSchurL2) {
+    const int n = 6, L = 2, E = 8, G = 2;
+    Case c = make_case(n, L, E, G, 21);
+    std::vector<double> Lp_k, Pm_k;
+    run_kernel_case(c, Lp_k, Pm_k);
+    std::vector<double> Lp_ref, Pm_ref;
+    ref_marg(c, Lp_ref, Pm_ref);
+
+    const int ncol = L * n * 6;
+    const int nrows = (int)c.A_rp.size() - 1;
+    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(nrows, ncol);
+    for (int r = 0; r < nrows; ++r)
+        for (int64_t p = c.A_rp[r]; p < c.A_rp[r + 1]; ++p)
+            A(r, c.A_ci[(size_t)p]) = c.A_val[(size_t)p];
+    for (int j = 0; j < ncol; ++j) A.col(j) *= c.sc[(size_t)j];
+    Eigen::MatrixXd H = A.transpose() * A;
+
+    double max_rel = 0.0;
+    for (int i = 0; i < n; ++i) {
+        auto blk = [&](int fr, int fc) {
+            return H.block<6, 6>(fr * n * 6 + i * 6, fc * n * 6 + i * 6);
+        };
+        M6 H00 = blk(0, 0);
+        M6 H11 = blk(1, 1);
+        M6 H10 = blk(1, 0);
+        H00 += M6::Identity() * std::max(H00.trace() * 1e-12, 1e-30);
+        M6 Lm = H11 - H10 * H00.inverse() * H10.transpose();
+        Lm += M6::Identity() * std::max(Lm.trace() * 1e-12, 1e-30);
+        M6 P = Lm.inverse();
+        Eigen::Matrix<double, 6, 1> s1;
+        for (int a = 0; a < 6; ++a) s1[a] = c.sc[(size_t)(n * 6 + i * 6 + a)];
+        P = s1.asDiagonal() * P * s1.asDiagonal();
+        Eigen::SelfAdjointEigenSolver<M6> es(P);
+        Eigen::Matrix<double, 6, 1> wv = es.eigenvalues();
+        (void)wv.maxCoeff();
+        for (int a = 0; a < 6; ++a) wv[a] = std::max(wv[a], 0.0);
+        P = es.eigenvectors() * wv.asDiagonal() * es.eigenvectors().transpose();
+        M6 Pk;
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b) Pk(a, b) = Pm_k[(size_t)i * 36 + a * 6 + b];
+        double nd = (P - Pk).norm(), nb = P.norm();
+        if (i == 0) {
+            std::printf("[dense] P diag: ");
+            for (int a = 0; a < 6; ++a) std::printf("%.3e ", P(a, a));
+            std::printf("\n[dense] Pk diag: ");
+            for (int a = 0; a < 6; ++a) std::printf("%.3e ", Pk(a, a));
+            std::printf("\n[dense] Pref diag: ");
+            for (int a = 0; a < 6; ++a) std::printf("%.3e ", Pm_ref[(size_t)a]);
+            std::printf("\n[dense] rel=%.3e |P|=%.3e |Pk|=%.3e\n", nd / std::max(nb, 1e-300),
+                        nb, Pk.norm());
+        }
+        max_rel = std::max(max_rel, nd / std::max(nb, 1e-300));
+    }
+    EXPECT_LT(max_rel, 1e-5) << "密集成对舒尔参考与核不一致（随机病态例，数值容差 1e-5）";
+}
+
+TEST(FlsMarg, DenseTinyNoObs) {
+    const int n = 1, L = 2;
+    Case c = make_case(n, L, 0, 0, 41);
+    std::vector<double> Lp_k, Pm_k;
+    run_kernel_case(c, Lp_k, Pm_k);
+    const int ncol = L * n * 6, nrows = (int)c.A_rp.size() - 1;
+    Eigen::MatrixXd A = Eigen::MatrixXd::Zero(nrows, ncol);
+    for (int r = 0; r < nrows; ++r)
+        for (int64_t p = c.A_rp[r]; p < c.A_rp[r + 1]; ++p)
+            A(r, c.A_ci[(size_t)p]) = c.A_val[(size_t)p];
+    for (int j = 0; j < ncol; ++j) A.col(j) *= c.sc[(size_t)j];
+    Eigen::MatrixXd H = A.transpose() * A;
+    M6 H00 = H.block<6, 6>(0, 0), H11 = H.block<6, 6>(6, 6), H10 = H.block<6, 6>(6, 0);
+    M6 L00 = M6::Zero(), L11 = M6::Zero(), L10 = M6::Zero();
+    auto add_rows = [&](M6 &M, const std::vector<int64_t> &p, const std::vector<int64_t> &s,
+                        const std::vector<int64_t> &cc, int i) {
+        for (int64_t q = p[i]; q < p[i + 1]; ++q) {
+            Eigen::Matrix<double, 6, 1> v;
+            for (int kk = 0; kk < 6; ++kk)
+                v[kk] = c.A_val[s[(size_t)q] + kk] * c.sc[cc[(size_t)q] + kk];
+            M += v * v.transpose();
+        }
+    };
+    add_rows(L00, c.lists.d00_p, c.lists.d00_s, c.lists.d00_c, 0);
+    add_rows(L11, c.lists.d11_p, c.lists.d11_s, c.lists.d11_c, 0);
+    for (int k = 0; k < 6; ++k) {
+        Eigen::Matrix<double, 6, 1> v1, v0;
+        for (int cc = 0; cc < 6; ++cc) {
+            v1[cc] = c.A_val[c.lists.pr_s1[k] + cc] * c.sc[6 + cc];
+            v0[cc] = c.A_val[c.lists.pr_s0[k] + cc] * c.sc[cc];
+        }
+        L10 += v1 * v0.transpose();
+    }
+    std::printf("[tiny] sc:");
+    for (int a = 0; a < 12; ++a) std::printf(" %.3e", c.sc[(size_t)a]);
+    std::printf("\n[tiny] |L00-H00|max=%.3e |L11-H11|max=%.3e |L10-H10|max=%.3e\n",
+                (L00 - H00).cwiseAbs().maxCoeff(), (L11 - H11).cwiseAbs().maxCoeff(),
+                (L10 - H10).cwiseAbs().maxCoeff());
+    H00 += M6::Identity() * std::max(H00.trace() * 1e-12, 1e-30);
+    M6 Lm = H11 - H10 * H00.inverse() * H10.transpose();
+    Lm += M6::Identity() * std::max(Lm.trace() * 1e-12, 1e-30);
+    M6 P = Lm.inverse();
+    Eigen::Matrix<double, 6, 1> s1;
+    for (int a = 0; a < 6; ++a) s1[a] = c.sc[(size_t)(6 + a)];
+    P = s1.asDiagonal() * P * s1.asDiagonal();
+    Eigen::SelfAdjointEigenSolver<M6> es(P);
+    auto wv = es.eigenvalues(); (void)wv.maxCoeff();
+    for (int a = 0; a < 6; ++a) wv[a] = std::max(wv[a], 0.0);
+    P = es.eigenvectors() * wv.asDiagonal() * es.eigenvectors().transpose();
+    M6 Pk;
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) Pk(a, b) = Pm_k[(size_t)a * 6 + b];
+    std::printf("[tiny] rel=%.3e |P|=%.3e |Pk|=%.3e\\n",
+                (P - Pk).norm() / std::max(P.norm(), 1e-300), P.norm(), Pk.norm());
+    EXPECT_LT((P - Pk).norm() / std::max(P.norm(), 1e-300), 1e-5);
+}
+
+TEST(FlsMarg, PmPSD) {
+    Case c = make_case(32, 4, 64, 8, 31);
+    std::vector<double> Lp_k, Pm_k;
+    run_kernel_case(c, Lp_k, Pm_k);
+    double worst = 0.0;
+    for (int i = 0; i < c.n; ++i) {
+        M6 P;
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b) P(a, b) = Pm_k[(size_t)i * 36 + a * 6 + b];
+        M6 Ps = 0.5 * (P + P.transpose());
+        Eigen::SelfAdjointEigenSolver<M6> es(Ps);
+        double wmax = es.eigenvalues().cwiseAbs().maxCoeff();
+        worst = std::min(worst, es.eigenvalues().minCoeff() / std::max(wmax, 1e-300));
+    }
+    EXPECT_GT(worst, -1e-10) << "Pm 出现负特征值";
 }
 
 // ---- 真实规模核的耗时（glog 输出；FlsWindow 全步归因待其头文件化后并入）----

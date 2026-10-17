@@ -3143,6 +3143,22 @@ __device__ __forceinline__ void eigh6_sym(const double *A, double *w, double *V)
         for (int j = 0; j < 6; ++j) V[i * 6 + j] = v[i][j];
     }
 }
+__device__ __forceinline__ void psd_clip6(double *P, double *w, double *V) {
+    double wmax = 0.0;
+#pragma unroll
+    for (int a = 0; a < 6; ++a) wmax = fmax(wmax, w[a]);
+    (void)wmax;
+#pragma unroll
+    for (int a = 0; a < 6; ++a) w[a] = fmax(w[a], 0.0);
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += V[a * 6 + k] * w[k] * V[b * 6 + k];
+            P[a * 6 + b] = s;
+        }
+}
 __global__ void flsMargKernel(const double *A_val, const double *sc,
                               const int64_t *d00_p, const int64_t *d00_s, const int64_t *d00_c,
                               const int64_t *d11_p, const int64_t *d11_s, const int64_t *d11_c,
@@ -3159,6 +3175,14 @@ __global__ void flsMargKernel(const double *A_val, const double *sc,
         for (int a = 0; a < 6; ++a)
 #pragma unroll
             for (int b = 0; b < 6; ++b) L00[a * 6 + b] += v[a] * v[b];
+    }
+    {
+        double tr = 0.0;
+#pragma unroll
+        for (int a = 0; a < 6; ++a) tr += L00[a * 6 + a];
+        const double eps = fmax(tr * 1e-12, 1e-30);
+#pragma unroll
+        for (int a = 0; a < 6; ++a) L00[a * 6 + a] += eps;
     }
     for (int64_t p = d11_p[i]; p < d11_p[i + 1]; ++p) {
         double v[6];
@@ -3204,13 +3228,25 @@ __global__ void flsMargKernel(const double *A_val, const double *sc,
     for (int a = 0; a < 6; ++a)
 #pragma unroll
         for (int b = 0; b < 6; ++b) Lm[a * 6 + b] = 0.5 * (Lmv[a * 6 + b] + Lmv[b * 6 + a]);
+    {
+        double tr = 0.0;
+#pragma unroll
+        for (int a = 0; a < 6; ++a) tr += Lm[a * 6 + a];
+        const double eps = fmax(tr * 1e-12, 1e-30);
+#pragma unroll
+        for (int a = 0; a < 6; ++a) Lm[a * 6 + a] += eps;
+    }
     double Pmv[36]; inv6(Lm, Pmv);
     double P[36];                                                  // 列均衡 → 物理空间
 #pragma unroll
     for (int a = 0; a < 6; ++a)
 #pragma unroll
         for (int b = 0; b < 6; ++b) P[a * 6 + b] = Pmv[a * 6 + b] * sc[(int64_t)(n + i) * 6 + a] * sc[(int64_t)(n + i) * 6 + b];
-    double w[6], Vv[36]; eigh6_sym(P, w, Vv);
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b) P[a * 6 + b] = 0.5 * (P[a * 6 + b] + P[b * 6 + a]);
+    double w[6], Vv[36]; eigh6_sym(P, w, Vv); psd_clip6(P, w, Vv);
 #pragma unroll
     for (int a = 0; a < 6; ++a) {
         double wa = w[a] > 1e-3 ? w[a] : 1e-3;
@@ -3428,6 +3464,14 @@ __global__ void flsEkfHandoffKernel(const double *A_val, const double *sc,
         for (int c = 0; c < 6; ++c) v[c] = A_val[s00[q] + c] * sc[c00[q] + c];
         outer6_add(L00, v);
     }
+    {
+        double tr = 0.0;
+#pragma unroll
+        for (int a = 0; a < 6; ++a) tr += L00[a * 6 + a];
+        const double eps = fmax(tr * 1e-12, 1e-30);
+#pragma unroll
+        for (int a = 0; a < 6; ++a) L00[a * 6 + a] += eps;
+    }
     double Ps[36], P[36];
     inv6(L00, Ps);
 #pragma unroll
@@ -3461,7 +3505,7 @@ __global__ void flsEkfHandoffKernel(const double *A_val, const double *sc,
 #pragma unroll
         for (int b = 0; b < 6; ++b) Pn[a * 6 + b] = 0.5 * (Pn[a * 6 + b] + Pn[b * 6 + a]);
     double w[6], Vv[36];
-    eigh6_sym(Pn, w, Vv);
+    eigh6_sym(Pn, w, Vv); psd_clip6(Pn, w, Vv);
 #pragma unroll
     for (int a = 0; a < 6; ++a) {
         double wa = w[a] > 1e-3 ? w[a] : 1e-3;
