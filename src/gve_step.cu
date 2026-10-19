@@ -29,6 +29,10 @@
 #define H0_KM 530.0                    // TBPfull 默认
 #define H1_KM 65.18534                 // TBPfull 默认
 
+// 当日真极在 ICRF 的单位向量 + 真极框架->ICRF 旋转 Q（列 e1,e2,p，行主序）；默认 I。
+__device__ double c_pole[3] = {0.0, 0.0, 1.0};
+__device__ double c_pole_Q[9] = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+
 // Newton 解 Kepler 方程 M->E（同 KepEqtnET<double>：初值 M±e，60 次，1e-13）。
 __device__ __forceinline__ double kepE_dev(double M, double e){
     double E = ((M > -PI && M < 0.0) || M > PI) ? M - e : M + e;
@@ -132,28 +136,42 @@ __device__ __forceinline__ void fieldAccelKmDev(const double *r_km, double *a3){
     // else if(c_field_kind == FIELD_KIND_SH) shAccelKmDev(r_km, a3);       // 预留
 }
 
-// 二体 + J2/J3/J4 + 阻力（km, km/s，km/s^2）。三体默认关，未计入（同 dastate 默认）。
+// 二体 + J2/J3/J4 + 阻力（km, km/s，km/s^2）。zonal 绕当日真极 c_pole。
 __device__ __forceinline__ void tbp_dev(const double* xk, double beta, double* res){
     const double pos0 = xk[0], pos1 = xk[1], pos2 = xk[2];
+    const double Q0=c_pole_Q[0], Q1=c_pole_Q[1], Q2=c_pole_Q[2];
+    const double Q3=c_pole_Q[3], Q4=c_pole_Q[4], Q5=c_pole_Q[5];
+    const double Q6=c_pole_Q[6], Q7=c_pole_Q[7], Q8=c_pole_Q[8];
+    const double px = Q0*pos0 + Q3*pos1 + Q6*pos2;
+    const double py = Q1*pos0 + Q4*pos1 + Q7*pos2;
+    const double pz = Q2*pos0 + Q5*pos1 + Q8*pos2;
     const double r = sqrt(pos0*pos0 + pos1*pos1 + pos2*pos2);
-    const double z_r = pos2 / r, z2 = z_r*z_r, z3 = z2*z_r, z4 = z3*z_r;
+    const double z_r = pz / r, z2 = z_r*z_r, z3 = z2*z_r, z4 = z3*z_r;
     const double Re_r = RE_KM / r, Re2 = Re_r*Re_r, Re3 = Re2*Re_r, Re4 = Re3*Re_r;
     const double cf = -MU_KM / (r*r*r);
 
     double j2 = (3.0/2.0)*J2C*Re2*(1.0 - 5.0*z2);
     double j3 = (5.0/2.0)*J3C*Re3*(3.0*z_r - 7.0*z3);
     double j4 = (5.0/8.0)*J4C*Re4*(3.0 - 42.0*z2 + 63.0*z4);
-    res[3] = cf*pos0*(1.0 + j2 + j3 - j4);
-    res[4] = cf*pos1*(1.0 + j2 + j3 - j4);
+    const double gx = cf*px*(1.0 + j2 + j3 - j4);
+    const double gy = cf*py*(1.0 + j2 + j3 - j4);
 
     j2 = (3.0/2.0)*J2C*Re2*(3.0 - 5.0*z2);
-    j3 = (5.0/2.0)*J3C*Re3*(6.0*z_r - 7.0*z3 - (3.0/5.0)*r/pos2);
+    j3 = (5.0/2.0)*J3C*Re3*(6.0*z_r - 7.0*z3 - (3.0/5.0)*r/pz);
     j4 = (5.0/8.0)*J4C*Re4*(15.0 - 70.0*z2 + 63.0*z4);
-    res[5] = cf*pos2*(1.0 + j2 + j3 - j4);
+    const double gz = cf*pz*(1.0 + j2 + j3 - j4);
+    res[3] = Q0*gx + Q1*gy + Q2*gz;
+    res[4] = Q3*gx + Q4*gy + Q5*gz;
+    res[5] = Q6*gx + Q7*gy + Q8*gz;
 
     res[0] = xk[3]; res[1] = xk[4]; res[2] = xk[5];
 
-    const double rvx = xk[3] + OMEGA_EARTH*xk[1], rvy = xk[4] - OMEGA_EARTH*xk[0], rvz = xk[5];
+    const double wx = OMEGA_EARTH*c_pole[0];
+    const double wy = OMEGA_EARTH*c_pole[1];
+    const double wz = OMEGA_EARTH*c_pole[2];
+    const double rvx = xk[3] - (wy*xk[2] - wz*xk[1]);
+    const double rvy = xk[4] - (wz*xk[0] - wx*xk[2]);
+    const double rvz = xk[5] - (wx*xk[1] - wy*xk[0]);
     const double v = sqrt(rvx*rvx + rvy*rvy + rvz*rvz);
     const double rho = exp(-(r - RE_KM - H0_KM) / H1_KM);
     const double dc = -0.5*RHO_CDA_M*beta*rho*v;
@@ -1066,8 +1084,38 @@ namespace kep3 {
 // 全流程细粒度计时（秒）：pack=host 装/解包、h2d=输入拷贝、kernel=CUDA 计算、d2h=输出拷贝、
 // stm=两体 STM 折叠 kernel。
 double g_gve_pack = 0.0, g_gve_h2d = 0.0, g_gve_kernel = 0.0, g_gve_d2h = 0.0, g_gve_stm = 0.0;
+// 共享 host 极轴（qoe/qoejopt/qoefls 都链同一个 libqoe_core.so）
+double g_pole[3] = {0.0, 0.0, 1.0};
+double g_pole_Q[9] = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
 void gveResetTiming(){ g_gve_pack = g_gve_h2d = g_gve_kernel = g_gve_d2h = g_gve_stm = 0.0; }
 std::vector<double> gveGetTiming(){ return { g_gve_pack, g_gve_h2d, g_gve_kernel, g_gve_d2h, g_gve_stm }; }
+
+// 设置当日真极（ICRF 单位向量）：zonal J234 与地球自转按此极轴。
+void setPole(double x, double y, double z){
+    double p[3] = {x, y, z};
+    double n = std::sqrt(x*x + y*y + z*z);
+    double Q[9] = {1,0,0, 0,1,0, 0,0,1};
+    if(n < 1e-12 || (std::fabs(x) < 1e-15 && std::fabs(y) < 1e-15 && z > 0.0)){
+        p[0] = 0.0; p[1] = 0.0; p[2] = 1.0;
+    } else {
+        x /= n; y /= n; z /= n;
+        p[0] = x; p[1] = y; p[2] = z;
+        double ax = 0.0, ay = 0.0, az = 1.0;
+        if(std::fabs(z) > 0.9){ ax = 1.0; ay = 0.0; az = 0.0; }
+        double e1[3] = {ay*z - az*y, az*x - ax*z, ax*y - ay*x};
+        double en = std::sqrt(e1[0]*e1[0] + e1[1]*e1[1] + e1[2]*e1[2]);
+        if(en < 1e-12){ e1[0] = 1.0; e1[1] = 0.0; e1[2] = 0.0; en = 1.0; }
+        for(int i=0;i<3;i++) e1[i] /= en;
+        double e2[3] = {y*e1[2] - z*e1[1], z*e1[0] - x*e1[2], x*e1[1] - y*e1[0]};
+        Q[0] = e1[0]; Q[1] = e2[0]; Q[2] = x;
+        Q[3] = e1[1]; Q[4] = e2[1]; Q[5] = y;
+        Q[6] = e1[2]; Q[7] = e2[2]; Q[8] = z;
+    }
+    for(int i=0;i<3;i++) g_pole[i] = p[i];
+    for(int i=0;i<9;i++) g_pole_Q[i] = Q[i];
+    cudaMemcpyToSymbol(c_pole, p, 3*sizeof(double));
+    cudaMemcpyToSymbol(c_pole_Q, Q, 9*sizeof(double));
+}
 
 // 设定 CUDA RBF 力场（整星共享）：中心（km）/宽度 s（km）/权重 θ。centers 空 → 关闭。
 // 中心/宽度/个数写 constant（一次），权重写 device 全局（每外环迭代调用一次即可）。

@@ -136,6 +136,12 @@ void cartStepBatch(const std::vector<Vector6d> &x0s, double dt, int nthreads, do
 void cartPropagateBatch(const std::vector<Vector6d> &x0s, int nfr, double dt, int nthreads,
                         double beta, std::vector<double> &x_all);
 
+// 当日真极在 ICRF 的单位向量：设置后 CUDA 的 tbp_dev 把 zonal J234 与地球自转按此极轴。
+// g_pole/g_pole_Q 定义在共享 qoe_core，CPU TBPfull 与所有模块共用同一份。
+extern double g_pole[3];
+extern double g_pole_Q[9];
+void setPole(double x, double y, double z);
+
 template <class F, class T>
 T newton_raphson_iterate(F f, T guess, T min, T max, int digits, uint& max_iter);
 // template double newton_raphson_iterate(Cf1f2 (*f)(double), 

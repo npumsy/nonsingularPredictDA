@@ -151,6 +151,7 @@ void setSHParams(int lmax);
 // 三体（日/月）确定性摄动开关 + 传播起点绝对历元（MJD）。开启后 forceAccel/TBPfull 内叠加日月第三体。
 void setThirdBody(bool on);
 void setPropEpoch(double mjd0);
+void setPole(double x, double y, double z);
 
 // 多历元一阶可微算子：一次积分到各 tf，取状态与一阶 Jacobian [∂x/∂x0 (6) | ∂x/∂θ (m)]。
 // 只需 order=1（对 m 线性，无二项式爆炸），供 PyTorch 训练一次前向、backward 仅做矩阵乘。

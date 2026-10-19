@@ -65,10 +65,10 @@ set(SRC_LIST src/elements.cpp src/integrater.cpp src/kepler.cpp src/dastate.cpp 
 
 # 共享 CUDA 核（gve_step.cu：GVE/STM/RBF/θ 敏度）**只编译一次**，qoe 与 qoejopt 共同链接
 # （此前 qoe 与 qoejopt 各编一份 gve_step.cu，构建时间翻倍且异常慢）。
-add_library(qoe_core STATIC src/gve_step.cu)
+add_library(qoe_core SHARED src/gve_step.cu)
 target_include_directories(qoe_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(qoe_core PUBLIC CUDA::cudart CUDA::cusolver CUDA::cublas)
-set_target_properties(qoe_core PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_PROPAGATE_HOST_FLAGS ON)
+set_target_properties(qoe_core PROPERTIES POSITION_INDEPENDENT_CODE ON CUDA_PROPAGATE_HOST_FLAGS ON BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
 
 # Set Include h file path
 list(APPEND PYLIB_INCLUDE_DIRS ${PROJECT_SOURCE_DIR}/include)
@@ -87,13 +87,14 @@ set(LIBRARY_OUTPUT_PATH ${PROJECT_SOURCE_DIR}/build)
 pybind11_add_module(${PROJECT_NAME} ${SRC_LIST})
 # 链接 qoe_core（共享 CUDA 核）、dace 库、OpenMP 与 CUDA runtime 到 qoe 模块
 target_link_libraries(${PROJECT_NAME} PRIVATE qoe_core dace::dace OpenMP::OpenMP_CXX CUDA::cudart)
-set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
+set_target_properties(${PROJECT_NAME} PROPERTIES BUILD_RPATH "$ORIGIN;${DACE_LIBDIR}")
 
 # qoejopt：joint 内环 C++/CUDA（device 常驻装配）。独立模块，仅依赖 gve_step.cu 的核 + pybind11
 # （不引 dace/torch：rv0/A0 由 Python 用 qoe 的扁平入口算好传入；Baspacho 仍在 Python/Theseus 侧）。
 pybind11_add_module(qoejopt src/qoejopt.cpp)
 target_link_libraries(qoejopt PRIVATE qoe_core OpenMP::OpenMP_CXX CUDA::cudart CUDA::cusolver CUDA::cublas)
 target_include_directories(qoejopt PRIVATE ${PROJECT_SOURCE_DIR}/include)
+set_target_properties(qoejopt PROPERTIES BUILD_RPATH "$ORIGIN")
 
 # qoefls：FLS 固定滞后平滑 C++ 核心（factor/滑窗/边缘化全在 C++）。
 # 链 qoe_core（GVE 核）+ torch + BaSpaCho（theseus/baspacho 构建产物）。
@@ -112,7 +113,7 @@ target_link_libraries(qoefls PRIVATE qoe_core dace::dace torch
   "${BS_ROOT}/build/_deps/dispenso-build/dispenso/libdispenso.a"
   "-l:libopenblas.so.0"
   OpenMP::OpenMP_CXX CUDA::cudart CUDA::cusolver CUDA::cublas)
-set_target_properties(qoefls PROPERTIES BUILD_RPATH "${BS_ROOT}/build/baspacho/baspacho;${BS_ROOT}/build/_deps/dispenso-build/dispenso;/home/msy/miniconda3/envs/rover_slam/lib;${DACE_LIBDIR}")
+set_target_properties(qoefls PROPERTIES BUILD_RPATH "$ORIGIN;${BS_ROOT}/build/baspacho/baspacho;${BS_ROOT}/build/_deps/dispenso-build/dispenso;/home/msy/miniconda3/envs/rover_slam/lib;${DACE_LIBDIR}")
 target_include_directories(qoefls PRIVATE ${PROJECT_SOURCE_DIR}/include ${TH_ROOT} ${BS_ROOT}
   "${BS_ROOT}/build/_deps/dispenso-src")
 target_compile_definitions(qoefls PRIVATE THESEUS_HAVE_CUDA)

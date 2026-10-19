@@ -1243,6 +1243,9 @@ PYBIND11_MODULE(qoejopt, m) {
     m.def("gve_rbf_sens", &gve_rbf_sens, py::arg("oe"), py::arg("nfr"), py::arg("dt"),
           py::arg("beta") = 1.0, py::arg("m") = 40,
           "整弧 RBF θ 前向敏度：oe(n,6) → (oe_all(nfr,n,6), S_all(nfr,n,6,m))（centers/s 需先 set_rbf_cuda）");
+    m.def("set_pole", [](double x, double y, double z){ kep3::setPole(x, y, z); },
+          py::arg("x"), py::arg("y"), py::arg("z"),
+          "设置当日真极（ICRF 单位向量），与本模块 CUDA tbp 核共享");
     m.def("set_rbf_cuda", [](py::array_t<double, py::array::c_style | py::array::forcecast> centers, double s,
                              py::array_t<double, py::array::c_style | py::array::forcecast> w) {
         auto bc = centers.request();

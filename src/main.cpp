@@ -52,6 +52,10 @@ PYBIND11_MODULE(qoe, m)
            "三体（日/月）确定性摄动开关");
      m.def("setPropEpoch", [](double mjd0){ setPropEpoch(mjd0); }, py::arg("mjd0"),
            "传播起点绝对历元（MJD）");
+     m.def("setPole", [](double x, double y, double z){
+           setPole(x, y, z); kep3::setPole(x, y, z);
+       }, py::arg("x"), py::arg("y"), py::arg("z"),
+          "当日真极在 ICRF 的单位向量；zonal J234 与地球自转按此极轴");
 
      m.def("GM_Earth", []()
            { return osculating::MU; });

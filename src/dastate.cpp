@@ -22,6 +22,7 @@ FieldSpec g_field;
 // --- 三体（日/月）确定性摄动：解析低精度星历（ECI，km） + 传播起点绝对历元（MJD） ---
 bool g_use3b = false;
 double g_mjd0 = 0.0;                              // 传播 t=0 处的 MJD（绝对历元）
+// 极轴 g_pole/g_pole_Q 定义在共享 libqoe_core（gve_step.cu），此处只 include kepler.h 使用。
 const double D2R_ = 3.14159265358979323846 / 180.0;
 void sunPosECI_km(double mjd, double out[3]){
     const double n = mjd - 2451545.0;
@@ -47,9 +48,14 @@ void moonPosECI_km(double mjd, double out[3]){
 }
 // 名义阻力加速度（β=κ=1，km/s²，位置 x 为 km）。即 ∂f/∂κ（阻力对 κ 线性）。与 TBPfull 内阻力项同式。
 void dragAccelKm(const double x_km[6], double out[3]){
-    const double omega = bddd::OMEGA_EARTH;
-    const double rx = x_km[0], ry = x_km[1]; const double vx = x_km[3], vy = x_km[4], vz = x_km[5];
-    const double rvx = vx + omega * ry, rvy = vy - omega * rx, rvz = vz;
+    const double wx = bddd::OMEGA_EARTH * kep3::g_pole[0];
+    const double wy = bddd::OMEGA_EARTH * kep3::g_pole[1];
+    const double wz = bddd::OMEGA_EARTH * kep3::g_pole[2];
+    const double rx = x_km[0], ry = x_km[1], rz = x_km[2];
+    const double vx = x_km[3], vy = x_km[4], vz = x_km[5];
+    const double rvx = vx - (wy*rz - wz*ry);
+    const double rvy = vy - (wz*rx - wx*rz);
+    const double rvz = vz - (wx*ry - wy*rx);
     const double v = std::sqrt(rvx*rvx + rvy*rvy + rvz*rvz);
     const double r = std::sqrt(rx*rx + ry*ry + x_km[2]*x_km[2]);
     const double Re = bddd::RE / 1e3, h0 = 530.0, H0 = 65.18534, rhoCdA_m = 1.42812824E-12;
@@ -60,6 +66,7 @@ void dragAccelKm(const double x_km[6], double out[3]){
 } // namespace
 void setThirdBody(bool on){ g_use3b = on; }
 void setPropEpoch(double mjd0){ g_mjd0 = mjd0; }
+void setPole(double x, double y, double z){ kep3::setPole(x, y, z); }
 void setRBFParams(const std::vector<std::array<double,3>> &centers, double s){
     g_field.kind = FIELD_RBF;
     g_field.centers = centers;
@@ -545,8 +552,13 @@ AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,T beta, double mu, dou
     pos[0] = x[0]; pos[1] = x[1]; pos[2] = x[2];
     // vel[0]=x[3];vel[1]=x[4];vel[2]=x[5];
     
+    // zonal 项绕当日真极：把位置旋到真极框架算 J234，再旋回 ICRF（Q 默认 I）。
+    const double *Q = kep3::g_pole_Q;
+    T px = Q[0]*pos[0] + Q[3]*pos[1] + Q[6]*pos[2];
+    T py = Q[1]*pos[0] + Q[4]*pos[1] + Q[7]*pos[2];
+    T pz = Q[2]*pos[0] + Q[5]*pos[1] + Q[8]*pos[2];
     T r = pos.vnorm();
-    T z_r =pos[2] / r;
+    T z_r = pz / r;
     T z2_r2 = z_r*z_r;
     T z3_r3 = z2_r2 * z_r;
     T z4_r4 = z3_r3 * z_r;
@@ -561,21 +573,29 @@ AlgebraicVector<T> TBPfull(AlgebraicVector<T> x, double t,T beta, double mu, dou
     T J3_term = (5.0 / 2.0) * bddd::J3 * Re3_r3 * (3.0 * z_r - 7.0 * z3_r3);
     T J4_term = (5.0 / 8.0) * bddd::J4 * Re4_r4 * (3.0 - 42.0 * z2_r2 + 63.0 * z4_r4);
 
-    res[3] = common_factor * pos[0] * (1.0 + J2_term + J3_term - J4_term);
-    res[4] = common_factor * pos[1] * (1.0 + J2_term + J3_term - J4_term);
-
+    T gx = common_factor * px * (1.0 + J2_term + J3_term - J4_term);
+    T gy = common_factor * py * (1.0 + J2_term + J3_term - J4_term);
 
     J2_term = (3.0 / 2.0) * bddd::J2 * Re2_r2 * (3.0 - 5.0 * z2_r2);
-    J3_term = (5.0 / 2.0) * bddd::J3 * Re3_r3 * (6.0 * z_r- 7.0 * z3_r3 - (3.0 / 5.0) * r / pos[2]);
+    J3_term = (5.0 / 2.0) * bddd::J3 * Re3_r3 * (6.0 * z_r- 7.0 * z3_r3 - (3.0 / 5.0) * r / pz);
     J4_term = (5.0 / 8.0) * bddd::J4 * Re4_r4 * (15.0 - 70.0 * z2_r2 + 63.0 * z4_r4);
 
-    res[5] = common_factor * pos[2] * (1.0 + J2_term + J3_term - J4_term);
+    T gz = common_factor * pz * (1.0 + J2_term + J3_term - J4_term);
+    res[3] = Q[0]*gx + Q[1]*gy + Q[2]*gz;
+    res[4] = Q[3]*gx + Q[4]*gy + Q[5]*gz;
+    res[5] = Q[6]*gx + Q[7]*gy + Q[8]*gz;
  if(printEachStepPertub_da)cout<<"DA---J234: (m/s^2)="<<cons(res[3]-common_factor * pos[0] )*1e3<<",\t"<<cons(res[4]-common_factor * pos[1] )*1e3<<",\t"<<cons(res[5]-common_factor * pos[2] )*1e3<<endl;
     // cout<<"DA---a_x, a_y, a_z(m/s^2)="<<cons(res[3]-common_factor * pos[0] )*1e3<<",\t"<<cons(res[4]-common_factor * pos[1] )*1e3<<",\t"<<cons(res[5]-common_factor * pos[2] )*1e3<<endl;
 
     // Calculate drag acceleration
     // T v = vel.vnorm(); // velocity magnitude
-    AlgebraicVector<T> rel_vel = {x[3] +bddd::OMEGA_EARTH * x[1], x[4] -bddd::OMEGA_EARTH * x[0], x[5]}; // Earth rotation correction
+    const double wx = bddd::OMEGA_EARTH * kep3::g_pole[0];
+    const double wy = bddd::OMEGA_EARTH * kep3::g_pole[1];
+    const double wz = bddd::OMEGA_EARTH * kep3::g_pole[2];
+    AlgebraicVector<T> rel_vel = {
+        x[3] - (wy*x[2] - wz*x[1]),
+        x[4] - (wz*x[0] - wx*x[2]),
+        x[5] - (wx*x[1] - wy*x[0])}; // v - omega x r
     T v = rel_vel.vnorm();
     T rho_expo = exp(-(r-Re - h0) / H0);          // 密度指数只算一次（原先每分量各算一次）
     T drag_coef = -0.5 * rhoCdA_m * beta * rho_expo * v;

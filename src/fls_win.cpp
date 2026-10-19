@@ -974,6 +974,9 @@ static py::tuple fls_geom_probe(py::array_t<double, py::array::c_style | py::arr
 
 PYBIND11_MODULE(qoefls, m) {
     m.doc() = "FLS 固定滞后平滑 C++ 核心（factor/滑窗/Schur 边缘化）";
+    m.def("set_pole", [](double x, double y, double z){ setPole(x, y, z); kep3::setPole(x, y, z); },
+          py::arg("x"), py::arg("y"), py::arg("z"),
+          "设置当日真极（ICRF 单位向量），覆盖本模块 CPU/CUDA 的 zonal 力模型");
     m.def("fls_probe", &fls_probe, py::arg("n"), "torch+BaSpaCho 链接探针");
     m.def("fls_baspacho_probe", &fls_baspacho_probe,
           "BaSpaCho C++ 全链探针（add_MtM/factor/solve/compute_diag_blocks vs 稠密）");
