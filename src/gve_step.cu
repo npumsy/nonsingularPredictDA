@@ -2230,15 +2230,17 @@ void gveStmDevice(const double *d_oe, int n, double dt, double beta, double *d_o
 // 仅 1152 线程（5 个 block）占不满 GPU。此处把 36 个变分分量按"列"分给 6 个 lane（各存 6 个
 // 分量 + 4 个 K 列），状态 RK4 与解析 Jacobian（Dual6 AD）每 lane 冗余；线程数 ×6。
 __global__ void gveStmKernelGrp(const double *oe0, int n, double dt, double beta,
+                                const double *betas,
                                 double *oef, double *Phi_all) {
     const int lane = threadIdx.x % 6;
     const int idx = (blockIdx.x * blockDim.x + threadIdx.x) / 6;
     if (idx >= n) return;
+    const double b = (betas != nullptr) ? betas[idx] : beta;
     double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6], A[6][6];
     const double el = (double)lane;
 #pragma unroll
     for (int c = 0; c < 6; ++c) y[c] = oe0[6 * idx + c];
-    gveRhsJacVal_dev(y, beta, A, k1);
+    gveRhsJacVal_dev(y, b, A, k1);
     double C[6], Kc1[6], Kc2[6], Kc3[6], Kc4[6];
 #pragma unroll
     for (int a = 0; a < 6; ++a) C[a] = (a == lane) ? 1.0 : 0.0;
@@ -2254,19 +2256,19 @@ __global__ void gveStmKernelGrp(const double *oe0, int n, double dt, double beta
     matcol(Kc1);
 #pragma unroll
     for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * k1[c] / 3.0;
-    gveRhsJacVal_dev(tmp, beta, A, k2);
+    gveRhsJacVal_dev(tmp, b, A, k2);
 #pragma unroll
     for (int c = 0; c < 6; ++c) C[c] = ((c == lane) ? 1.0 : 0.0) + dt * Kc1[c] / 3.0;
     matcol(Kc2);
 #pragma unroll
     for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
-    gveRhsJacVal_dev(tmp, beta, A, k3);
+    gveRhsJacVal_dev(tmp, b, A, k3);
 #pragma unroll
     for (int c = 0; c < 6; ++c) C[c] = ((c == lane) ? 1.0 : 0.0) + dt * (-Kc1[c] / 3.0 + Kc2[c]);
     matcol(Kc3);
 #pragma unroll
     for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
-    gveRhsJacVal_dev(tmp, beta, A, k4);
+    gveRhsJacVal_dev(tmp, b, A, k4);
 #pragma unroll
     for (int c = 0; c < 6; ++c) C[c] = ((c == lane) ? 1.0 : 0.0) + dt * (Kc1[c] - Kc2[c] + Kc3[c]);
     matcol(Kc4);
@@ -2287,9 +2289,19 @@ void gveStmDeviceGrp(const double *d_oe, int n, double dt, double beta, double *
     const int threads = 192;   // 32 星/块
     const int total = n * 6;
     const int blocks = (total + threads - 1) / threads;
-    gveStmKernelGrp<<<blocks, threads>>>(d_oe, n, dt, beta, d_oef, d_Phi);
+    gveStmKernelGrp<<<blocks, threads>>>(d_oe, n, dt, beta, nullptr, d_oef, d_Phi);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) fprintf(stderr, "[gveStmDeviceGrp] %s\n", cudaGetErrorString(err));
+}
+
+void gveStmDeviceGrpBeta(const double *d_oe, int n, double dt, const double *d_beta,
+                         double *d_oef, double *d_Phi) {
+    const int threads = 192;
+    const int total = n * 6;
+    const int blocks = (total + threads - 1) / threads;
+    gveStmKernelGrp<<<blocks, threads>>>(d_oe, n, dt, 1.0, d_beta, d_oef, d_Phi);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[gveStmDeviceGrpBeta] %s\n", cudaGetErrorString(err));
 }
 
 // ---- 一阶同源 STM：Φ ≈ I + A·Δt（A=∂f/∂oe 在段首解析求一次，与 RK4 残差同源 RHS）----
@@ -2967,7 +2979,12 @@ double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const d
     const int threads = 256;
     const int nk = (c.L - 1) * c.n;
     double td = _now();
-    if (nk > 0) gveStmDeviceGrp(c.d_X, nk, c.dt, 1.0, c.d_end, c.d_phi);   // 单步 φ + Φ（同一 3/8-RK4）
+    if (nk > 0) {
+        if (c.d_beta != nullptr)
+            gveStmDeviceGrpBeta(c.d_X, nk, c.dt, c.d_beta, c.d_end, c.d_phi);
+        else
+            gveStmDeviceGrp(c.d_X, nk, c.dt, 1.0, c.d_end, c.d_phi);   // 单步 φ + Φ（同一 3/8-RK4）
+    }
     wt_dyn += _now() - td;
 
     double ta = _now();
@@ -3045,6 +3062,89 @@ __global__ void winPriorAsmKernel(const double *d_X, const double *pri_fac, cons
         for (int cc = 0; cc < 6; ++cc) av[cc] = pri_fac[(size_t)i * 36 + a * 6 + cc];
     }
 }
+// ---- 全帧 consensus + 锚帧 FLS 先验：每状态 6 行，行布局与 _lift_struct prior 组一致 ----
+__device__ __forceinline__ void chol6_dev(const double A[6][6], double L[6][6]) {
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j) L[i][j] = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        for (int j = 0; j <= i; ++j) {
+            double s = A[i][j];
+            for (int k = 0; k < j; ++k) s -= L[i][k] * L[j][k];
+            if (i == j) L[i][j] = sqrt(fmax(s, 1e-30));
+            else L[i][j] = s / L[j][j];
+        }
+    }
+}
+__device__ __forceinline__ void solve6_dev(const double A[6][6], const double b[6], double x[6]) {
+    double L[6][6]; chol6_dev(A, L);
+    double y[6];
+    for (int i = 0; i < 6; ++i) {
+        double s = b[i];
+        for (int k = 0; k < i; ++k) s -= L[i][k] * y[k];
+        y[i] = s / L[i][i];
+    }
+    for (int i = 5; i >= 0; --i) {
+        double s = y[i];
+        for (int k = i + 1; k < 6; ++k) s -= L[k][i] * x[k];
+        x[i] = s / L[i][i];
+    }
+}
+__global__ void winConsensusAsmKernel(const double *d_X, const double *d_zcons, const double *d_u,
+                                      const double *d_Lp, const double *d_zp, int n, int L,
+                                      int prior_mode, int prior_node, double rho, int off_prior, int base_b,
+                                      double *A_val, double *b) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= L * n) return;
+    const int f = idx / n, i = idx - f * n;
+    double center[6], Lt[6][6], A[6][6];
+    for (int c = 0; c < 6; ++c) center[c] = d_zcons[idx * 6 + c] - d_u[idx * 6 + c];
+    for (int a = 0; a < 6; ++a)
+        for (int c = 0; c < 6; ++c) Lt[a][c] = (a == c) ? sqrt(rho) : 0.0;
+    if (prior_mode && f == prior_node) {
+        const double *Lp = d_Lp + (size_t)i * 36;
+        const double *zp = d_zp + (size_t)i * 6;
+        for (int a = 0; a < 6; ++a)
+            for (int c = 0; c < 6; ++c) {
+                double s = (a == c) ? rho : 0.0;
+                for (int k = 0; k < 6; ++k) s += Lp[k * 6 + a] * Lp[k * 6 + c];
+                A[a][c] = s;
+            }
+        double rhs[6];
+        for (int a = 0; a < 6; ++a) {
+            double s = rho * center[a];
+            for (int c = 0; c < 6; ++c) {
+                double pinv = 0.0;
+                for (int k = 0; k < 6; ++k) pinv += Lp[k * 6 + a] * Lp[k * 6 + c];
+                s += pinv * zp[c];
+            }
+            rhs[a] = s;
+        }
+        solve6_dev(A, rhs, center);
+        chol6_dev(A, Lt);
+    }
+    const double *x = d_X + (size_t)idx * 6;
+    for (int a = 0; a < 6; ++a) {
+        const int row = f * n * 6 + i * 6 + a;
+        double bb = 0.0;
+        for (int c = 0; c < 6; ++c) {
+            A_val[(size_t)off_prior + (size_t)row * 6 + c] = Lt[a][c];
+            bb += Lt[a][c] * (center[c] - x[c]);
+        }
+        b[base_b + row] = bb;
+    }
+}
+void winConsensusAsmDevice(const WinCtx &c, const double *d_zcons, const double *d_u,
+                           const double *d_Lp, const double *d_zp, int prior_mode,
+                           double rho, double *A_val, double *b) {
+    const int tot = c.L * c.n, threads = 256, blocks = (tot + threads - 1) / threads;
+    const int nISL = c.L * c.E, nGTS = c.L * c.G, nDYN = (c.L - 1) * c.n * 6;
+    const int base_b = nISL + nGTS + nDYN;
+    winConsensusAsmKernel<<<blocks, threads>>>(c.d_X, d_zcons, d_u, d_Lp, d_zp, c.n, c.L,
+                                               prior_mode, 0, rho, c.off_damp, base_b, A_val, b);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[winConsensusAsmDevice] %s\n", cudaGetErrorString(err));
+}
+
 void winPriorAsmDevice(const double *d_X, const double *d_pri_fac, const double *d_zp, int n,
                        int pnode, int off_pri, int base_b, double *A_val, double *b) {
     const int threads = 256, blocks = (n + threads - 1) / threads;
@@ -3955,6 +4055,251 @@ void blkResetTiming() {
 }
 std::vector<double> blkGetTiming() {
     return {bt_copy, bt_pack, bt_cbwd, bt_fbwd, bt_cfwd, bt_ffwd, bt_memset, bt_asm};
+}
+
+// ===================== 144 块同图案批量窗口装配（B 个独立块） =====================
+// 布局：X/rv/Ap 为 (B,L,n,·)，A/b 为 (B,nnz)/(B,nrows)，ISL/GTS 观测为 (B,L,·)，
+// beta 为 (B,(L-1)*n)，qingt 为 (B,n,36)。所有核按 blockIdx 映射块号，一次覆盖 B 块。
+__global__ void bStmKernel(const double *d_X, int B, int n, int L, double dt,
+                           const double *d_beta, double *d_end, double *d_phi) {
+    const int lane = threadIdx.x % 6;
+    const int idx = (blockIdx.x * blockDim.x + threadIdx.x) / 6;
+    const int nk = (L - 1) * n;
+    if (idx >= B * nk) return;
+    const int b = idx / nk, loc = idx - b * nk;
+    const double *oe0 = d_X + (size_t)b * L * n * 6 + (size_t)loc * 6;
+    const double bta = (d_beta != nullptr) ? d_beta[(size_t)b * nk + loc] : 1.0;
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6], A[6][6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[c];
+    gveRhsJacVal_dev(y, bta, A, k1);
+    double C[6], Kc1[6], Kc2[6], Kc3[6], Kc4[6];
+#pragma unroll
+    for (int a = 0; a < 6; ++a) C[a] = (a == lane) ? 1.0 : 0.0;
+    auto matcol = [&](double Kc[6]) {
+#pragma unroll
+        for (int a = 0; a < 6; ++a) {
+            double s = 0.0;
+#pragma unroll
+            for (int c = 0; c < 6; ++c) s += A[a][c] * C[c];
+            Kc[a] = s;
+        }
+    };
+    matcol(Kc1);
+#pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * k1[c] / 3.0;
+    gveRhsJacVal_dev(tmp, bta, A, k2);
+#pragma unroll
+    for (int c = 0; c < 6; ++c) C[c] = ((c == lane) ? 1.0 : 0.0) + dt * Kc1[c] / 3.0;
+    matcol(Kc2);
+#pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
+    gveRhsJacVal_dev(tmp, bta, A, k3);
+#pragma unroll
+    for (int c = 0; c < 6; ++c) C[c] = ((c == lane) ? 1.0 : 0.0) + dt * (-Kc1[c] / 3.0 + Kc2[c]);
+    matcol(Kc3);
+#pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
+    gveRhsJacVal_dev(tmp, bta, A, k4);
+#pragma unroll
+    for (int c = 0; c < 6; ++c) C[c] = ((c == lane) ? 1.0 : 0.0) + dt * (Kc1[c] - Kc2[c] + Kc3[c]);
+    matcol(Kc4);
+    if (lane == 0) {
+        double *of = d_end + (size_t)idx * 6;
+#pragma unroll
+        for (int c = 0; c < 6; ++c)
+            of[c] = y[c] + dt * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    }
+    double *Pa = d_phi + (size_t)idx * 36 + lane;
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+        Pa[a * 6] = ((a == lane) ? 1.0 : 0.0) +
+                    dt * (Kc1[a] + 3.0 * Kc2[a] + 3.0 * Kc3[a] + Kc4[a]) / 8.0;
+}
+
+__global__ void bIslAsmKernel(const double *d_rv, const double *d_Ap,
+                              const int *isl_i, const int *isl_jj,
+                              const double *isl_D, const double *isl_W,
+                              int B, int L, int n, int E, double s_isl, int off_isl,
+                              int nnz, int nrows, double *A_out, double *b_out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per = L * E;
+    if (idx >= B * per) return;
+    const int b = idx / per, loc = idx - b * per;
+    const int f = loc / E, e = loc - f * E;
+    const int i = isl_i[e], j = isl_jj[e];
+    const double *P = d_rv + (size_t)b * L * n * 6;
+    const double *Ap = d_Ap + (size_t)b * L * n * 18;
+    const double *pi = P + ((size_t)f * n + i) * 6;
+    const double *pj = P + ((size_t)f * n + j) * 6;
+    const double d0 = pi[0] - pj[0], d1 = pi[1] - pj[1], d2 = pi[2] - pj[2];
+    const double rr = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double ir = (rr > 1e-12) ? 1.0 / rr : 0.0;
+    const double u0 = d0 * ir, u1 = d1 * ir, u2 = d2 * ir;
+    const double *Ai = Ap + ((size_t)f * n + i) * 18;
+    const double *Aj = Ap + ((size_t)f * n + j) * 18;
+    const double wit = isl_W[(size_t)b * per + loc] * s_isl;
+    double *av = A_out + (size_t)b * nnz + off_isl + (size_t)loc * 12;
+#pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        av[k]     =  wit * (u0 * Ai[0 * 6 + k] + u1 * Ai[1 * 6 + k] + u2 * Ai[2 * 6 + k]);
+        av[6 + k] = -wit * (u0 * Aj[0 * 6 + k] + u1 * Aj[1 * 6 + k] + u2 * Aj[2 * 6 + k]);
+    }
+    b_out[(size_t)b * nrows + loc] = -(rr - isl_D[(size_t)b * per + loc]) * wit;
+}
+
+__global__ void bGtsAsmKernel(const double *d_rv, const double *d_Ap,
+                              const int *gts_a, const double *gts_D,
+                              const double *gts_W, const double *gts_Q,
+                              int B, int L, int n, int G, double s_gts, int nISL_local,
+                              int off_gts, int nnz, int nrows, double *A_out, double *b_out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per = L * G;
+    if (idx >= B * per) return;
+    const int b = idx / per, loc = idx - b * per;
+    const int f = loc / G, ge = loc - f * G;
+    const int a = gts_a[ge];
+    const double *P = d_rv + (size_t)b * L * n * 6;
+    const double *Ap = d_Ap + (size_t)b * L * n * 18;
+    const double *pf = P + ((size_t)f * n + a) * 6;
+    const double *q = gts_Q + (size_t)idx * 3;
+    const double d0 = pf[0] - q[0], d1 = pf[1] - q[1], d2 = pf[2] - q[2];
+    const double rg = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double ir = (rg > 1e-12) ? 1.0 / rg : 0.0;
+    const double u0 = d0 * ir, u1 = d1 * ir, u2 = d2 * ir;
+    const double *Ag = Ap + ((size_t)f * n + a) * 18;
+    // GTS 是绝对基准：固定 1/sigma，不按帧有效数降权、不抽样。
+    const double *wrow = gts_W + (size_t)b * per + (size_t)f * G;
+    const double wg = wrow[ge] * s_gts;
+    double *av = A_out + (size_t)b * nnz + off_gts + (size_t)loc * 6;
+#pragma unroll
+    for (int k = 0; k < 6; ++k)
+        av[k] = wg * (u0 * Ag[0 * 6 + k] + u1 * Ag[1 * 6 + k] + u2 * Ag[2 * 6 + k]);
+    b_out[(size_t)b * nrows + nISL_local + loc] = -(rg - gts_D[(size_t)b * per + loc]) * wg;
+}
+
+__global__ void bDynAsmKernel(const double *d_X, const double *d_end, const double *d_phi,
+                              const double *d_qingt, int B, int n, int L, int off_dyn,
+                              int nISL_local, int nGTS_local, int nnz, int nrows,
+                              double *A_out, double *b_out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int nk = (L - 1) * n;
+    if (idx >= B * nk) return;
+    const int b = idx / nk, loc = idx - b * nk;
+    const double *q = d_qingt + ((size_t)b * n + (loc % n)) * 36;
+    const double *X = d_X + (size_t)b * L * n * 6;
+    const double *end = d_end + (size_t)b * nk * 6;
+    const double *phi = d_phi + (size_t)b * nk * 36;
+    const double *xnext = X + ((size_t)(loc + n)) * 6;
+    const double *xe = end + (size_t)loc * 6;
+    const double *Ph = phi + (size_t)loc * 36;
+    double e[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) e[c] = xnext[c] - xe[c];
+    for (int a = 0; a < 6; ++a) {
+        const size_t row = (size_t)loc * 6 + a;
+        double *av = A_out + (size_t)b * nnz + off_dyn + row * 12;
+        double bb = 0.0;
+#pragma unroll
+        for (int j = 0; j < 6; ++j) bb += q[a * 6 + j] * e[j];
+        b_out[(size_t)b * nrows + nISL_local + nGTS_local + row] = -bb;
+#pragma unroll
+        for (int cc = 0; cc < 6; ++cc) {
+            double s = 0.0;
+#pragma unroll
+            for (int j = 0; j < 6; ++j) s += q[a * 6 + j] * (-Ph[j * 6 + cc]);
+            av[cc] = s;
+        }
+#pragma unroll
+        for (int cc = 0; cc < 6; ++cc) av[6 + cc] = q[a * 6 + cc];
+    }
+}
+
+__global__ void bConsensusAsmKernel(const double *d_X, const double *d_z, const double *d_u,
+                                    const double *d_Lp, const double *d_zp, int B, int n, int L,
+                                    int prior_mode, int prior_node, double rho, int off_prior,
+                                    int base_b, int nnz, int nrows,
+                                    double *A_out, double *b_out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int per = L * n;
+    if (idx >= B * per) return;
+    const int b = idx / per, loc = idx - b * per;
+    const int f = loc / n, i = loc - f * n;
+    double center[6], Lt[6][6], A[6][6];
+    const double *z = d_z + (size_t)b * L * n * 6;
+    const double *u = d_u + (size_t)b * L * n * 6;
+    for (int c = 0; c < 6; ++c) center[c] = z[(size_t)loc * 6 + c] - u[(size_t)loc * 6 + c];
+    for (int a = 0; a < 6; ++a)
+        for (int c = 0; c < 6; ++c) Lt[a][c] = (a == c) ? sqrt(rho) : 0.0;
+    if (prior_mode && f == prior_node) {
+        const double *Lp = d_Lp + ((size_t)b * n + i) * 36;
+        const double *zp = d_zp + ((size_t)b * n + i) * 6;
+        for (int a = 0; a < 6; ++a)
+            for (int c = 0; c < 6; ++c) {
+                double s = (a == c) ? rho : 0.0;
+                for (int k = 0; k < 6; ++k) s += Lp[k * 6 + a] * Lp[k * 6 + c];
+                A[a][c] = s;
+            }
+        double rhs[6];
+        for (int a = 0; a < 6; ++a) {
+            double s = rho * center[a];
+            for (int c = 0; c < 6; ++c) {
+                double pinv = 0.0;
+                for (int k = 0; k < 6; ++k) pinv += Lp[k * 6 + a] * Lp[k * 6 + c];
+                s += pinv * zp[c];
+            }
+            rhs[a] = s;
+        }
+        solve6_dev(A, rhs, center);
+        chol6_dev(A, Lt);
+    }
+    const double *x = d_X + (size_t)b * L * n * 6 + (size_t)loc * 6;
+    for (int a = 0; a < 6; ++a) {
+        const int row = f * n * 6 + i * 6 + a;
+        double bb = 0.0;
+        for (int c = 0; c < 6; ++c) {
+            A_out[(size_t)b * nnz + off_prior + (size_t)row * 6 + c] = Lt[a][c];
+            bb += Lt[a][c] * (center[c] - x[c]);
+        }
+        b_out[(size_t)b * nrows + base_b + row] = bb;
+    }
+}
+
+void winAssembleBatchDevice(const WinBatchCtx &c) {
+    const int threads = 256;
+    const int nk = (c.L - 1) * c.n;
+    if (nk > 0) {
+        const int total = c.B * nk * 6;
+        const int stm_threads = 192;   // 必须是 6 的倍数，保证 lane 与全局 idx 对齐
+        bStmKernel<<<(total + stm_threads - 1) / stm_threads, stm_threads>>>(
+            c.d_X, c.B, c.n, c.L, c.dt, c.d_beta,
+            c.d_end, c.d_phi);
+    }
+    const int nISL = c.B * c.L * c.E;
+    if (nISL > 0)
+        bIslAsmKernel<<<(nISL + threads - 1) / threads, threads>>>(
+            c.d_rv, c.d_Ap, c.d_isl_i, c.d_isl_jj, c.d_isl_D, c.d_isl_W,
+            c.B, c.L, c.n, c.E, c.s_isl, c.off_isl, c.nnz, c.nrows, c.d_A, c.d_b);
+    const int nGTS = c.B * c.L * c.G;
+    if (nGTS > 0)
+        bGtsAsmKernel<<<(nGTS + threads - 1) / threads, threads>>>(
+            c.d_rv, c.d_Ap, c.d_gts_a, c.d_gts_D, c.d_gts_W, c.d_gts_Q,
+            c.B, c.L, c.n, c.G, c.s_gts, c.L * c.E, c.off_gts, c.nnz, c.nrows, c.d_A, c.d_b);
+    const int nDYN = c.B * nk;
+    if (nDYN > 0)
+        bDynAsmKernel<<<(nDYN + threads - 1) / threads, threads>>>(
+            c.d_X, c.d_end, c.d_phi, c.d_qingt, c.B, c.n, c.L, c.off_dyn,
+            c.L * c.E, c.L * c.G, c.nnz, c.nrows, c.d_A, c.d_b);
+    if (c.d_z != nullptr) {
+        const int tot = c.B * c.L * c.n;
+        const int base_b = c.L * c.E + c.L * c.G + nk * 6;
+        bConsensusAsmKernel<<<(tot + threads - 1) / threads, threads>>>(
+            c.d_X, c.d_z, c.d_u, c.d_Lp, c.d_zp, c.B, c.n, c.L,
+            c.prior_mode, c.prior_node, c.rho, c.off_damp, base_b, c.nnz, c.nrows, c.d_A, c.d_b);
+    }
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("winAssembleBatchDevice: ") + cudaGetErrorString(err));
 }
 
 }  // namespace qoejopt

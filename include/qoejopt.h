@@ -173,10 +173,30 @@ struct WinCtx {
     double *d_isl_D = nullptr, *d_isl_W = nullptr;
     double *d_gts_D = nullptr, *d_gts_W = nullptr, *d_gts_Q = nullptr;
     double *d_ctr = nullptr, *d_qingt = nullptr;
+    double *d_beta = nullptr;                                  // (n,) 逐星阻力倍率；空=beta=1
     double *d_X = nullptr, *d_rv = nullptr, *d_Ap = nullptr;   // 节点 QOE / rv / ∂p/∂oe(18)
     double *d_end = nullptr, *d_phi = nullptr;                 // ((L-1)*n) 单步 φ 末态(QOE) 与 Φ_oe(36)
     double *d_res = nullptr;
 };
+
+// 144 块同图案批量窗口装配：B 个独立 13 节点块，A/b 为 (B,nnz)/(B,nrows)；
+// 一次 STM + ISL/GTS/dyn/consensus，不再逐块 setup_win/win_assemble。
+struct WinBatchCtx {
+    int B = 0, n = 0, L = 0, E = 0, G = 0, ncol = 0, nnz = 0, nrows = 0;
+    int off_isl = 0, off_gts = 0, off_dyn = 0, off_damp = 0;
+    double dt = 0.0, s_isl = 1.0, s_gts = 1.0, rho = 1.0;
+    int prior_mode = 1;
+    int prior_node = 0;
+    const int *d_isl_i = nullptr, *d_isl_jj = nullptr, *d_gts_a = nullptr;
+    const double *d_isl_D = nullptr, *d_isl_W = nullptr;
+    const double *d_gts_D = nullptr, *d_gts_W = nullptr, *d_gts_Q = nullptr;
+    const double *d_beta = nullptr, *d_qingt = nullptr;
+    const double *d_X = nullptr, *d_rv = nullptr, *d_Ap = nullptr;
+    double *d_end = nullptr, *d_phi = nullptr;
+    const double *d_z = nullptr, *d_u = nullptr, *d_Lp = nullptr, *d_zp = nullptr;
+    double *d_A = nullptr, *d_b = nullptr;
+};
+void winAssembleBatchDevice(const WinBatchCtx &c);
 
 // L 节点批量窗口装配：host 传 X(L*n,6,QOE)、rv(L*n,6)、Ap(L*n,18)=∂p/∂oe；写 A_val/b(device)；返回 ISL res2。
 double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const double *hAp,
@@ -185,6 +205,10 @@ void winResetTiming();
 std::vector<double> winGetTiming();
 // 仅算 ISL res2（线搜索用）：假定 WinCtx.d_rv 已刷新；不做 A/b 装配、不算 STM。
 double winRes2Only(WinCtx &c);
+// 全帧 consensus/锚帧 FLS 先验行：zcons/u (L,n,6) device，Lp(n,6,6) 或空，zp(n,6)。
+void winConsensusAsmDevice(const WinCtx &c, const double *d_zcons, const double *d_u,
+                           const double *d_Lp, const double *d_zp, int prior_mode,
+                           double rho, double *A_val, double *b);
 
 // FLS 逐帧消去（sweep，scaled 空间）：每星一线程，装本帧 S_m,ii = ISL@m+GTS@m+dynNext 本帧侧
 // +dynPrev 上帧侧+先验(m=0)−Δ_{m-1} → 6×6 逆 → 输出 dlt_out = −Cᵀ S_m,ii⁻¹ C（C = A_mᵀ A_n，

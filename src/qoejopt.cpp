@@ -16,6 +16,9 @@
 #include <vector>
 #include "qoejopt.h"
 #include "kepler.h"
+#include <Eigen/Dense>
+#include <cusolverDn.h>
+#include <cublas_v2.h>
 
 namespace py = pybind11;
 using qoejopt::Ctx;
@@ -481,7 +484,7 @@ static void _free_wctx() {
     cudaFree(c.d_isl_i); cudaFree(c.d_isl_jj); cudaFree(c.d_gts_a);
     cudaFree(c.d_isl_D); cudaFree(c.d_isl_W);
     cudaFree(c.d_gts_D); cudaFree(c.d_gts_W); cudaFree(c.d_gts_Q);
-    cudaFree(c.d_ctr); cudaFree(c.d_qingt);
+    cudaFree(c.d_ctr); cudaFree(c.d_qingt); cudaFree(c.d_beta);
     cudaFree(c.d_X); cudaFree(c.d_rv); cudaFree(c.d_Ap);
     cudaFree(c.d_end); cudaFree(c.d_phi); cudaFree(c.d_res);
     g_wctx = qoejopt::WinCtx{};
@@ -517,6 +520,234 @@ static void setup_win(int n, int L, int E, int G, int ncol, int nnz, int nrows,
     cudaMalloc(&c.d_X, bRv); cudaMalloc(&c.d_rv, bRv); cudaMalloc(&c.d_Ap, bAp);
     cudaMalloc(&c.d_end, bEnd); cudaMalloc(&c.d_phi, bEnd * 6);
     cudaMalloc(&c.d_res, sizeof(double));
+}
+
+static void set_win_beta(py::array_t<double, py::array::c_style | py::array::forcecast> beta) {
+    qoejopt::WinCtx &c = g_wctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.set_win_beta: 未先 setup_win");
+    auto b = beta.request();
+    if ((std::size_t)b.size != (std::size_t)c.n)
+        throw std::runtime_error("qoejopt.set_win_beta: beta 需 (n,)");
+    if (c.d_beta) cudaFree(c.d_beta);
+    const int nseg = std::max(1, c.L - 1);
+    std::vector<double> hb((std::size_t)nseg * c.n);
+    const double *src = static_cast<const double *>(b.ptr);
+    for (int s = 0; s < nseg; ++s)
+        std::copy(src, src + c.n, hb.begin() + (std::size_t)s * c.n);
+    cudaMalloc(&c.d_beta, (std::size_t)nseg * c.n * sizeof(double));
+    cudaMemcpy(c.d_beta, hb.data(), hb.size() * sizeof(double), cudaMemcpyHostToDevice);
+}
+
+static void win_consensus_asm(py::array_t<double, py::array::c_style | py::array::forcecast> zcons,
+                              py::array_t<double, py::array::c_style | py::array::forcecast> u,
+                              py::object Lp, py::object zp,
+                              double rho, int prior_mode,
+                              uint64_t Aval_ptr, uint64_t b_ptr) {
+    qoejopt::WinCtx &c = g_wctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.win_consensus_asm: 未先 setup_win");
+    auto bz = zcons.request(); auto bu = u.request();
+    if ((std::size_t)bz.size != (std::size_t)c.L * c.n * 6 ||
+        (std::size_t)bu.size != (std::size_t)c.L * c.n * 6)
+        throw std::runtime_error("win_consensus_asm: zcons/u 需 (L,n,6)");
+    double *dz = nullptr, *du = nullptr, *dLp = nullptr, *dzp = nullptr;
+    cudaMalloc(&dz, bz.size * sizeof(double)); cudaMalloc(&du, bu.size * sizeof(double));
+    cudaMemcpy(dz, bz.ptr, bz.size * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(du, bu.ptr, bu.size * sizeof(double), cudaMemcpyHostToDevice);
+    if (prior_mode && !Lp.is_none()) {
+        auto aL = Lp.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        auto aZ = zp.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        cudaMalloc(&dLp, (std::size_t)c.n * 36 * sizeof(double));
+        cudaMalloc(&dzp, (std::size_t)c.n * 6 * sizeof(double));
+        cudaMemcpy(dLp, aL.request().ptr, (std::size_t)c.n * 36 * sizeof(double), cudaMemcpyHostToDevice);
+        cudaMemcpy(dzp, aZ.request().ptr, (std::size_t)c.n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    }
+    {
+        py::gil_scoped_release rel;
+        qoejopt::winConsensusAsmDevice(c, dz, du, dLp, dzp, prior_mode, rho,
+                                       reinterpret_cast<double *>(Aval_ptr),
+                                       reinterpret_cast<double *>(b_ptr));
+    }
+    cudaFree(dz); cudaFree(du); if (dLp) cudaFree(dLp); if (dzp) cudaFree(dzp);
+}
+
+
+
+static void _solve6(double A[6][6], double b[6], double x[6]) {
+    for (int i = 0; i < 6; ++i) {
+        int p = i;
+        for (int r = i + 1; r < 6; ++r)
+            if (std::abs(A[r][i]) > std::abs(A[p][i])) p = r;
+        if (std::abs(A[p][i]) < 1e-14) { for (int j = 0; j < 6; ++j) x[j] = 0.0; return; }
+        if (p != i) { for (int j = 0; j < 6; ++j) std::swap(A[i][j], A[p][j]); std::swap(b[i], b[p]); }
+        double d = A[i][i];
+        for (int j = i; j < 6; ++j) A[i][j] /= d;
+        b[i] /= d;
+        for (int r = 0; r < 6; ++r) if (r != i) {
+            double f = A[r][i];
+            if (f == 0.0) continue;
+            for (int j = i; j < 6; ++j) A[r][j] -= f * A[i][j];
+            b[r] -= f * b[i];
+        }
+    }
+    for (int j = 0; j < 6; ++j) x[j] = b[j];
+}
+
+static py::array_t<double> gts_global_update(
+        py::array_t<double, py::array::c_style | py::array::forcecast> Z,
+        py::array_t<double, py::array::c_style | py::array::forcecast> D,
+        py::array_t<double, py::array::c_style | py::array::forcecast> M,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Q,
+        py::array_t<int, py::array::c_style | py::array::forcecast> gs) {
+    auto bz = Z.request(); auto bd = D.request(); auto bm = M.request();
+    auto bq = Q.request(); auto bg = gs.request();
+    const int K = (int)bz.shape[0], n = (int)bz.shape[1];
+    const int G = (int)bg.size;
+    if (bz.ndim != 3 || (int)bz.shape[2] != 6 || (int)bd.shape[0] != K ||
+        (int)bd.shape[1] != G || (int)bm.shape[0] != K || (int)bm.shape[1] != G ||
+        (int)bq.shape[0] != K || (int)bq.shape[1] != G)
+        throw std::runtime_error("gts_global_update: shape mismatch");
+    py::array_t<double> out({K, n, 6});
+    std::memcpy(out.request().ptr, bz.ptr, (size_t)K * n * 6 * sizeof(double));
+    double *z = static_cast<double *>(out.request().ptr);
+    const double *Dp = static_cast<const double *>(bd.ptr);
+    const double *Mp = static_cast<const double *>(bm.ptr);
+    const double *Qp = static_cast<const double *>(bq.ptr);
+    const int *gp = static_cast<const int *>(bg.ptr);
+    std::vector<double> rv((size_t)n * 6), J((size_t)n * 36), dr((size_t)n * 6, 0.0);
+    for (int f = 0; f < K; f += 6) {
+        bool any = false;
+        for (int g = 0; g < G; ++g) if (Mp[(size_t)f * G + g] > 0.5) { any = true; break; }
+        if (!any) continue;
+        qoejopt::oe2rvJacHost(z + (size_t)f * n * 6, n, rv.data(), J.data());
+        std::fill(dr.begin(), dr.end(), 0.0);
+        for (int g = 0; g < G; ++g) {
+            if (Mp[(size_t)f * G + g] <= 0.5) continue;
+            const int s = gp[g];
+            const double *q = Qp + ((size_t)f * G + g) * 3;
+            const double *p = rv.data() + (size_t)s * 6;
+            const double *dd = dr.data() + (size_t)s * 6;
+            double dv[3] = {p[0] + dd[0] - q[0], p[1] + dd[1] - q[1], p[2] + dd[2] - q[2]};
+            double dist = std::sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]);
+            if (dist < 1e-12) continue;
+            double u[3] = {dv[0] / dist, dv[1] / dist, dv[2] / dist};
+            double r = dist - Dp[(size_t)f * G + g];
+            for (int c = 0; c < 3; ++c) dr[(size_t)s * 6 + c] -= r * u[c];
+        }
+        for (int s = 0; s < n; ++s) {
+            const double *d = dr.data() + (size_t)s * 6;
+            if (std::abs(d[0]) + std::abs(d[1]) + std::abs(d[2]) < 1e-12) continue;
+            double A[6][6], b[6] = {d[0], d[1], d[2], 0.0, 0.0, 0.0}, x[6];
+            const double *Js = J.data() + (size_t)s * 36;
+            for (int a = 0; a < 6; ++a) for (int c = 0; c < 6; ++c) A[a][c] = Js[a * 6 + c];
+            _solve6(A, b, x);
+            for (int c = 0; c < 6; ++c) z[((size_t)f * n + s) * 6 + c] += x[c];
+        }
+    }
+    return out;
+}
+
+static py::object win_batch_assemble(
+        py::array_t<double, py::array::c_style | py::array::forcecast> X,
+        py::array_t<double, py::array::c_style | py::array::forcecast> rv,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Ap,
+        py::array_t<int, py::array::c_style | py::array::forcecast> isl_i,
+        py::array_t<int, py::array::c_style | py::array::forcecast> isl_jj,
+        py::array_t<double, py::array::c_style | py::array::forcecast> isl_D,
+        py::array_t<double, py::array::c_style | py::array::forcecast> isl_W,
+        py::array_t<int, py::array::c_style | py::array::forcecast> gts_a,
+        py::array_t<double, py::array::c_style | py::array::forcecast> gts_D,
+        py::array_t<double, py::array::c_style | py::array::forcecast> gts_W,
+        py::array_t<double, py::array::c_style | py::array::forcecast> gts_Q,
+        py::object beta, py::array_t<double, py::array::c_style | py::array::forcecast> qingt,
+        py::array_t<double, py::array::c_style | py::array::forcecast> z,
+        py::array_t<double, py::array::c_style | py::array::forcecast> u,
+        py::object Lp, py::object zp,
+        int n, int L, int E, int G, int nnz, int nrows,
+        int off_isl, int off_gts, int off_dyn, int off_damp,
+        double dt, double s_isl, double s_gts, double rho, int prior_mode, int prior_node,
+        uint64_t A_device_ptr, uint64_t b_device_ptr) {
+    auto bx = X.request(); auto br = rv.request(); auto ba = Ap.request();
+    const int B = (int)bx.shape[0];
+    if ((int)bx.shape[0] != B || bx.ndim != 4 ||
+        (int)bx.shape[1] != L || (int)bx.shape[2] != n || (int)bx.shape[3] != 6)
+        throw std::runtime_error("win_batch_assemble: X 需 (B,L,n,6)");
+    auto cuda_up_d = [](py::array_t<double, py::array::c_style | py::array::forcecast> &a) {
+        auto r = a.request(); double *d = nullptr;
+        cudaMalloc(&d, (size_t)r.size * sizeof(double));
+        cudaMemcpy(d, r.ptr, (size_t)r.size * sizeof(double), cudaMemcpyHostToDevice); return d;
+    };
+    auto cuda_up_i = [](py::array_t<int, py::array::c_style | py::array::forcecast> &a) {
+        auto r = a.request(); int *d = nullptr;
+        cudaMalloc(&d, (size_t)r.size * sizeof(int));
+        cudaMemcpy(d, r.ptr, (size_t)r.size * sizeof(int), cudaMemcpyHostToDevice); return d;
+    };
+    qoejopt::WinBatchCtx c;
+    c.B = B; c.n = n; c.L = L; c.E = E; c.G = G; c.ncol = L * n * 6;
+    c.nnz = nnz; c.nrows = nrows; c.off_isl = off_isl; c.off_gts = off_gts;
+    c.off_dyn = off_dyn; c.off_damp = off_damp; c.dt = dt; c.s_isl = s_isl;
+    c.s_gts = s_gts; c.rho = rho; c.prior_mode = prior_mode; c.prior_node = prior_node;
+    c.d_X = cuda_up_d(X); c.d_rv = cuda_up_d(rv); c.d_Ap = cuda_up_d(Ap);
+    c.d_isl_i = cuda_up_i(isl_i); c.d_isl_jj = cuda_up_i(isl_jj);
+    c.d_isl_D = cuda_up_d(isl_D); c.d_isl_W = cuda_up_d(isl_W);
+    c.d_gts_a = cuda_up_i(gts_a); c.d_gts_D = cuda_up_d(gts_D);
+    c.d_gts_W = cuda_up_d(gts_W); c.d_gts_Q = cuda_up_d(gts_Q);
+    c.d_qingt = cuda_up_d(qingt);
+    c.d_z = cuda_up_d(z); c.d_u = cuda_up_d(u);
+    if (!Lp.is_none()) {
+        auto a = Lp.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        c.d_Lp = cuda_up_d(a);
+        auto b = zp.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        c.d_zp = cuda_up_d(b);
+    }
+    if (!beta.is_none()) {
+        auto a = beta.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        c.d_beta = cuda_up_d(a);
+    }
+    const int nk = (L - 1) * n;
+    double *d_end = nullptr, *d_phi = nullptr;
+    if (nk > 0) {
+        cudaMalloc(&d_end, (size_t)B * nk * 6 * sizeof(double));
+        cudaMalloc(&d_phi, (size_t)B * nk * 36 * sizeof(double));
+    }
+    c.d_end = d_end; c.d_phi = d_phi;
+    double *d_A = nullptr, *d_b = nullptr;
+    const bool ext_out = (A_device_ptr != 0 || b_device_ptr != 0);
+    if (A_device_ptr != 0 && b_device_ptr != 0) {
+        d_A = reinterpret_cast<double *>(A_device_ptr);
+        d_b = reinterpret_cast<double *>(b_device_ptr);
+    } else {
+        cudaMalloc(&d_A, (size_t)B * nnz * sizeof(double));
+        cudaMalloc(&d_b, (size_t)B * nrows * sizeof(double));
+    }
+    cudaMemset(d_A, 0, (size_t)B * nnz * sizeof(double));
+    cudaMemset(d_b, 0, (size_t)B * nrows * sizeof(double));
+    c.d_A = d_A; c.d_b = d_b;
+    {
+        py::gil_scoped_release rel;
+        qoejopt::winAssembleBatchDevice(c);
+    }
+    py::object out = py::none();
+    if (!ext_out) {
+        py::array_t<double> A_out({B, nnz});
+        py::array_t<double> b_out({B, nrows});
+        cudaMemcpy(A_out.request().ptr, d_A, (size_t)B * nnz * sizeof(double), cudaMemcpyDeviceToHost);
+        cudaMemcpy(b_out.request().ptr, d_b, (size_t)B * nrows * sizeof(double), cudaMemcpyDeviceToHost);
+        out = py::make_tuple(A_out, b_out);
+    }
+    if (!ext_out) { cudaFree(d_A); cudaFree(d_b); }
+    cudaFree(d_end); cudaFree(d_phi);
+    cudaFree(const_cast<double*>(c.d_X)); cudaFree(const_cast<double*>(c.d_rv));
+    cudaFree(const_cast<double*>(c.d_Ap));
+    cudaFree(const_cast<int*>(c.d_isl_i)); cudaFree(const_cast<int*>(c.d_isl_jj));
+    cudaFree(const_cast<double*>(c.d_isl_D)); cudaFree(const_cast<double*>(c.d_isl_W));
+    cudaFree(const_cast<int*>(c.d_gts_a)); cudaFree(const_cast<double*>(c.d_gts_D));
+    cudaFree(const_cast<double*>(c.d_gts_W)); cudaFree(const_cast<double*>(c.d_gts_Q));
+    cudaFree(const_cast<double*>(c.d_qingt));
+    cudaFree(const_cast<double*>(c.d_z)); cudaFree(const_cast<double*>(c.d_u));
+    if (c.d_Lp) cudaFree(const_cast<double*>(c.d_Lp));
+    if (c.d_zp) cudaFree(const_cast<double*>(c.d_zp));
+    if (c.d_beta) cudaFree(const_cast<double*>(c.d_beta));
+    return out;
 }
 
 static double win_assemble(py::array_t<double, py::array::c_style | py::array::forcecast> X,
@@ -758,6 +989,172 @@ static py::tuple blk_copy_rv() {
     return py::make_tuple(rvK, rv4);
 }
 
+
+static py::array_t<double> gts_weak_cuda(
+        py::array_t<double, py::array::c_style | py::array::forcecast> Q,
+        py::array_t<double, py::array::c_style | py::array::forcecast> D,
+        py::array_t<double, py::array::c_style | py::array::forcecast> M,
+        py::array_t<int, py::array::c_style | py::array::forcecast> edges,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Dg,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Mg,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Qg,
+        py::array_t<int, py::array::c_style | py::array::forcecast> gsat,
+        int nweak, double sigma_gts=19.0, double lam=1e-2) {
+    auto qb = Q.request(); auto db = D.request(); auto mb = M.request();
+    auto eb = edges.request(); auto dgb = Dg.request(); auto mgb = Mg.request();
+    auto qgb = Qg.request(); auto gb = gsat.request();
+    if (qb.ndim != 3 || qb.shape[2] != 6) throw std::runtime_error("gts_weak_cuda: Q 需 (K,n,6)");
+    const int K = (int)qb.shape[0], n = (int)qb.shape[1], E = (int)eb.shape[0], G = (int)mgb.shape[1];
+    const int ns = n * 6;
+    std::vector<double> q((double*)qb.ptr, (double*)qb.ptr + (size_t)K * ns);
+    const double *Dp = (const double*)db.ptr, *Mp = (const double*)mb.ptr;
+    const int *ep = (const int*)eb.ptr;
+    const double *Dgp = (const double*)dgb.ptr, *Mgp = (const double*)mgb.ptr, *Qgp = (const double*)qgb.ptr;
+    const int *gsp = (const int*)gb.ptr;
+    const double scale6[6] = {10.0, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5};
+    Eigen::VectorXd scale(ns);
+    for (int i = 0; i < ns; ++i) scale[i] = scale6[i % 6];
+    Eigen::MatrixXd F(ns, ns), Fw(ns, ns);
+    std::vector<double> rv(n * 6), J(n * 36);
+    cusolverDnHandle_t h = nullptr; cusolverDnCreate(&h);
+    double *dA = nullptr, *dW = nullptr, *dEig = nullptr; int *dInfo = nullptr;
+    cudaMalloc(&dA, (size_t)ns * ns * sizeof(double));
+    cudaMalloc(&dEig, (size_t)ns * sizeof(double));
+    cudaMalloc(&dInfo, sizeof(int));
+    double *hEvec = (double*)malloc((size_t)ns * nweak * sizeof(double));
+    int nwrite = 0;
+    for (int f = 0; f < K; ++f) {
+        bool has = false;
+        for (int g = 0; g < G; ++g) if (Mgp[(size_t)f * G + g] > 0.5) { has = true; break; }
+        if (!has) continue;
+        qoejopt::oe2rvJacHost(q.data() + (size_t)f * ns, n, rv.data(), J.data());
+        F.setZero();
+        for (int e = 0; e < E; ++e) {
+            if (Mp[(size_t)f * E + e] <= 0.5) continue;
+            int i = ep[2 * e], j = ep[2 * e + 1];
+            double dx = rv[6 * i] - rv[6 * j], dy = rv[6 * i + 1] - rv[6 * j + 1], dz = rv[6 * i + 2] - rv[6 * j + 2];
+            double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (r < 1e-12) continue;
+            double u[3] = {dx / r, dy / r, dz / r};
+            double ri[6], rj[6];
+            for (int a = 0; a < 6; ++a) {
+                ri[a] = (u[0] * J[i * 36 + a] + u[1] * J[i * 36 + 6 + a] + u[2] * J[i * 36 + 12 + a]) / 30.0;
+                rj[a] = -(u[0] * J[j * 36 + a] + u[1] * J[j * 36 + 6 + a] + u[2] * J[j * 36 + 12 + a]) / 30.0;
+            }
+            for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) {
+                F(i * 6 + a, i * 6 + b) += ri[a] * ri[b];
+                F(i * 6 + a, j * 6 + b) += ri[a] * rj[b];
+                F(j * 6 + a, i * 6 + b) += rj[a] * ri[b];
+                F(j * 6 + a, j * 6 + b) += rj[a] * rj[b];
+            }
+        }
+        for (int g = 0; g < G; ++g) {
+            if (Mgp[(size_t)f * G + g] <= 0.5) continue;
+            int i = gsp[g];
+            double dx = rv[6 * i] - Qgp[(size_t)f * G * 3 + 3 * g];
+            double dy = rv[6 * i + 1] - Qgp[(size_t)f * G * 3 + 3 * g + 1];
+            double dz = rv[6 * i + 2] - Qgp[(size_t)f * G * 3 + 3 * g + 2];
+            double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (r < 1e-12) continue;
+            double u[3] = {dx / r, dy / r, dz / r};
+            double ri[6];
+            for (int a = 0; a < 6; ++a)
+                ri[a] = (u[0] * J[i * 36 + a] + u[1] * J[i * 36 + 6 + a] + u[2] * J[i * 36 + 12 + a]) / sigma_gts;
+            for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b)
+                F(i * 6 + a, i * 6 + b) += ri[a] * ri[b];
+        }
+        Fw = scale.asDiagonal() * F * scale.asDiagonal();
+        cudaMemcpy(dA, Fw.data(), (size_t)ns * ns * sizeof(double), cudaMemcpyHostToDevice);
+        int lwork = 0, h_me = 0;
+        cusolverDnDsyevdx_bufferSize(h, CUSOLVER_EIG_MODE_VECTOR, CUSOLVER_EIG_RANGE_I,
+                                     CUBLAS_FILL_MODE_LOWER, ns, dA, ns, 0.0, 0.0,
+                                     1, nweak, &h_me, dEig, &lwork);
+        if (!dW) cudaMalloc(&dW, (size_t)lwork * sizeof(double));
+        cudaMemset(dA, 0, (size_t)ns * ns * sizeof(double));
+        cudaMemcpy(dA, Fw.data(), (size_t)ns * ns * sizeof(double), cudaMemcpyHostToDevice);
+        int h_m = 0;
+        cusolverDnDsyevdx(h, CUSOLVER_EIG_MODE_VECTOR, CUSOLVER_EIG_RANGE_I,
+                          CUBLAS_FILL_MODE_LOWER, ns, dA, ns, 0.0, 0.0,
+                          1, nweak, &h_m, dEig, dW, lwork, dInfo);
+        cudaDeviceSynchronize();
+        int h_info = -1;
+        cudaMemcpy(&h_info, dInfo, sizeof(int), cudaMemcpyDeviceToHost);
+        cudaMemcpy(hEvec, dA, (size_t)ns * nweak * sizeof(double), cudaMemcpyDeviceToHost);
+        std::vector<double> V((size_t)ns * nweak);
+        double vmax = 0.0;
+        for (int k = 0; k < nweak; ++k)
+            for (int i = 0; i < ns; ++i) {
+                V[(size_t)k * ns + i] = scale[i] * hEvec[(size_t)k * ns + i];
+                vmax = std::max(vmax, std::abs(V[(size_t)k * ns + i]));
+            }
+        if (nwrite < 2)
+            fprintf(stderr, "[gts_cpp] f=%d meig=%d info=%d Vmax=%.3e\n", f, h_me, h_info, vmax);
+        for (int g = 0; g < G; ++g) {
+            if (Mgp[(size_t)f * G + g] <= 0.5) continue;
+            int i = gsp[g];
+            double dx = rv[6 * i] - Qgp[(size_t)f * G * 3 + 3 * g];
+            double dy = rv[6 * i + 1] - Qgp[(size_t)f * G * 3 + 3 * g + 1];
+            double dz = rv[6 * i + 2] - Qgp[(size_t)f * G * 3 + 3 * g + 2];
+            double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (r < 1e-12) continue;
+            double u[3] = {dx / r, dy / r, dz / r};
+            Eigen::VectorXd gg(nweak);
+            for (int k = 0; k < nweak; ++k) {
+                double s = 0.0;
+                for (int a = 0; a < 6; ++a)
+                    s += u[0] * J[i * 36 + 0 * 6 + a] * V[(size_t)k * ns + i * 6 + a]
+                       + u[1] * J[i * 36 + 1 * 6 + a] * V[(size_t)k * ns + i * 6 + a]
+                       + u[2] * J[i * 36 + 2 * 6 + a] * V[(size_t)k * ns + i * 6 + a];
+                gg[k] = s / sigma_gts;
+            }
+            // 每帧一个 GTS 行，累积到 A^T A；用逐行 rank-1 更新，避免保存所有行。
+            // 这里只做单条 GTS 的弱写回近似会过拟合，故先在帧末统一解；见下面 frame A。
+        }
+        // 帧内全部 GTS 行联合弱坐标最小二乘
+        Eigen::MatrixXd Af(nweak, nweak); Af.setZero();
+        Eigen::VectorXd bf(nweak); bf.setZero();
+        int m = 0;
+        for (int g = 0; g < G; ++g) {
+            if (Mgp[(size_t)f * G + g] <= 0.5) continue;
+            int i = gsp[g];
+            double dx = rv[6 * i] - Qgp[(size_t)f * G * 3 + 3 * g];
+            double dy = rv[6 * i + 1] - Qgp[(size_t)f * G * 3 + 3 * g + 1];
+            double dz = rv[6 * i + 2] - Qgp[(size_t)f * G * 3 + 3 * g + 2];
+            double r = std::sqrt(dx * dx + dy * dy + dz * dz);
+            if (r < 1e-12) continue;
+            double u[3] = {dx / r, dy / r, dz / r};
+            Eigen::VectorXd gg(nweak);
+            for (int k = 0; k < nweak; ++k) {
+                double s = 0.0;
+                for (int a = 0; a < 6; ++a)
+                    s += u[0] * J[i * 36 + 0 * 6 + a] * V[(size_t)k * ns + i * 6 + a]
+                       + u[1] * J[i * 36 + 1 * 6 + a] * V[(size_t)k * ns + i * 6 + a]
+                       + u[2] * J[i * 36 + 2 * 6 + a] * V[(size_t)k * ns + i * 6 + a];
+                gg[k] = s / sigma_gts;
+            }
+            double res = (r - Dgp[(size_t)f * G + g]) / sigma_gts;
+            Af += gg * gg.transpose();
+            bf += gg * (-res);
+            ++m;
+        }
+        if (m > 0) {
+            Af.diagonal().array() += lam;
+            Eigen::VectorXd aa = Af.ldlt().solve(bf);
+            for (int i = 0; i < n; ++i)
+                for (int k = 0; k < nweak; ++k)
+                    for (int a = 0; a < 6; ++a)
+                        q[(size_t)f * ns + i * 6 + a] += V[(size_t)k * ns + i * 6 + a] * aa[k];
+            ++nwrite;
+            if (nwrite < 3) fprintf(stderr, "[gts_cpp] f=%d m=%d nwrite=%d aa0=%.3e\n", f, m, nwrite, aa.norm());
+        }
+    }
+    cudaFree(dA); cudaFree(dW); cudaFree(dEig); cudaFree(dInfo);
+    cusolverDnDestroy(h); free(hEvec);
+    py::array_t<double> out({(py::ssize_t)K, (py::ssize_t)n, (py::ssize_t)6});
+    std::memcpy(out.mutable_data(), q.data(), q.size() * sizeof(double));
+    return out;
+}
+
 PYBIND11_MODULE(qoejopt, m) {
     m.doc() = "joint 单发全局联合内环 C++/CUDA 核心（device 常驻装配；A_val/b 写调用方 torch cuda 缓冲）";
     m.def("setup", &setup, py::arg("n"), py::arg("nfr"), py::arg("E"), py::arg("G"),
@@ -797,6 +1194,10 @@ PYBIND11_MODULE(qoejopt, m) {
           "单步 GVE + 全动力学变分 STM：x(n,6) oe → (oef(n,6), Φ_oe(n,6,6))");
     m.def("gve_stm_ia", &gve_stm_ia, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
           "一阶同源 STM：Φ≈I+A·dt（A=∂f/∂oe 解析）→ (oef(n,6), Φ(n,6,6))");
+    m.def("gts_weak_cuda", &gts_weak_cuda, py::arg("Q"), py::arg("D"), py::arg("M"),
+          py::arg("edges"), py::arg("Dg"), py::arg("Mg"), py::arg("Qg"), py::arg("gsat"),
+          py::arg("nweak"), py::arg("sigma_gts") = 19.0, py::arg("lam") = 1e-2,
+          "CUDA/C++ GTS 逐帧弱子空间写回：全 1152 星、6912 维、cuSOLVER syevdx");
     m.def("oe2rv_jac", [](py::array_t<double, py::array::c_style | py::array::forcecast> X) {
             auto buf = X.request();
             if (buf.ndim != 2 || buf.shape[1] != 6)
@@ -895,6 +1296,27 @@ PYBIND11_MODULE(qoejopt, m) {
           py::arg("isl_i"), py::arg("isl_jj"), py::arg("isl_D"), py::arg("isl_W"),
           py::arg("gts_a"), py::arg("gts_D"), py::arg("gts_W"), py::arg("gts_Q"),
           py::arg("ctr"), py::arg("qingt"), "L 节点批量窗口：一次注册结构/观测到 device（prior=1 时末组为 6×6 先验行）");
+    m.def("set_win_beta", &set_win_beta, py::arg("beta"),
+          "L 节点批量窗口：设置逐星阻力倍率 beta(n,)；缺省/不调用时 beta=1");
+    m.def("win_consensus_asm", &win_consensus_asm, py::arg("zcons"), py::arg("u"),
+          py::arg("Lp"), py::arg("zp"), py::arg("rho"), py::arg("prior_mode"),
+          py::arg("A_val_ptr"), py::arg("b_ptr"),
+          "全帧 consensus + 锚帧 FLS 先验行：写 A_val/b（需先 win_assemble 拷贝 X）");
+    m.def("gts_global_update", &gts_global_update,
+          py::arg("Z"), py::arg("D"), py::arg("M"), py::arg("Q"), py::arg("gs"),
+          "全局 GTS 60 s 样本修正：每 6 帧一次，所有 GTS 全部进入");
+    m.def("win_batch_assemble", &win_batch_assemble,
+          py::arg("X"), py::arg("rv"), py::arg("Ap"),
+          py::arg("isl_i"), py::arg("isl_jj"), py::arg("isl_D"), py::arg("isl_W"),
+          py::arg("gts_a"), py::arg("gts_D"), py::arg("gts_W"), py::arg("gts_Q"),
+          py::arg("beta"), py::arg("qingt"), py::arg("z"), py::arg("u"),
+          py::arg("Lp"), py::arg("zp"),
+          py::arg("n"), py::arg("L"), py::arg("E"), py::arg("G"),
+          py::arg("nnz"), py::arg("nrows"),
+          py::arg("off_isl"), py::arg("off_gts"), py::arg("off_dyn"), py::arg("off_damp"),
+          py::arg("dt"), py::arg("s_isl"), py::arg("s_gts"), py::arg("rho"), py::arg("prior_mode"),
+          py::arg("prior_node"), py::arg("A_device_ptr") = 0, py::arg("b_device_ptr") = 0,
+          "144 块同图案批量装配（C++/CUDA）：返回 (B,nnz) A 与 (B,nrows) b");
     m.def("win_assemble", &win_assemble, py::arg("X"), py::arg("rv"), py::arg("Ap"),
           py::arg("A_val_ptr"), py::arg("b_ptr"),
           "L 节点批量窗口装配：X(Ln,6) QOE、rv(Ln,6)、Ap(Ln,18)；dyn 单步 φ/Φ + ISL/GTS/damp；返回 ISL res2");
