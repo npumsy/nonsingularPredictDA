@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include <cstdlib>
 #include <cmath>
 #include <stdexcept>
@@ -28,6 +29,7 @@ static Ctx g_ctx;
 static void _free_ctx() {
     Ctx &c = g_ctx;
     cudaFree(c.d_isl_i); cudaFree(c.d_isl_jj); cudaFree(c.d_gts_a);
+    cudaFree(c.d_scale); c.d_scale = nullptr;
     cudaFree(c.d_isl_D); cudaFree(c.d_isl_W);
     cudaFree(c.d_gts_D); cudaFree(c.d_gts_W); cudaFree(c.d_gts_Q);
     cudaFree(c.d_ctr);
@@ -886,8 +888,72 @@ static py::tuple obs_spectrum(int k) {
     py::array_t<double> EV((py::ssize_t)ncol);
     std::memcpy(EV.mutable_data(), eval.data(), eval.size() * sizeof(double));
     py::array_t<double> VEC({(py::ssize_t)ncol, (py::ssize_t)k});
-    std::memcpy(VEC.mutable_data(), evec.data(), evec.size() * sizeof(double));
+    double *vp = VEC.mutable_data();
+    for (int j = 0; j < k; ++j)
+        for (int i = 0; i < ncol; ++i) vp[(std::size_t)i * k + j] = evec[(std::size_t)j * ncol + i];
     return py::make_tuple(EV, VEC);
+}
+
+static py::tuple obs_spectrum_range(int k) {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.obs_spectrum_range: 未先 setup");
+    const int ncol = c.ncol;
+    const int nk = std::max(1, std::min(k, ncol));
+    double *d_H = nullptr;
+    cudaMalloc(&d_H, (std::size_t)ncol * ncol * sizeof(double));
+    std::vector<double> eval, evec;
+    {
+        py::gil_scoped_release rel;
+        qoejopt::obsFormHDevice(c, d_H);
+        qoejopt::obsEigRangeDevice(c, d_H, nk, eval, evec);
+    }
+    cudaFree(d_H);
+    py::array_t<double> EV((py::ssize_t)eval.size());
+    std::memcpy(EV.mutable_data(), eval.data(), eval.size() * sizeof(double));
+    const int nk_out = (int)eval.size();
+    py::array_t<double> VEC({(py::ssize_t)ncol, (py::ssize_t)nk_out});
+    double *vp = VEC.mutable_data();
+    for (int j = 0; j < nk_out; ++j)
+        for (int i = 0; i < ncol; ++i) vp[(std::size_t)i * nk_out + j] = evec[(std::size_t)j * ncol + i];
+    return py::make_tuple(EV, VEC);
+}
+
+static void obs_set_scale(py::array_t<double, py::array::c_style | py::array::forcecast> scale) {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.obs_set_scale: 未先 setup");
+    auto b = scale.request();
+    if ((int)b.size != c.ncol) throw std::runtime_error("qoejopt.obs_set_scale: 长度 != ncol");
+    qoejopt::obsSetScaleDevice(c, static_cast<const double *>(b.ptr));
+}
+
+static py::array_t<double> obs_apply_h(py::array_t<double, py::array::c_style | py::array::forcecast> x,
+                                       int mode) {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.obs_apply_h: 未先 setup");
+    auto bx = x.request();
+    if ((int)bx.size != c.ncol) throw std::runtime_error("qoejopt.obs_apply_h: x 长度 != ncol");
+    double *dx = nullptr, *dy = nullptr;
+    cudaMalloc(&dx, (std::size_t)c.ncol * sizeof(double));
+    cudaMalloc(&dy, (std::size_t)c.ncol * sizeof(double));
+    cudaMemcpy(dx, bx.ptr, (std::size_t)c.ncol * sizeof(double), cudaMemcpyHostToDevice);
+    {
+        py::gil_scoped_release rel;
+        qoejopt::obsApplyHDevice(c, dx, dy, mode);
+    }
+    py::array_t<double> out((py::ssize_t)c.ncol);
+    cudaMemcpy(out.mutable_data(), dy, (std::size_t)c.ncol * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(dy);
+    return out;
+}
+
+static py::array_t<double> copy_A() {
+    Ctx &c = g_ctx;
+    if (!c.d_A) throw std::runtime_error("qoejopt.copy_A: 未先 setup");
+    py::array_t<double> A({(py::ssize_t)c.nfr, (py::ssize_t)c.n,
+                           (py::ssize_t)3, (py::ssize_t)6});
+    cudaMemcpy(A.mutable_data(), c.d_A,
+               (std::size_t)c.nfr * c.n * 18 * sizeof(double), cudaMemcpyDeviceToHost);
+    return A;
 }
 
 static py::array_t<double> obs_perstar() {
@@ -1250,9 +1316,16 @@ PYBIND11_MODULE(qoejopt, m) {
     m.def("win_prior_prop", &win_prior_prop, py::arg("Pp"), py::arg("Q"), py::arg("stride") = 0,
           "K 帧单发窗口：P⁻ 跨窗递推 Pn = Φ_s Pp Φ_sᵀ + Q（(n,36)×2 → (n,6,6)）");
     m.def("obs_spectrum", &obs_spectrum, py::arg("k") = 32,
-          "可观测性：装配 H=AᵀA 的 (eval 升序 ncol, evec ncol×k)（cuSOLVER syevd）");
+          "可观测性：装配 H=AᵀA（含 setup 配置的 ISL+GTS 行）的 (eval 升序 ncol, evec ncol×k)（cuSOLVER syevd）");
+    m.def("obs_spectrum_range", &obs_spectrum_range, py::arg("k") = 32,
+          "可观测性：装配 H=AᵀA（含 ISL+GTS 行）的最小 k 个特征对（cuSOLVER syevdx range I）");
+    m.def("obs_apply_h", &obs_apply_h, py::arg("x"), py::arg("mode") = 7,
+          "信息矩阵矩阵-free 作用 y=Hx；mode 位：1=ISL, 2=GTS, 4=prior");
+    m.def("obs_set_scale", &obs_set_scale, py::arg("scale"),
+          "设置状态列尺度；H 观测行按 S H S，先验行按 S^{-1} P^{-1} S^{-1}");
     m.def("obs_perstar", &obs_perstar, "逐星有效 Jacobian Gram 的 6 特征（奇异值²，升序）(n,6)");
     m.def("copy_rv", &copy_rv, "把当前 d_P（nfr,n,6）拷回 numpy（不重展开）");
+    m.def("copy_A", &copy_A, "把当前 d_A（nfr,n,3,6）拷回 numpy（不重展开）");
 
     // 单发窗口（win_assemble_ss）：单发 L 帧 + 每星 6×6 先验 + 协方差白化
     m.def("setup_win_ss", &setup_win_ss, py::arg("n"), py::arg("L"), py::arg("E"), py::arg("G"),

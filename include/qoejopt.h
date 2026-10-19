@@ -53,6 +53,7 @@ struct Ctx {
 
     // device scratch（setup 分配）
     double *d_X = nullptr, *d_rv0 = nullptr, *d_A0 = nullptr;
+    double *d_scale = nullptr;  // (ncol,) 状态列尺度；空=1。H_scaled = S H S。
     double *d_P = nullptr,   // rv 全帧 (nfr*n*6)
            *d_A = nullptr,   // 位置 Jacobian 折叠 (nfr*n*18)
            *d_phi_all = nullptr,  // 每帧 Φ_oe=∂oe_f/∂oe_0 (nfr*n*36，窗口 P⁻ 跨窗递推用)
@@ -109,8 +110,15 @@ void obsFormHDevice(Ctx &c, double *d_H);
 // H 对称特征分解（cuSOLVER syevd）：返回全谱升序 eval(ncol) 与最小 k 个特征向量 evec(ncol,k)。
 void obsEigDevice(Ctx &c, const double *d_H, int k, std::vector<double> &eval,
                   std::vector<double> &evec);
+// 只求最小 k 个特征对（cuSOLVER syevdx range I），只回拷 ncol×k 个特征向量。
+void obsEigRangeDevice(Ctx &c, const double *d_H, int k, std::vector<double> &eval,
+                       std::vector<double> &evec);
 // 逐星有效 Jacobian Gram 的 6 个特征（奇异值²，升序）：h_sv2 (n,6)。需先 expand。
 void obsPerStarDevice(Ctx &c, double *h_sv2);
+// 信息矩阵矩阵-free 作用：y = H x；mode 位：1=ISL, 2=GTS, 4=prior。需先 expand。
+void obsApplyHDevice(Ctx &c, const double *d_x, double *d_y, int mode);
+// 设置状态列尺度（ncol）：H 的观测行按 S H S 缩放；先验行按 S^{-1} P^{-1} S^{-1}。
+void obsSetScaleDevice(Ctx &c, const double *hScale);
 
 // 细粒度计时（秒，累计）：[expand(GVE), stmfold, assemble, res2]。
 void jointResetTiming();

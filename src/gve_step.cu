@@ -9,6 +9,7 @@
 #include <cublas_v2.h>
 #include <vector>
 #include <array>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <chrono>
@@ -1933,7 +1934,7 @@ void winPriorPropDevice(Ctx &c, const double *hPp, const double *hQ, int stride,
 // ---- 可观测性：装配 H=AᵀA（ISL 行 + 先验行）到 d_H（ncol×ncol 稠密，row-major）----
 __global__ void obsFormHKernel(const double *d_P, const double *d_A, const int *isl_i, const int *isl_jj,
                                const double *isl_W, int n, int nfr, int E, double s_isl, int off_isl,
-                               double *d_H) {
+                               const double *scale, double *d_H) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= nfr * E) return;
     if (isl_W[idx] <= 0.0) return;
@@ -1949,8 +1950,10 @@ __global__ void obsFormHKernel(const double *d_P, const double *d_A, const int *
     double Ji[6], Jj[6];
     #pragma unroll
     for (int k = 0; k < 6; ++k) {
-        Ji[k] = u0*Ai[0*6+k] + u1*Ai[1*6+k] + u2*Ai[2*6+k];
-        Jj[k] = u0*Aj[0*6+k] + u1*Aj[1*6+k] + u2*Aj[2*6+k];
+        const double si = scale ? scale[i*6+k] : 1.0;
+        const double sj = scale ? scale[j*6+k] : 1.0;
+        Ji[k] = (u0*Ai[0*6+k] + u1*Ai[1*6+k] + u2*Ai[2*6+k]) * si;
+        Jj[k] = (u0*Aj[0*6+k] + u1*Aj[1*6+k] + u2*Aj[2*6+k]) * sj;
     }
     const double w = s_isl * s_isl;
     #pragma unroll
@@ -1965,7 +1968,40 @@ __global__ void obsFormHKernel(const double *d_P, const double *d_A, const int *
         }
 }
 
-__global__ void obsPriorHKernel(const double *fac, int n, int ncol, double *d_H) {
+__global__ void obsGtsHKernel(const double *d_P, const double *d_A,
+                              const int *gts_a, const double *gts_W,
+                              const double *gts_Q, int n, int nfr, int G,
+                              double s_gts, const double *scale, double *d_H) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nfr * G) return;
+    const double w0 = gts_W[idx];
+    if (w0 <= 0.0) return;
+    const int f = idx / G;
+    const int a = gts_a[idx];
+    const double *pi = d_P + ((size_t)f * n + a) * 6;
+    const double *q = gts_Q + (size_t)idx * 3;
+    double d0 = pi[0] - q[0], d1 = pi[1] - q[1], d2 = pi[2] - q[2];
+    double r = sqrt(d0*d0 + d1*d1 + d2*d2);
+    if (r < 1e-12) return;
+    double u0 = d0/r, u1 = d1/r, u2 = d2/r;
+    const double *Ai = d_A + ((size_t)f * n + a) * 18;
+    double Ji[6];
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        const double sk = scale ? scale[a*6+k] : 1.0;
+        Ji[k] = (u0*Ai[0*6+k] + u1*Ai[1*6+k] + u2*Ai[2*6+k]) * sk;
+    }
+    const double w = w0 * s_gts;
+    const double w2 = w * w;
+    const int ncol = 6 * n;
+    #pragma unroll
+    for (int p = 0; p < 6; ++p)
+        #pragma unroll
+        for (int q2 = 0; q2 < 6; ++q2)
+            atomicAdd(&d_H[(size_t)(a*6+p)*ncol + (a*6+q2)], w2 * Ji[p] * Ji[q2]);
+}
+
+__global__ void obsPriorHKernel(const double *fac, int n, int ncol, const double *scale, double *d_H) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const double *F = fac + (size_t)i*36;   // 6 行 × 6 列（A_prior=chol(P0^-1)^T）
@@ -1975,7 +2011,125 @@ __global__ void obsPriorHKernel(const double *fac, int n, int ncol, double *d_H)
         for (int b = 0; b < 6; ++b) { double s = 0.0;
             #pragma unroll
             for (int c = 0; c < 6; ++c) s += F[c*6+a] * F[c*6+b];   // A_priorᵀ A_prior
+            if (scale) s *= (scale[i*6+a] * scale[i*6+b]);
             atomicAdd(&d_H[(size_t)(i*6+a)*ncol + (i*6+b)], s); }
+}
+
+__global__ void obsApplyIslKernel(const double *d_P, const double *d_A,
+                                  const int *isl_i, const int *isl_jj, const double *isl_W,
+                                  int n, int nfr, int E, double s_isl,
+                                  const double *scale, const double *d_x, double *d_y) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nfr * E) return;
+    if (isl_W[idx] <= 0.0) return;
+    const int f = idx / E;
+    const int i = isl_i[idx], j = isl_jj[idx];
+    const double *pi = d_P + ((size_t)f*n + i)*6, *pj = d_P + ((size_t)f*n + j)*6;
+    double d0 = pi[0]-pj[0], d1 = pi[1]-pj[1], d2 = pi[2]-pj[2];
+    double r = sqrt(d0*d0 + d1*d1 + d2*d2); if (r < 1e-12) return;
+    double u0 = d0/r, u1 = d1/r, u2 = d2/r;
+    const double *Ai = d_A + ((size_t)f*n + i)*18;
+    const double *Aj = d_A + ((size_t)f*n + j)*18;
+    double Ji[6], Jj[6];
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        const double si = scale ? scale[i*6+k] : 1.0;
+        const double sj = scale ? scale[j*6+k] : 1.0;
+        Ji[k] = (u0*Ai[0*6+k] + u1*Ai[1*6+k] + u2*Ai[2*6+k]) * si;
+        Jj[k] = (u0*Aj[0*6+k] + u1*Aj[1*6+k] + u2*Aj[2*6+k]) * sj;
+    }
+    double dot = 0.0;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) dot += Ji[k]*d_x[i*6+k] - Jj[k]*d_x[j*6+k];
+    const double w2 = s_isl * s_isl;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        atomicAdd(&d_y[i*6+k], w2 * Ji[k] * dot);
+        atomicAdd(&d_y[j*6+k], -w2 * Jj[k] * dot);
+    }
+}
+
+__global__ void obsApplyGtsKernel(const double *d_P, const double *d_A,
+                                  const int *gts_a, const double *gts_W, const double *gts_Q,
+                                  int n, int nfr, int G, double s_gts,
+                                  const double *scale, const double *d_x, double *d_y) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nfr * G) return;
+    const double w0 = gts_W[idx];
+    if (w0 <= 0.0) return;
+    const int f = idx / G;
+    const int a = gts_a[idx];
+    const double *pi = d_P + ((size_t)f*n + a)*6;
+    const double *q = gts_Q + (size_t)idx * 3;
+    double d0 = pi[0]-q[0], d1 = pi[1]-q[1], d2 = pi[2]-q[2];
+    double r = sqrt(d0*d0 + d1*d1 + d2*d2); if (r < 1e-12) return;
+    double u0 = d0/r, u1 = d1/r, u2 = d2/r;
+    const double *Ai = d_A + ((size_t)f*n + a)*18;
+    double Jg[6];
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) {
+        const double sk = scale ? scale[a*6+k] : 1.0;
+        Jg[k] = (u0*Ai[0*6+k] + u1*Ai[1*6+k] + u2*Ai[2*6+k]) * sk;
+    }
+    double dot = 0.0;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) dot += Jg[k] * d_x[a*6+k];
+    const double w = w0 * s_gts;
+    const double w2 = w * w;
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) atomicAdd(&d_y[a*6+k], w2 * Jg[k] * dot);
+}
+
+__global__ void obsApplyPriorKernel(const double *fac, int n, const double *scale,
+                                    const double *d_x, double *d_y) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double *F = fac + (size_t)i*36;
+    double t[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) {
+        double s = 0.0;
+        #pragma unroll
+        for (int a = 0; a < 6; ++a) s += F[c*6+a] * (scale ? d_x[i*6+a] * scale[i*6+a] : d_x[i*6+a]);
+        t[c] = s;
+    }
+    #pragma unroll
+    for (int b = 0; b < 6; ++b) {
+        double s = 0.0;
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) s += F[c*6+b] * t[c];
+        d_y[i*6+b] += (scale ? s * scale[i*6+b] : s);
+    }
+}
+
+void obsSetScaleDevice(Ctx &c, const double *hScale) {
+    if (!c.d_scale) cudaMalloc(&c.d_scale, (std::size_t)c.ncol * sizeof(double));
+    cudaMemcpy(c.d_scale, hScale, (std::size_t)c.ncol * sizeof(double), cudaMemcpyHostToDevice);
+}
+
+void obsApplyHDevice(Ctx &c, const double *d_x, double *d_y, int mode) {
+    const int ncol = c.ncol;
+    cudaMemset(d_y, 0, (std::size_t)ncol * sizeof(double));
+    const int threads = 256;
+    if (mode & 1) {
+        const int nISL = c.nfr * c.E;
+        if (nISL > 0)
+            obsApplyIslKernel<<<(nISL + threads - 1) / threads, threads>>>(
+                c.d_P, c.d_A, c.d_isl_i, c.d_isl_jj, c.d_isl_W, c.n, c.nfr, c.E,
+                c.s_isl, c.d_scale, d_x, d_y);
+    }
+    if (mode & 2) {
+        const int nGTS = c.nfr * c.G;
+        if (nGTS > 0)
+            obsApplyGtsKernel<<<(nGTS + threads - 1) / threads, threads>>>(
+                c.d_P, c.d_A, c.d_gts_a, c.d_gts_W, c.d_gts_Q, c.n, c.nfr, c.G,
+                c.s_gts, c.d_scale, d_x, d_y);
+    }
+    if ((mode & 4) && c.prior_mode)
+        obsApplyPriorKernel<<<(c.n + threads - 1) / threads, threads>>>(
+            c.d_prior_fac, c.n, c.d_scale, d_x, d_y);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[obsApplyHDevice] %s\n", cudaGetErrorString(err));
 }
 
 void obsFormHDevice(Ctx &c, double *d_H) {
@@ -1985,9 +2139,13 @@ void obsFormHDevice(Ctx &c, double *d_H) {
     const int nISL = c.nfr * c.E;
     if (nISL > 0)
         obsFormHKernel<<<(nISL + threads - 1) / threads, threads>>>(
-            c.d_P, c.d_A, c.d_isl_i, c.d_isl_jj, c.d_isl_W, c.n, c.nfr, c.E, c.s_isl, c.off_isl, d_H);
+            c.d_P, c.d_A, c.d_isl_i, c.d_isl_jj, c.d_isl_W, c.n, c.nfr, c.E, c.s_isl, c.off_isl, c.d_scale, d_H);
+    const int nGTS = c.nfr * c.G;
+    if (nGTS > 0)
+        obsGtsHKernel<<<(nGTS + threads - 1) / threads, threads>>>(
+            c.d_P, c.d_A, c.d_gts_a, c.d_gts_W, c.d_gts_Q, c.n, c.nfr, c.G, c.s_gts, c.d_scale, d_H);
     if (c.prior_mode)
-        obsPriorHKernel<<<(c.n + threads - 1) / threads, threads>>>(c.d_prior_fac, c.n, ncol, d_H);
+        obsPriorHKernel<<<(c.n + threads - 1) / threads, threads>>>(c.d_prior_fac, c.n, ncol, c.d_scale, d_H);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) fprintf(stderr, "[obsFormHDevice] %s\n", cudaGetErrorString(err));
 }
@@ -2080,6 +2238,40 @@ void obsEigDevice(Ctx &c, const double *d_H, int k, std::vector<double> &eval,
     cudaMemcpy(eval.data(), d_eig, (std::size_t)ncol * sizeof(double), cudaMemcpyDeviceToHost);
     // syevd 输出列主序：A2 的第 j 列（列主序为 allv[j*ncol + i]）为第 j 个特征向量；取最小 k 列
     for (int j = 0; j < k && j < ncol; ++j)
+        for (int i = 0; i < ncol; ++i) evec[(std::size_t)j * ncol + i] = allv[(std::size_t)j * ncol + i];
+    cudaFree(d_eig); cudaFree(d_A2); cudaFree(d_info); cudaFree(d_work);
+    cusolverDnDestroy(h);
+}
+
+// ---- 最小 k 个特征对（cuSOLVER syevdx range I）：只回拷 ncol×k 个特征向量 ----
+void obsEigRangeDevice(Ctx &c, const double *d_H, int k, std::vector<double> &eval,
+                       std::vector<double> &evec) {
+    const int ncol = c.ncol;
+    const int nk = std::max(1, std::min(k, ncol));
+    eval.assign(nk, 0.0); evec.assign((std::size_t)ncol * nk, 0.0);
+    cusolverDnHandle_t h = nullptr; cusolverDnCreate(&h);
+    double *d_eig = nullptr, *d_A2 = nullptr, *d_work = nullptr; int *d_info = nullptr;
+    cudaMalloc(&d_eig, (std::size_t)ncol * sizeof(double));
+    cudaMalloc(&d_A2, (std::size_t)ncol * ncol * sizeof(double));
+    cudaMalloc(&d_info, sizeof(int));
+    cudaMemcpy(d_A2, d_H, (std::size_t)ncol * ncol * sizeof(double), cudaMemcpyDeviceToDevice);
+    int lwork = 0, h_me = 0;
+    cusolverDnDsyevdx_bufferSize(h, CUSOLVER_EIG_MODE_VECTOR, CUSOLVER_EIG_RANGE_I,
+                                 CUBLAS_FILL_MODE_LOWER, ncol, d_A2, ncol, 0.0, 0.0,
+                                 1, nk, &h_me, d_eig, &lwork);
+    cudaMalloc(&d_work, (std::size_t)lwork * sizeof(double));
+    cudaMemset(d_A2, 0, (std::size_t)ncol * ncol * sizeof(double));
+    cudaMemcpy(d_A2, d_H, (std::size_t)ncol * ncol * sizeof(double), cudaMemcpyDeviceToDevice);
+    int h_m = 0;
+    cusolverDnDsyevdx(h, CUSOLVER_EIG_MODE_VECTOR, CUSOLVER_EIG_RANGE_I,
+                      CUBLAS_FILL_MODE_LOWER, ncol, d_A2, ncol, 0.0, 0.0,
+                      1, nk, &h_m, d_eig, d_work, lwork, d_info);
+    cudaDeviceSynchronize();
+    const int me = std::max(1, std::min(h_m, nk));
+    std::vector<double> allv((std::size_t)ncol * me);
+    cudaMemcpy(allv.data(), d_A2, (std::size_t)ncol * me * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(eval.data(), d_eig, (std::size_t)me * sizeof(double), cudaMemcpyDeviceToHost);
+    for (int j = 0; j < me; ++j)
         for (int i = 0; i < ncol; ++i) evec[(std::size_t)j * ncol + i] = allv[(std::size_t)j * ncol + i];
     cudaFree(d_eig); cudaFree(d_A2); cudaFree(d_info); cudaFree(d_work);
     cusolverDnDestroy(h);
