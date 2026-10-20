@@ -27,7 +27,7 @@ struct Ctx {
     int off_isl = 0, off_gts = 0, off_damp = 0;
     double dt = 0.0, s_isl = 1.0, s_gts = 1.0, issq = 0.0, sigma_a = 0.0;
     int prior_mode = 0, cov_mode = 0;
-    int stm_gve = 0;            // 1=joint 的 d_A 用同源全动力学变分 Φ_oe（`stmFoldGveKernel`），0=二体
+    int stm_mode = 2;           // joint d_A：0=解析二体（旧默认），1=同源全动力学变分，2=J2 解析（默认）
     int sub_steps = 1;          // >1：每输出帧=一段，内部 sub_steps 个 dt/sub_steps 子步（大步长段级递推）
 
     // device 结构/观测（setup 上传）
@@ -162,6 +162,10 @@ void flsMargDevice(const double *d_Aval, const double *d_sc,
 
 // 同源全动力学 STM 折叠：d_A(nfr,n,18)=∂p_f/∂oe_0（链式变分 Φ_oe，`gveStmStep_dev`）。
 void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta, double *d_A);
+
+// J2 解析 STM 折叠：d_A(nfr,n,18)=Jp(oe_f)·Φ_J2(t_f)，Φ_J2 见 HG-iod.md 10.4.5-10.4.12。
+// d_phi 可空；非空时写每帧 Φ_J2(nfr*n*36，QOE 空间，供跨窗 P 递推)。
+void stmFoldJ2Device(const double *d_oe, int n, int nfr, double dt, double *d_A, double *d_phi);
 
 // P4.2/CUDA：整弧 RBF θ 前向敏度 S_f = ∂oe_f/∂θ（nfr,n,6,m）；centers/s 需先 qoe.setRbfCuda 预设。
 // 变分方程 dS/dt = (∂f/∂oe)S + ∂f/∂θ（∂f/∂θ_k = RHS(ap=第 k 基加速度)），与状态同一 3/8-RK4。

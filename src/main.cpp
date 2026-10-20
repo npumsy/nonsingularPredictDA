@@ -403,6 +403,29 @@ PYBIND11_MODULE(qoe, m)
             return O;
             }, py::arg("rv0"), py::arg("nfr"), py::arg("dt"), py::arg("A0"), py::arg("nthreads")=16,
             "解析两体 STM 折叠（GPU）：(n,6),nfr,dt,(n,36) → A (nfr,n,3,6)");
+      m.def("stmFoldJ2GpuFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe0, int nfr, double dt,
+                py::array_t<double, py::array::c_style | py::array::forcecast> A0, int nthreads){
+            auto b0 = oe0.request(); auto ba = A0.request();
+            if(b0.ndim != 2 || b0.shape[1] != 6) throw std::runtime_error("oe0 需 (n,6)");
+            const std::size_t n = (std::size_t)b0.shape[0];
+            const double *p0 = static_cast<const double *>(b0.ptr);
+            std::vector<Vector6d> oe(n);
+            for(std::size_t i = 0; i < n; ++i)
+                for(int c = 0; c < 6; ++c) oe[i](c) = p0[i*6 + c];
+            std::vector<double> a0;
+            if(ba.size > 0){
+                if(ba.ndim != 2 || ba.shape[1] != 36) throw std::runtime_error("A0 需 (n,36) 或空");
+                a0.resize(n*36);
+                std::memcpy(a0.data(), ba.ptr, n*36*sizeof(double));
+            }
+            std::vector<double> out;
+            { py::gil_scoped_release release; kep3::stmFoldJ2GpuBatch(oe, nfr, dt, a0, nthreads, out); }
+            py::array_t<double> O({(std::size_t)nfr, n, (std::size_t)3, (std::size_t)6});
+            std::memcpy(O.mutable_data(), out.data(), out.size()*sizeof(double));
+            return O;
+            }, py::arg("oe0"), py::arg("nfr"), py::arg("dt"), py::arg("A0") = py::array_t<double>(), py::arg("nthreads")=16,
+            "J2 解析 STM 折叠（GPU）：oe0(n,6,QOE),nfr,dt,A0_oe(n,36 或空) → A (nfr,n,3,6)");
       m.def("cartStepBatchFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> x, double dt,
                 int nthreads, double beta){
@@ -1032,10 +1055,11 @@ PYBIND11_MODULE(qoe, m)
           py::arg("mu") = osculating::MU, 
           py::arg("J2") = osculating::J2, 
           R"pbdoc(
-              计算第一类非奇异轨道要素的J2摄动的状态转移矩阵. 内部计算仍然是经典轨道要素的
+              计算第一类非奇异轨道要素的 J2 一阶长期状态转移矩阵（输入/输出均为 QOE 顺序
+              [a, u=M+w, ex, ey, i, Om]；SI 单位，含 Re^2）。
               Parameters
               OE :
-                  Array of orbital elements (6x1).
+                  Array of orbital elements (6x1, QOE order).
               tf :
                   Final time.
               Re :      Earth radius.
@@ -1043,6 +1067,14 @@ PYBIND11_MODULE(qoe, m)
               J2 :      Second zonal harmonic.
               Returns: 
                   状态转移矩阵 (6x6).
+          )pbdoc");
+
+    m.def("stmJ2Qoe", &osculating::stmJ2Qoe, py::arg("oe"), py::arg("tf"),
+          py::arg("Re") = osculating::RE, py::arg("mu") = osculating::MU,
+          py::arg("J2") = osculating::J2,
+          R"pbdoc(
+              J2 一阶长期 STM（HG-iod.md 10.4.5-10.4.12），QOE 顺序 [a,u,ex,ey,i,Om]。
+              与 OscElemsLongpropagate(..., terms=1) 同一长期模型（SI 单位，含 Re^2）。
           )pbdoc");
       
 

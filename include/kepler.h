@@ -130,6 +130,11 @@ void gvePropagateChunkBatch(const std::vector<Vector6d> &rv0s, int nfr, int L, d
 void stmFoldGpuBatch(const std::vector<Vector6d> &rv0s, int nfr, double dt,
                      const std::vector<double> &A0flat, int nthreads, std::vector<double> &A_all);
 
+// J2 解析 STM 折叠（GPU）：oe0(n,6, QOE) + A0_oe(n,36, ∂oe0/∂z，空=单位) → A（平铺 nfr*n*18）。
+// A_f = Jp(oe_f)·Φ_J2(t_f)·A0_oe，Φ 为 HG-iod.md 10.4.5-10.4.12 的一阶长期 STM。
+void stmFoldJ2GpuBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
+                       const std::vector<double> &A0flat, int nthreads, std::vector<double> &A_all);
+
 // 笛卡尔 ECI 全动力学 RK4（GPU，对比 qoe-GVE）：单步 / 整弧多帧。state=(x,y,z,vx,vy,vz) m/m·s⁻¹。
 void cartStepBatch(const std::vector<Vector6d> &x0s, double dt, int nthreads, double beta,
                    std::vector<Vector6d> &xf);
@@ -279,6 +284,9 @@ void OscElemsLongStepJacBatch(const std::vector<Eigen::Matrix<double,6,1>> &oes,
 Eigen::MatrixXd Jacobian_RV2OscElems(const Eigen::VectorXd OE, const Eigen::VectorXd &x,  double mu, double tol);
 
 Eigen::Matrix3d PQW2GCRF(double Omega, double omega, double i);
+// J2 一阶长期 STM（HG-iod.md 10.4.5-10.4.12），QOE 顺序 [a, u=M+w, ex, ey, i, Om]。
+// 与 OscElemsLongpropagate(..., terms=1) 同一模型；Re/mu/J2 用 SI 单位。
+Eigen::MatrixXd stmJ2Qoe(const Eigen::VectorXd &oe, double tf, double Re, double mu, double J2);
 Eigen::MatrixXd STM_ONsElemsWarppedByCOE(const Eigen::VectorXd OE, double tf, double Re, double mu, double J2);
 
 int testOEMeanSTM();

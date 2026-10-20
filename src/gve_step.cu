@@ -685,6 +685,71 @@ __device__ __forceinline__ void stmTwoBodyDev(const double* r0, const double* v0
     }
 }
 
+// ---- J2 一阶长期解析模型（HG-iod.md 10.4.5-10.4.12），QOE 顺序 [a,u,ex,ey,i,Om] ----
+// 与 host `stmJ2Qoe` / `OscElemsLongpropagate(..., terms=1)` 同一模型；SI 单位，含 Re^2。
+__device__ __forceinline__ void qoeJ2RatesDev(const double* oe, double& n, double& Om1,
+                                              double& w1, double& lam1) {
+    const double a = oe[0], ex = oe[2], ey = oe[3], i = oe[4];
+    const double e2 = ex * ex + ey * ey;
+    const double om = 1.0 - e2;
+    const double p = a * om;
+    n = sqrt(MU_M / (a * a * a));
+    const double ci = cos(i);
+    const double k = J2C * (RE_KM * 1e3) * (RE_KM * 1e3) / (p * p);
+    Om1 = -1.5 * k * n * ci;
+    w1 = 0.75 * k * n * (5.0 * ci * ci - 1.0);
+    const double M1 = 0.75 * k * n * sqrt(om) * (3.0 * ci * ci - 1.0);
+    lam1 = M1 + w1;
+}
+
+// 与解析 STM 同模型的状态传播（t 可正可负；ex/ey 用一阶旋转，与 OscElemsLongpropagate 一致）。
+__device__ __forceinline__ void qoeJ2PropDev(const double* oe, double t, double* oef) {
+    double n, Om1, w1, lam1;
+    qoeJ2RatesDev(oe, n, Om1, w1, lam1);
+    const double ex = oe[2], ey = oe[3];
+    oef[0] = oe[0];
+    oef[1] = oe[1] + (n + lam1) * t;
+    oef[2] = ex - w1 * ey * t;
+    oef[3] = ey + w1 * ex * t;
+    oef[4] = oe[4];
+    oef[5] = oe[5] + Om1 * t;
+}
+
+// Φ = ∂oe(t)/∂oe(0)，J2 一阶长期项（doc 公式换到 QOE 顺序）。
+__device__ __forceinline__ void qoeJ2StmDev(const double* oe, double t, double Phi[6][6]) {
+    const double a = oe[0], ex = oe[2], ey = oe[3], i = oe[4];
+    const double e2 = ex * ex + ey * ey;
+    const double om = 1.0 - e2;
+    const double p = a * om;
+    const double n = sqrt(MU_M / (a * a * a));
+    const double ci = cos(i), si = sin(i);
+    const double s2 = si * si;
+    const double s2i = sin(2.0 * i);
+    const double k = J2C * (RE_KM * 1e3) * (RE_KM * 1e3) / (p * p);
+    const double Om1 = -1.5 * k * n * ci;
+    const double w1 = 0.75 * k * n * (5.0 * ci * ci - 1.0);
+    const double M1 = 0.75 * k * n * sqrt(om) * (3.0 * ci * ci - 1.0);
+    const double lam1 = M1 + w1;
+    for (int r = 0; r < 6; ++r)
+        for (int c = 0; c < 6; ++c) Phi[r][c] = (r == c) ? 1.0 : 0.0;
+    Phi[1][0] = -(1.5 * n / a + 3.5 * lam1 / a) * t;
+    Phi[1][4] = -(3.0 * M1 / (2.0 - 3.0 * s2) + 5.0 * w1 / (4.0 - 5.0 * s2)) * s2i * t;
+    Phi[1][2] = ex * (3.0 * M1 + 4.0 * w1) / om * t;
+    Phi[1][3] = ey * (3.0 * M1 + 4.0 * w1) / om * t;
+    Phi[5][0] = -3.5 * Om1 / a * t;
+    Phi[5][4] = -tan(i) * Om1 * t;
+    Phi[5][2] = 4.0 * ex * Om1 / om * t;
+    Phi[5][3] = 4.0 * ey * Om1 / om * t;
+    Phi[2][0] = 3.5 * ey * w1 / a * t;
+    Phi[2][4] = 5.0 * ey * s2i / (4.0 - 5.0 * s2) * w1 * t;
+    Phi[2][2] = 1.0 - 4.0 * ex * ey * w1 / om * t;
+    Phi[2][3] = -(1.0 + 4.0 * ey * ey / om) * w1 * t;
+    Phi[3][0] = -3.5 * ex * w1 / a * t;
+    Phi[3][4] = -5.0 * ex * s2i / (4.0 - 5.0 * s2) * w1 * t;
+    Phi[3][2] = (1.0 + 4.0 * ex * ex / om) * w1 * t;
+    Phi[3][3] = 1.0 + 4.0 * ex * ey * w1 / om * t;
+}
+
 // 二体解析传播（Lagrange F,G；**km 口径**）：r0,v0 -> rf,vf。用于多重打靶 chunk 的解析热启动。
 __device__ __forceinline__ void twoBodyRvDev(const double* r0, const double* v0, double tof,
                                              double mu, double* rf, double* vf){
@@ -882,8 +947,60 @@ __global__ void stmFoldKernel(const double* rv0, int n, int nfr, double dt, cons
     }
 }
 
+// J2 解析 STM 折叠：每 (星,帧) 算 A_f = ∂p_f/∂z = Jp(oe_f)·Φ_J2(t_f)·A0_oe，
+// A0_oe=∂oe_0/∂z（空=单位阵，即 z=oe_0）；可选输出每帧 Φ(oe_f←oe_0)。
+__global__ void stmFoldJ2Kernel(const double* oe0, int n, int nfr, double dt,
+                                const double* A0_oe, double* A_all, double* Phi_all){
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    double y0[6], A0[6][6];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) y0[c] = oe0[idx*6 + c];
+    #pragma unroll
+    for(int r = 0; r < 6; ++r)
+        #pragma unroll
+        for(int c = 0; c < 6; ++c)
+            A0[r][c] = (A0_oe != nullptr) ? A0_oe[idx*36 + r*6 + c] : ((r == c) ? 1.0 : 0.0);
+    for(int f = 0; f < nfr; ++f){
+        const double t = (double)f * dt;
+        double yf[6];
+        qoeJ2PropDev(y0, t, yf);
+        Dual6 OD[6];
+        #pragma unroll
+        for(int j = 0; j < 6; ++j) OD[j] = d6_var(yf[j], j);
+        Dual6 xd[6];
+        oe2rv_d_dev(OD, xd);
+        double Phi[6][6];
+        qoeJ2StmDev(y0, t, Phi);
+        double PA[6][6];
+        #pragma unroll
+        for(int r = 0; r < 6; ++r)
+            #pragma unroll
+            for(int c = 0; c < 6; ++c){
+                double s = 0.0;
+                #pragma unroll
+                for(int q = 0; q < 6; ++q) s += Phi[r][q] * A0[q][c];
+                PA[r][c] = s;
+            }
+        double* Ao = A_all + ((size_t)f*n + idx)*18;
+        #pragma unroll
+        for(int r = 0; r < 3; ++r)
+            #pragma unroll
+            for(int c = 0; c < 6; ++c){
+                double s = 0.0;
+                #pragma unroll
+                for(int q = 0; q < 6; ++q) s += xd[r].d[q] * PA[q][c];
+                Ao[r*6 + c] = s;
+            }
+        if(Phi_all != nullptr){
+            double* Po = Phi_all + ((size_t)f*n + idx)*36;
+            #pragma unroll
+            for(int q = 0; q < 36; ++q) Po[q] = ((const double*)Phi)[q];
+        }
+    }
+}
+
 namespace qoejopt {
-// ---- 单步全动力学变分 STM（就地）+ 段级（段首冻结 A）+ 同源 STM 折叠 + 段级传播 ----
 // 单步：y(6) → y 与 Φ=∂y_out/∂y_in（与状态同 3/8-RK4，A 每阶段精确）。
 __device__ __noinline__ void gveStmStep_dev(double *y, double beta, double dt, double Phi[6][6]) {
     double k1[6], k2[6], k3[6], k4[6], tmp[6], yn[6];
@@ -1054,6 +1171,13 @@ void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta
     stmFoldGveKernel<<<blocks, threads>>>(d_oe, n, nfr, dt, 1, beta, d_A, nullptr, nullptr);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) fprintf(stderr, "[stmFoldGveDevice] %s\n", cudaGetErrorString(err));
+}
+
+void stmFoldJ2Device(const double *d_oe, int n, int nfr, double dt, double *d_A, double *d_phi) {
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    stmFoldJ2Kernel<<<blocks, threads>>>(d_oe, n, nfr, dt, nullptr, d_A, d_phi);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[stmFoldJ2Device] %s\n", cudaGetErrorString(err));
 }
 
 // 段级 GVE 传播：每输出帧=一段，内部 nsub 个 dt/nsub 子步的精确 3/8-RK4；输出每帧 rv（nfr,n,6）。
@@ -1378,7 +1502,55 @@ void stmFoldGpuBatch(const std::vector<Vector6d> &rv0s, int nfr, double dt,
     g_gve_d2h += _now() - _t;
 }
 
-// 笛卡尔单步（GPU，全动力学）：x0(n,6) → xf。Jac 用同一两体 STM（stmFoldGpuBatch）。
+// J2 解析 STM 折叠（GPU）：oe0(n,6) + A0_oe(n,36，空=单位) → A（平铺 nfr*n*18）。
+void stmFoldJ2GpuBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
+                       const std::vector<double> &A0flat, int nthreads, std::vector<double> &A_all){
+    (void)nthreads;
+    using clk = std::chrono::steady_clock;
+    auto _now = []{ return std::chrono::duration<double>(clk::now().time_since_epoch()).count(); };
+    const int n = (int)oe0s.size();
+    A_all.assign((size_t)nfr * n * 18, 0.0);
+    if(n == 0 || nfr <= 0) return;
+    const bool hasA0 = !A0flat.empty();
+    if(hasA0 && (int)A0flat.size() != n * 36) throw std::runtime_error("stmFoldJ2GpuBatch: A0 需 n*36 或空");
+
+    static thread_local std::vector<double> hoe, ha0;
+    hoe.resize((size_t)n * 6);
+    if(hasA0) ha0.resize((size_t)n * 36);
+    double _t = _now();
+    for(int i = 0; i < n; ++i)
+        for(int c = 0; c < 6; ++c) hoe[(size_t)i*6 + c] = oe0s[i](c);
+    if(hasA0) std::memcpy(ha0.data(), A0flat.data(), (size_t)n*36*sizeof(double));
+    g_gve_pack += _now() - _t;
+
+    static thread_local double *doe = nullptr, *da0 = nullptr, *dA = nullptr;
+    static thread_local size_t coe = 0, ca0 = 0, cA = 0;
+    const size_t boe = (size_t)n*6*sizeof(double), ba0 = (size_t)n*36*sizeof(double),
+                 bA = (size_t)nfr*n*18*sizeof(double);
+    if(boe > coe){ if(doe) cudaFree(doe); doe = nullptr; cudaMalloc(&doe, boe); coe = boe; }
+    if(hasA0 && ba0 > ca0){ if(da0) cudaFree(da0); da0 = nullptr; cudaMalloc(&da0, ba0); ca0 = ba0; }
+    if(bA > cA){ if(dA) cudaFree(dA); dA = nullptr; cudaMalloc(&dA, bA); cA = bA; }
+
+    _t = _now();
+    cudaMemcpy(doe, hoe.data(), boe, cudaMemcpyHostToDevice);
+    if(hasA0) cudaMemcpy(da0, ha0.data(), ba0, cudaMemcpyHostToDevice);
+    g_gve_h2d += _now() - _t;
+
+    const int threads = 256;
+    const int blocks = (n + threads - 1) / threads;
+    _t = _now();
+    stmFoldJ2Kernel<<<blocks, threads>>>(doe, n, nfr, dt, hasA0 ? da0 : nullptr, dA, nullptr);
+    cudaError_t err = cudaDeviceSynchronize();
+    g_gve_stm += _now() - _t;
+    if(err != cudaSuccess)
+        fprintf(stderr, "[stmFoldJ2GpuBatch] kernel error: %s\n", cudaGetErrorString(err));
+
+    _t = _now();
+    cudaMemcpy(A_all.data(), dA, bA, cudaMemcpyDeviceToHost);
+    g_gve_d2h += _now() - _t;
+}
+
+
 void cartStepBatch(const std::vector<Vector6d> &x0s, double dt, int nthreads, double beta,
                    std::vector<Vector6d> &xf){
     (void)nthreads;
@@ -1786,7 +1958,7 @@ void jointExpandDevice(Ctx &c) {
     const int threads = 32;                         // 小块多 block（n=1152 → 36 block）填满 SM；256 只有 5 block
     const int blocks = (c.n + threads - 1) / threads;
     const double t0 = _jnow();
-    if (!(c.stm_gve && c.sub_steps > 1)) {          // 段级同源折叠时位置(与 rv0/A0)由 stmFoldGveKernel 一并输出
+    if (!(c.stm_mode == 1 && c.sub_steps > 1)) {    // 段级同源折叠时位置(与 rv0/A0)由 stmFoldGveKernel 一并输出
         oeJacKernel<<<blocks, threads>>>(c.d_X, c.n, c.d_rv0, c.d_A0);   // rv0/A0 设备端（免 host DACE）
         if (c.sub_steps > 1)
             gvePropagateSubKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0, c.d_P);
@@ -1800,12 +1972,15 @@ void jointExpandDevice(Ctx &c) {
 }
 
 void jointStmFoldDevice(Ctx &c) {
-    const int threads = c.stm_gve ? 32 : 256;       // gve 折叠：小块多 block 填满 SM
+    const int threads = (c.stm_mode == 1) ? 32 : 256;   // gve 折叠：小块多 block 填满 SM
     const int blocks = (c.n + threads - 1) / threads;
     const double t0 = _jnow();
-    if (c.stm_gve)
+    if (c.stm_mode == 1)
         stmFoldGveKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0,
                                               c.d_A, c.d_phi_all, c.d_P);
+    else if (c.stm_mode == 2)
+        stmFoldJ2Kernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, nullptr,
+                                             c.d_A, c.d_phi_all);
     else
         stmFoldKernel<<<blocks, threads>>>(c.d_rv0, c.n, c.nfr, c.dt, c.d_A0, c.d_A);
     cudaError_t err = cudaDeviceSynchronize();

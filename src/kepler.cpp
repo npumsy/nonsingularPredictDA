@@ -1379,70 +1379,48 @@ Eigen::MatrixXd Jacobian_RV2OscElems(const Eigen::VectorXd OE, const Eigen::Vect
 
     return M;
 }
-Eigen::MatrixXd STM_ONsElemsWarppedByCOE(const Eigen::VectorXd OE, double tf, double Re, double mu, double J2){
-    // Constants (these should be defined or calculated appropriately)
-    double a=OE(0);
-    double lambda0 = OE(1),xi = OE(2), eta = OE(3);
-    double i = OE(4),Omega = OE(5);
-    double omega = std::atan2(eta, xi);
-    double e2 = xi * xi + eta * eta; // e_x^2 + e_y^2
-    double e = sqrt(e2); // sqrt(e_x^2 + e_y^2)
-    double p = a * (1 - e2);
-    double n= sqrt(mu / (a * a * a));
-    
-    // Define trigonometric terms
-    double cos_omega = cos(omega);
-    double sin_omega = sin(omega);
-    double e_cos2_sin2 = e * (cos_omega * cos_omega + sin_omega * sin_omega);
+// J2 一阶长期 STM（HG-iod.md 10.4.5-10.4.12），QOE 顺序 [a, u=M+w, ex, ey, i, Om]。
+// 与 OscElemsLongpropagate(..., terms=1) 同一长期模型：a/i 不变，Om 线性，ex/ey 一阶旋转，
+// u 以 n+lambda1 线性变化。注意 Re^2 因子（doc 公式为归一化单位）。
+Eigen::MatrixXd stmJ2Qoe(const Eigen::VectorXd &oe, double tf, double Re, double mu, double J2) {
+    const double a = oe(0), u = oe(1), ex = oe(2), ey = oe(3), i = oe(4), Om = oe(5);
+    const double e2 = ex * ex + ey * ey;
+    const double om = 1.0 - e2;
+    const double p = a * om;
+    const double n = std::sqrt(mu / (a * a * a));
+    const double ci = std::cos(i), si = std::sin(i);
+    const double s2 = si * si;
+    const double s2i = std::sin(2.0 * i);
+    const double k = J2 * (Re * Re) / (p * p);
+    const double Om1 = -1.5 * k * n * ci;
+    const double w1 = 0.75 * k * n * (5.0 * ci * ci - 1.0);
+    const double M1 = 0.75 * k * n * std::sqrt(om) * (3.0 * ci * ci - 1.0);
+    const double lam1 = M1 + w1;
 
-    // Define matrix J
-    Eigen::MatrixXd J(6, 6);
-    J << 1, 0, 0, 0, 0, 0,
-         0, 0, 0, 0, 1, 1,
-         0, cos_omega, 0, 0, -e * sin_omega, 0,
-         0, sin_omega, 0, 0, e * cos_omega, 0,
-         0, 0, 1, 0, 0, 0,
-         0, 0, 0, 1, 0, 0;
+    Eigen::MatrixXd Phi = Eigen::MatrixXd::Identity(6, 6);
+    Phi(1, 0) = -(1.5 * n / a + 3.5 * lam1 / a) * tf;
+    Phi(1, 4) = -(3.0 * M1 / (2.0 - 3.0 * s2) + 5.0 * w1 / (4.0 - 5.0 * s2)) * s2i * tf;
+    Phi(1, 2) = ex * (3.0 * M1 + 4.0 * w1) / om * tf;
+    Phi(1, 3) = ey * (3.0 * M1 + 4.0 * w1) / om * tf;
+    Phi(5, 0) = -3.5 * Om1 / a * tf;
+    Phi(5, 4) = -std::tan(i) * Om1 * tf;
+    Phi(5, 2) = 4.0 * ex * Om1 / om * tf;
+    Phi(5, 3) = 4.0 * ey * Om1 / om * tf;
+    Phi(2, 0) = 3.5 * ey * w1 / a * tf;
+    Phi(2, 4) = 5.0 * ey * s2i / (4.0 - 5.0 * s2) * w1 * tf;
+    Phi(2, 2) = 1.0 - 4.0 * ex * ey * w1 / om * tf;
+    Phi(2, 3) = -(1.0 + 4.0 * ey * ey / om) * w1 * tf;
+    Phi(3, 0) = -3.5 * ex * w1 / a * tf;
+    Phi(3, 4) = -5.0 * ex * s2i / (4.0 - 5.0 * s2) * w1 * tf;
+    Phi(3, 2) = (1.0 + 4.0 * ex * ex / om) * w1 * tf;
+    Phi(3, 3) = 1.0 + 4.0 * ex * ey * w1 / om * tf;
+    return Phi;
+}
 
-    // Define matrix JInv
-    Eigen::MatrixXd JInv(6, 6);
-    JInv << 1, 0, 0, 0, 0, 0,
-            0, 0, e * cos_omega / e_cos2_sin2, e * sin_omega / e_cos2_sin2, 0, 0,
-            0, 0, 0, 0, 1, 0,
-            0, 0, 0, 0, 0, 1,
-            0, 0, -sin_omega / e_cos2_sin2, cos_omega / e_cos2_sin2, 0, 0,
-            0, 1, sin_omega / e_cos2_sin2, -cos_omega / e_cos2_sin2, 0, 0;
-    
-    // Constants (these should be defined or calculated appropriately)
-    double Omega_1, omega_1, M_1;
-
-    // Compute the Omega_1, omega_1, and M_1 values
-    Omega_1 = -3.0 * J2 * n * cos(i) / (2 * p * p);
-    omega_1 = 3.0 * J2 * n * (2 - 2.5 * sin(i) * sin(i)) / (2 * p * p);
-    M_1 = 3.0 * J2 * n * (1 - 1.5 * sin(i) * sin(i)) * sqrt(1 - e * e) / (2 * p * p);
-
-    // Create the matrix with the given values
-    Eigen::Matrix3d phi1;
-    phi1(0, 0) = -7.0 / (2 * a) * Omega;
-    phi1(0, 1) = 4 * e / (1 - e * e) * Omega;
-    phi1(0, 2) = -tan(i) * Omega;
-    phi1(1, 0) = -7.0 / (2 * a) * omega_1;
-    phi1(1, 1) = 4 * e / (1 - e * e) * omega_1;
-    phi1(1, 2) = -5 * sin(2 * i) / (4 - 5 * sin(i) * sin(i)) * omega_1;
-    phi1(2, 0) = -7.0 / (2 * a) * M_1;
-    phi1(2, 1) = 3 * e / (1 - e * e) * M_1;
-    phi1(2, 2) = -3 * sin(2 * i) / (2 - 3 * sin(i) * sin(i)) * M_1;
-
-    // Construct the 6x6 matrix
-    Eigen::MatrixXd Phi_coe(6, 6);
-    Phi_coe.block<3, 3>(3, 0) = phi1 * tf;
-    Phi_coe(5,0) =-3.0/2.0*n/a * tf;
-
-    Phi_coe = Phi_coe + Eigen::MatrixXd::Identity(6, 6);
-
-    Eigen::MatrixXd Phi_nse(6, 6);
-    Phi_nse = J*Phi_coe*JInv;
-    return Phi_nse;
+// 兼容旧接口：输入/输出均为 QOE 顺序 [a, u, ex, ey, i, Om]（旧实现变量顺序与 J/JInv 不一致，
+// 且 Phi_coe 未置零；此处直接改为调用 stmJ2Qoe）。
+Eigen::MatrixXd STM_ONsElemsWarppedByCOE(const Eigen::VectorXd OE, double tf, double Re, double mu, double J2) {
+    return stmJ2Qoe(OE, tf, Re, mu, J2);
 }
 int testOEMeanSTM(){
     double J2 = osculating::J2;

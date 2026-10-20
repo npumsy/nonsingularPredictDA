@@ -813,8 +813,25 @@ static py::array_t<double> prior_fac_ss(py::array_t<double, py::array::c_style |
     return out;
 }
 
-static void set_stm_gve(int flag) { g_ctx.stm_gve = flag ? 1 : 0; }
+static void set_stm_gve(int flag) { g_ctx.stm_mode = flag ? 1 : 0; }
+static void set_stm_mode(int mode) { g_ctx.stm_mode = (mode >= 0 && mode <= 2) ? mode : 2; }
 static void set_sub_steps(int nsub) { g_ctx.sub_steps = nsub > 0 ? nsub : 1; }
+
+static py::array_t<double> stm_fold_j2(py::array_t<double, py::array::c_style | py::array::forcecast> x,
+                                       int nfr, double dt) {
+    auto buf = x.request();
+    if (buf.ndim != 2 || buf.shape[1] != 6) throw std::runtime_error("qoejopt.stm_fold_j2: x 需 (n,6)");
+    const std::size_t n = (std::size_t)buf.shape[0];
+    double *dx = nullptr, *dA = nullptr;
+    cudaMalloc(&dx, n * 6 * sizeof(double));
+    cudaMalloc(&dA, (std::size_t)nfr * n * 18 * sizeof(double));
+    cudaMemcpy(dx, buf.ptr, n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    { py::gil_scoped_release rel; qoejopt::stmFoldJ2Device(dx, (int)n, nfr, dt, dA, nullptr); }
+    py::array_t<double> A({(py::ssize_t)nfr, (py::ssize_t)n, (py::ssize_t)18});
+    cudaMemcpy(A.mutable_data(), dA, (std::size_t)nfr * n * 18 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(dA);
+    return A;
+}
 
 static py::array_t<double> stm_fold_gve(py::array_t<double, py::array::c_style | py::array::forcecast> x,
                                         int nfr, double dt, double beta) {
@@ -1308,11 +1325,15 @@ PYBIND11_MODULE(qoejopt, m) {
     m.def("reset_timing", &qoejopt::jointResetTiming, "清零 qoejopt 计时");
     m.def("free", &_free_ctx, "释放 device 缓冲");
     m.def("set_stm_gve", &set_stm_gve, py::arg("flag"),
-          "joint d_A 折叠切换：1=同源全动力学变分 Φ_oe（stmFoldGveKernel），0=二体");
+          "joint d_A 折叠切换：1=同源全动力学变分 Φ_oe（stmFoldGveKernel），0=二体（旧路径）");
+    m.def("set_stm_mode", &set_stm_mode, py::arg("mode"),
+          "joint d_A 折叠：0=解析二体，1=同源全动力学变分，2=J2 解析（默认）");
     m.def("set_sub_steps", &set_sub_steps, py::arg("nsub"),
           "段级：每输出帧=一段、内部 nsub 个 dt/sub 子步（大步长段级递推）");
     m.def("stm_fold_gve", &stm_fold_gve, py::arg("x"), py::arg("nfr"), py::arg("dt"),
           py::arg("beta") = 1.0, "同源全动力学 STM 折叠：x(n,6) → d_A(nfr,n,18)=∂p_f/∂oe_0");
+    m.def("stm_fold_j2", &stm_fold_j2, py::arg("x"), py::arg("nfr"), py::arg("dt"),
+          "J2 解析 STM 折叠：x(n,6,QOE) → d_A(nfr,n,18)=Jp(oe_f)Φ_J2(t_f)");
     m.def("set_prior_cov", &set_prior_cov, py::arg("P0"), py::arg("zprior"), py::arg("sigma_a"),
           py::arg("cov_mode"),
           "整弧单发先验：每星 QOE 6×6 P0 + 先验均值 zprior → 信息先验（+ cov_mode=2 逐帧递推白化）");
