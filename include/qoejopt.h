@@ -35,6 +35,7 @@ struct Ctx {
     double *d_isl_D = nullptr, *d_isl_W = nullptr;
     double *d_gts_D = nullptr, *d_gts_W = nullptr, *d_gts_Q = nullptr;
     double *d_ctr = nullptr;
+    double *d_beta = nullptr;       // (n,) 逐星阻力倍率；空=beta=1
 
     // 单发窗口：每星 6×6 边界先验（白化 + 信息先验）
     double *d_P0 = nullptr;         // (n,36) 边界先验协方差
@@ -162,6 +163,10 @@ void flsMargDevice(const double *d_Aval, const double *d_sc,
 
 // 同源全动力学 STM 折叠：d_A(nfr,n,18)=∂p_f/∂oe_0（链式变分 Φ_oe，`gveStmStep_dev`）。
 void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta, double *d_A);
+
+// 只输出末帧 QOE 与 QOE→QOE STM（n,6）/（n,36）；逐星 beta 可空。
+void gveStmLastBetaDevice(const double *d_oe, const double *d_beta, int n, int nfr, double dt,
+                          double *d_qend, double *d_phi);
 
 // J2 解析 STM 折叠：d_A(nfr,n,18)=Jp(oe_f)·Φ_J2(t_f)，Φ_J2 见 HG-iod.md 10.4.5-10.4.12。
 // d_phi 可空；非空时写每帧 Φ_J2(nfr*n*36，QOE 空间，供跨窗 P 递推)。

@@ -33,6 +33,7 @@ static void _free_ctx() {
     cudaFree(c.d_isl_D); cudaFree(c.d_isl_W);
     cudaFree(c.d_gts_D); cudaFree(c.d_gts_W); cudaFree(c.d_gts_Q);
     cudaFree(c.d_ctr);
+    cudaFree(c.d_beta); c.d_beta = nullptr;
     cudaFree(c.d_P0); cudaFree(c.d_prior_fac); cudaFree(c.d_zprior);
     cudaFree(c.d_cov); cudaFree(c.d_phi);
     cudaFree(c.d_P0rv); cudaFree(c.d_Pm); cudaFree(c.d_Pp); cudaFree(c.d_PpPrev);
@@ -144,6 +145,267 @@ static double assemble_cached(uint64_t Aval_ptr, uint64_t b_ptr) {
     py::gil_scoped_release rel;
     return qoejopt::jointAssembleCachedInto(c, reinterpret_cast<double *>(Aval_ptr),
                                             reinterpret_cast<double *>(b_ptr));
+}
+
+
+
+static inline void _retract_qoe6(double *z) {
+    const double TWOPI = 6.283185307179586476925286766559;
+    z[1] = std::fmod(z[1], TWOPI); if (z[1] < 0) z[1] += TWOPI;
+    z[5] = std::fmod(z[5], TWOPI); if (z[5] < 0) z[5] += TWOPI;
+    double e = std::sqrt(z[2]*z[2] + z[3]*z[3]);
+    if (e > 0.9 && e > 1e-30) { z[2] *= 0.9/e; z[3] *= 0.9/e; }
+    if (z[0] < 6.0e6) z[0] = 6.0e6;
+    if (z[0] > 8.5e6) z[0] = 8.5e6;
+    if (z[4] < 1e-4) z[4] = 1e-4;
+    if (z[4] > 3.1415) z[4] = 3.1415;
+}
+
+
+static py::array_t<double> gts_delta_chain(
+        py::array_t<double, py::array::c_style | py::array::forcecast> Zin,
+        py::array_t<double, py::array::c_style | py::array::forcecast> D,
+        py::array_t<double, py::array::c_style | py::array::forcecast> M,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Qg,
+        py::array_t<int, py::array::c_style | py::array::forcecast> gsat,
+        int K, double sigma_gts, int iters) {
+    auto zb = Zin.request(); auto db = D.request(); auto mb = M.request();
+    auto qb = Qg.request(); auto gb = gsat.request();
+    if (zb.ndim != 3 || zb.shape[2] != 6) throw std::runtime_error("gts_delta_chain: Z 需 (nwin,n,6)");
+    const int nwin = (int)zb.shape[0], n = (int)zb.shape[1], G = (int)gb.shape[0];
+    const int nfr = 577;
+    const double *Dp = static_cast<const double*>(db.ptr);
+    const double *Mp = static_cast<const double*>(mb.ptr);
+    const double *Qp = static_cast<const double*>(qb.ptr);
+    const int *gp = static_cast<const int*>(gb.ptr);
+    std::vector<double> Z((std::size_t)nwin*n*6), Zb((std::size_t)nwin*n*6);
+    std::memcpy(Z.data(), zb.ptr, Z.size()*sizeof(double));
+    Zb = Z;
+    std::vector<Eigen::Matrix<double,6,6>> H(n, Eigen::Matrix<double,6,6>::Zero());
+    std::vector<Eigen::Matrix<double,6,1>> b(n, Eigen::Matrix<double,6,1>::Zero());
+    for (int it = 0; it < iters; ++it) {
+        for (int s = 0; s < n; ++s) { H[s].setZero(); b[s].setZero(); }
+        for (int w = 0; w < nwin; ++w) {
+            std::vector<kep3::Vector6d> oe(n);
+            for (int i = 0; i < n; ++i)
+                for (int c = 0; c < 6; ++c) oe[i][c] = Z[((std::size_t)w*n+i)*6+c];
+            std::vector<double> rv;
+            kep3::gvePropagateNoeBatch(oe, nfr, 10.0, 16, 1.0, rv);
+            double *d_oe=nullptr,*d_A=nullptr;
+            cudaMalloc(&d_oe,(std::size_t)n*6*sizeof(double));
+            cudaMalloc(&d_A,(std::size_t)nfr*n*18*sizeof(double));
+            cudaMemcpy(d_oe, oe.data(), (std::size_t)n*6*sizeof(double), cudaMemcpyHostToDevice);
+            qoejopt::stmFoldGveDevice(d_oe,n,nfr,10.0,1.0,d_A);
+            std::vector<double> A((std::size_t)nfr*n*18);
+            cudaMemcpy(A.data(),d_A,A.size()*sizeof(double),cudaMemcpyDeviceToHost);
+            cudaFree(d_oe); cudaFree(d_A);
+            for (int f=0; f<nfr-1; ++f) {
+                const int t=w*576+f; if (t>=K) break;
+                for (int g=0; g<G; ++g) {
+                    if (Mp[(std::size_t)t*G+g] <= 0.5) continue;
+                    const int s=gp[g];
+                    const double *p=&rv[((std::size_t)f*n+s)*6];
+                    const double *q=&Qp[((std::size_t)t*G+g)*3];
+                    double dv[3]={p[0]-q[0],p[1]-q[1],p[2]-q[2]};
+                    double dist=std::sqrt(dv[0]*dv[0]+dv[1]*dv[1]+dv[2]*dv[2]);
+                    if (dist<1e-9) continue;
+                    double u[3]={dv[0]/dist,dv[1]/dist,dv[2]/dist};
+                    const double *Af=&A[((std::size_t)f*n+s)*18];
+                    double J[6];
+                    for (int c=0;c<6;++c) J[c]=(u[0]*Af[c]+u[1]*Af[6+c]+u[2]*Af[12+c])/sigma_gts;
+                    const double r=(dist-Dp[(std::size_t)t*G+g])/sigma_gts;
+                    for (int a=0;a<6;++a) {
+                        for (int c=0;c<6;++c) H[s](a,c)+=J[a]*J[c];
+                        b[s](a)+=J[a]*r;
+                    }
+                }
+            }
+        }
+        for (int s=0;s<n;++s) {
+            Eigen::Matrix<double,6,6> Hs=H[s];
+            Eigen::Matrix<double,6,1> bs=b[s];
+            for (int a=0;a<6;++a) Hs(a,a)+=1e-8;
+            Eigen::LDLT<Eigen::Matrix<double,6,6>> ldlt(Hs);
+            if (ldlt.info()!=Eigen::Success) continue;
+            Eigen::Matrix<double,6,1> d=ldlt.solve(-bs);
+            if (!d.allFinite()) continue;
+            double cap[6]={1e3,1e-4,2e-5,2e-5,1e-5,1e-5};
+            for (int a=0;a<6;++a) d(a)=std::max(-cap[a],std::min(cap[a],d(a)));
+            for (int w=0;w<nwin;++w) {
+                double *zz=&Z[((std::size_t)w*n+s)*6];
+                for (int a=0;a<6;++a) zz[a]+=d(a);
+                _retract_qoe6(zz);
+            }
+        }
+    }
+    py::array_t<double> out({(py::ssize_t)nwin,(py::ssize_t)n,(py::ssize_t)6});
+    std::memcpy(out.mutable_data(), Z.data(), Z.size()*sizeof(double));
+    return out;
+}
+
+static py::array_t<double> gts_z_chain(
+        py::array_t<double, py::array::c_style | py::array::forcecast> Zin,
+        py::array_t<double, py::array::c_style | py::array::forcecast> D,
+        py::array_t<double, py::array::c_style | py::array::forcecast> M,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Qg,
+        py::array_t<int, py::array::c_style | py::array::forcecast> gsat,
+        int K, double sigma_gts, double sigma_dyn, int iters, double sigma_p, int mode) {
+    auto zb = Zin.request();
+    auto db = D.request(); auto mb = M.request(); auto qb = Qg.request();
+    auto gb = gsat.request();
+    if (zb.ndim != 3 || zb.shape[2] != 6) throw std::runtime_error("gts_z_chain: Z 需 (nwin,n,6)");
+    const int nwin = (int)zb.shape[0], n = (int)zb.shape[1];
+    const int G = (int)gb.shape[0];
+    const int nfr = 577;
+    std::vector<double> Z((std::size_t)nwin * n * 6);
+    std::memcpy(Z.data(), zb.ptr, Z.size() * sizeof(double));
+    const std::vector<double> Z0 = Z;
+    const double *Dp = static_cast<const double *>(db.ptr);
+    const double *Mp = static_cast<const double *>(mb.ptr);
+    const double *Qp = static_cast<const double *>(qb.ptr);
+    const int *gp = static_cast<const int *>(gb.ptr);
+
+    using M96 = Eigen::Matrix<double, 96, 96>;
+    using V96 = Eigen::Matrix<double, 96, 1>;
+    const double inv_dyn2 = 1.0 / (sigma_dyn * sigma_dyn);
+    const double inv_p2 = 1.0 / (sigma_p * sigma_p);
+
+    for (int it = 0; it < iters; ++it) {
+        std::vector<M96> H(n, M96::Zero());
+        std::vector<V96> b(n, V96::Zero());
+        // window GTS rows
+        if (mode != 0) for (int w = 0; w < nwin; ++w) {
+            std::vector<kep3::Vector6d> oe(n);
+            for (int i = 0; i < n; ++i)
+                for (int c = 0; c < 6; ++c) oe[i][c] = Z[((std::size_t)w * n + i) * 6 + c];
+            std::vector<double> rv;
+            kep3::gvePropagateNoeBatch(oe, nfr, 10.0, 16, 1.0, rv);
+            double *d_oe = nullptr, *d_A = nullptr;
+            cudaMalloc(&d_oe, (std::size_t)n * 6 * sizeof(double));
+            cudaMalloc(&d_A, (std::size_t)nfr * n * 18 * sizeof(double));
+            cudaMemcpy(d_oe, oe.data(), (std::size_t)n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+            qoejopt::stmFoldGveDevice(d_oe, n, nfr, 10.0, 1.0, d_A);
+            std::vector<double> A((std::size_t)nfr * n * 18);
+            cudaMemcpy(A.data(), d_A, A.size() * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaFree(d_oe); cudaFree(d_A);
+            for (int f = 0; f < nfr - 1; ++f) {
+                const int t = w * 576 + f;
+                if (t >= K) break;
+                for (int g = 0; g < G; ++g) {
+                    if (Mp[(std::size_t)t * G + g] <= 0.5) continue;
+                    const int s = gp[g];
+                    const double *p = &rv[((std::size_t)f * n + s) * 6];
+                    const double *q = &Qp[((std::size_t)t * G + g) * 3];
+                    double dv[3] = {p[0]-q[0], p[1]-q[1], p[2]-q[2]};
+                    double dist = std::sqrt(dv[0]*dv[0]+dv[1]*dv[1]+dv[2]*dv[2]);
+                    if (dist < 1e-9) continue;
+                    double u[3] = {dv[0]/dist, dv[1]/dist, dv[2]/dist};
+                    const double *Af = &A[((std::size_t)f * n + s) * 18];
+                    double J[6];
+                    for (int c = 0; c < 6; ++c)
+                        J[c] = (u[0]*Af[c] + u[1]*Af[6+c] + u[2]*Af[12+c]) / sigma_gts;
+                    const double r = (dist - Dp[(std::size_t)t * G + g]) / sigma_gts;
+                    const int o = w * 6;
+                    for (int a = 0; a < 6; ++a) {
+                        for (int c = 0; c < 6; ++c) H[s](o+a, o+c) += J[a] * J[c];
+                        b[s](o+a) += J[a] * r;
+                    }
+                }
+            }
+        }
+        // window dynamics
+        if (mode != 1) for (int w = 0; w + 1 < nwin; ++w) {
+            std::vector<kep3::Vector6d> oe(n);
+            for (int i = 0; i < n; ++i)
+                for (int c = 0; c < 6; ++c) oe[i][c] = Z[((std::size_t)w * n + i) * 6 + c];
+            double *d_xlo = nullptr, *d_xhi = nullptr, *d_res = nullptr, *d_F = nullptr;
+            cudaMalloc(&d_xlo, (std::size_t)n * 6 * sizeof(double));
+            cudaMalloc(&d_xhi, (std::size_t)n * 6 * sizeof(double));
+            cudaMalloc(&d_res, (std::size_t)n * 6 * sizeof(double));
+            cudaMalloc(&d_F, (std::size_t)n * 36 * sizeof(double));
+            cudaMemcpy(d_xlo, &Z[((std::size_t)w * n) * 6], (std::size_t)n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+            cudaMemcpy(d_xhi, &Z[((std::size_t)(w+1) * n) * 6], (std::size_t)n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+            qoejopt::gveDynFactorDev(d_xlo, d_xhi, 1, n, 5760.0, 1.0, d_res, d_F);
+            std::vector<double> F((std::size_t)n * 36), rr((std::size_t)n * 6);
+            cudaMemcpy(F.data(), d_F, F.size() * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(rr.data(), d_res, rr.size() * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaFree(d_xlo); cudaFree(d_xhi); cudaFree(d_res); cudaFree(d_F);
+            for (int s = 0; s < n; ++s) {
+                const int a0 = w * 6, b0 = a0 + 6;
+                for (int a = 0; a < 6; ++a)
+                    for (int c = 0; c < 6; ++c) {
+                        double fa = 0.0;
+                        for (int k = 0; k < 6; ++k) fa += F[s*36 + a*6 + k] * F[s*36 + c*6 + k];
+                        H[s](a0+a, a0+c) += fa * inv_dyn2;
+                        H[s](b0+a, b0+c) += (a == c ? inv_dyn2 : 0.0);
+                        H[s](a0+a, b0+c) -= F[s*36 + a*6 + c] * inv_dyn2;
+                        H[s](b0+a, a0+c) -= F[s*36 + c*6 + a] * inv_dyn2;
+                    }
+                for (int a = 0; a < 6; ++a) {
+                    double rv = rr[(std::size_t)s * 6 + a];
+                    double fr = 0.0;
+                    for (int k = 0; k < 6; ++k) fr += F[s*36 + k*6 + a] * rv;
+                    b[s](a0+a) -= fr * inv_dyn2;
+                    b[s](b0+a) += rv * inv_dyn2;
+                }
+            }
+        }
+        // prior first window; mode=1 only: weak prior every window to fix null modes
+        for (int s = 0; s < n; ++s) {
+            for (int a = 0; a < 6; ++a) {
+                H[s](a, a) += inv_p2;
+                b[s](a) += inv_p2 * (Z[(std::size_t)s * 6 + a] - Z0[(std::size_t)s * 6 + a]);
+            }
+            if (mode == 1) {
+                for (int w = 1; w < nwin; ++w) {
+                    for (int a = 0; a < 6; ++a) {
+                        H[s](w*6+a, w*6+a) += 1e-8;
+                        b[s](w*6+a) += 1e-8 * (Z[((std::size_t)w*n+s)*6+a] - Z0[((std::size_t)w*n+s)*6+a]);
+                    }
+                }
+            }
+        }
+        // solve per satellite
+        for (int s = 0; s < n; ++s) {
+            H[s] = 0.5 * (H[s] + H[s].transpose());
+            V96 dsc;
+            for (int a = 0; a < nwin * 6; ++a)
+                dsc(a) = std::sqrt(std::max(H[s](a, a), 1e-12));
+            M96 Hs = H[s];
+            V96 bs = b[s];
+            for (int a = 0; a < nwin * 6; ++a) {
+                bs(a) *= 1.0 / dsc(a);
+                for (int c = 0; c < nwin * 6; ++c)
+                    Hs(a, c) *= 1.0 / (dsc(a) * dsc(c));
+            }
+            Hs += M96::Identity() * 1e-6;
+            Eigen::LDLT<M96> ldlt(Hs);
+            if (ldlt.info() != Eigen::Success) continue;
+            V96 y = ldlt.solve(-bs);
+            if (!y.allFinite()) continue;
+            V96 dx;
+            const double cap6[6] = {1e3, 1e-4, 2e-5, 2e-5, 1e-5, 1e-5};
+            for (int a = 0; a < nwin * 6; ++a) {
+                const double cc = cap6[a % 6];
+                dx(a) = std::max(-cc, std::min(cc, y(a) / dsc(a)));
+            }
+            double alpha = 1.0;
+            for (int ls = 0; ls < 8; ++ls) {
+                V96 d = alpha * dx;
+                double lin = 0.5 * d.dot(H[s] * d) + b[s].dot(d);
+                if (lin < 0.0) break;
+                alpha *= 0.5;
+            }
+            for (int w = 0; w < nwin; ++w) {
+                double *zz = &Z[((std::size_t)w * n + s) * 6];
+                for (int a = 0; a < 6; ++a) zz[a] += alpha * dx(w*6+a);
+                _retract_qoe6(zz);
+            }
+        }
+    }
+    py::array_t<double> out({(py::ssize_t)nwin, (py::ssize_t)n, (py::ssize_t)6});
+    std::memcpy(out.mutable_data(), Z.data(), Z.size() * sizeof(double));
+    return out;
 }
 
 static py::tuple gve_stm(py::array_t<double, py::array::c_style | py::array::forcecast> x,
@@ -335,12 +597,10 @@ static void setup_win_ss(int n, int L, int E, int G, int ncol, int nnz, int nrow
     cudaMalloc(&c.d_P0, (std::size_t)n * 36 * sizeof(double));
     cudaMalloc(&c.d_prior_fac, (std::size_t)n * 36 * sizeof(double));
     cudaMalloc(&c.d_zprior, (std::size_t)n * 6 * sizeof(double));
-    cudaMalloc(&c.d_cov, (std::size_t)L * n * 36 * sizeof(double));
-    cudaMalloc(&c.d_phi, (std::size_t)L * n * 36 * sizeof(double));
     cudaMalloc(&c.d_P0rv, (std::size_t)n * 36 * sizeof(double));
-    cudaMalloc(&c.d_Pm, (std::size_t)L * n * 36 * sizeof(double));
-    cudaMalloc(&c.d_Pp, (std::size_t)L * n * 36 * sizeof(double));
-    cudaMalloc(&c.d_PpPrev, (std::size_t)L * n * 36 * sizeof(double));
+    // d_cov/d_phi/d_Pm/d_Pp/d_PpPrev 与 d_phi_all 在长窗口（L≥8T）各占 L*n*36*8，
+    // 全部预分配会让 16T 窗口超出显存；只在用到协方差/iEKF 时按需分配。
+    cudaFree(c.d_phi_all); c.d_phi_all = nullptr;
 }
 
 // 逐帧协方差滤波（iEKF）：设置 rv 空间边界 P0；mode=1 串行（迭代 1）、mode=2 Jacobi（迭代 ≥2）。
@@ -363,14 +623,18 @@ static void set_adj_ss(py::array_t<int, py::array::c_style | py::array::forcecas
 
 static void win_cov_rv_ss(int mode) {
     Ctx &c = g_ctx;
-    if (!c.d_Pm) throw std::runtime_error("qoejopt.win_cov_rv_ss: 未先 setup_win_ss");
+    if (!c.d_P0) throw std::runtime_error("qoejopt.win_cov_rv_ss: 未先 setup_win_ss");
+    const std::size_t bP = (std::size_t)c.nfr * c.n * 36 * sizeof(double);
+    if (!c.d_Pm) cudaMalloc(&c.d_Pm, bP);
+    if (!c.d_Pp) cudaMalloc(&c.d_Pp, bP);
+    if (!c.d_PpPrev) cudaMalloc(&c.d_PpPrev, bP);
     qoejopt::ssFrameCovDevice(c, mode);
     c.cov_mode = 0;                 // 口径 A：ISL/GTS 用常数权重 1/σ（P_k 不进白化）
 }
 
 static py::array_t<double> win_Pp_ss() {
     Ctx &c = g_ctx;
-    if (!c.d_Pp) throw std::runtime_error("qoejopt.win_Pp_ss: 未先 setup_win_ss");
+    if (!c.d_Pp) throw std::runtime_error("qoejopt.win_Pp_ss: 未先 setup_win_ss / 未先 win_cov_rv_ss");
     const std::size_t sz = (std::size_t)c.nfr * c.n * 36;
     std::vector<double> h(sz);
     cudaMemcpy(h.data(), c.d_Pp, sz * sizeof(double), cudaMemcpyDeviceToHost);
@@ -409,6 +673,16 @@ static void set_prior_ss(py::array_t<double, py::array::c_style | py::array::for
     qoejopt::setPriorDevice(c, static_cast<const double *>(fac.request().ptr),
                             static_cast<const double *>(zprior.request().ptr),
                             static_cast<const double *>(P0.request().ptr));
+}
+
+static void set_beta_ss(py::array_t<double, py::array::c_style | py::array::forcecast> beta) {
+    Ctx &c = g_ctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.set_beta_ss: 未先 setup_win_ss");
+    auto b = beta.request();
+    if ((std::size_t)b.size != (std::size_t)c.n)
+        throw std::runtime_error("qoejopt.set_beta_ss: beta 需 (n,)");
+    if (c.d_beta) cudaFree(c.d_beta);
+    c.d_beta = _upload(beta);
 }
 
 static double win_assemble_ss(py::array_t<double, py::array::c_style | py::array::forcecast> X,
@@ -460,11 +734,12 @@ static double win_cached_ss(uint64_t Aval_ptr, uint64_t b_ptr) {
 
 static py::tuple win_cov_ss(py::array_t<double, py::array::c_style | py::array::forcecast> X) {
     Ctx &c = g_ctx;
-    if (!c.d_X || !c.d_cov) throw std::runtime_error("qoejopt.win_cov_ss: 未先 setup_win_ss");
+    if (!c.d_X) throw std::runtime_error("qoejopt.win_cov_ss: 未先 setup_win_ss");
     auto bx = X.request();
     if ((std::size_t)bx.size != (std::size_t)c.n * 6)
         throw std::runtime_error("qoejopt.win_cov_ss: X 需 (n,6)");
     const std::size_t sz = (std::size_t)c.nfr * c.n * 36;
+    if (!c.d_cov) cudaMalloc(&c.d_cov, sz * sizeof(double));
     std::vector<double> cov(sz);
     std::vector<double> rv((std::size_t)c.nfr * c.n * 6);
     {
@@ -1276,6 +1551,15 @@ PYBIND11_MODULE(qoejopt, m) {
         { py::gil_scoped_release rel; kep3::setRbfCuda(C, s, wv); }
     }, py::arg("centers"), py::arg("s"), py::arg("w"),
     "设定 qoejopt 侧 RBF 力场（静态库使 __constant__ 在 qoe/qoejopt 各一份，需各自设定）");
+    m.def("gts_delta_chain", &gts_delta_chain, py::arg("Z"), py::arg("D"), py::arg("M"),
+          py::arg("Qg"), py::arg("gsat"), py::arg("K"), py::arg("sigma_gts") = 19.0,
+          py::arg("iters") = 2,
+          "固定 ISL QOE 序列，所有窗加同一个 delta QOE，16T GTS 全局最小化");
+    m.def("gts_z_chain", &gts_z_chain, py::arg("Z"), py::arg("D"), py::arg("M"),
+          py::arg("Qg"), py::arg("gsat"), py::arg("K"), py::arg("sigma_gts") = 19.0,
+          py::arg("sigma_dyn") = 10.0, py::arg("iters") = 2, py::arg("sigma_p") = 1e4,
+          py::arg("mode") = 2,
+          "16T QOE0 链 GTS 全局正规方程（mode 0=GTS off, 1=GTS only, 2=all）");
     m.def("gve_stm", &gve_stm, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
           "单步 GVE + 全动力学变分 STM：x(n,6) oe → (oef(n,6), Φ_oe(n,6,6))");
     m.def("gve_stm_ia", &gve_stm_ia, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
@@ -1364,6 +1648,8 @@ PYBIND11_MODULE(qoejopt, m) {
           "单发窗口：更新当前窗观测（结构不变）");
     m.def("set_prior_ss", &set_prior_ss, py::arg("prior_fac"), py::arg("zprior"), py::arg("P0"),
           "单发窗口：更新每星 6×6 先验（白化 P0 + 信息 A_prior/zprior）");
+    m.def("set_beta_ss", &set_beta_ss, py::arg("beta"),
+          "单发窗口：设置逐星阻力倍率 beta(n,)；缺省/不调用时 beta=1");
     m.def("win_assemble_ss", &win_assemble_ss, py::arg("X"), py::arg("rv0"), py::arg("A0"),
           py::arg("A_val_ptr"), py::arg("b_ptr"),
           "单发窗口装配：X(n,6) QOE、rv0(n,6)、A0(n,36)；单发 L 帧+STM折叠+白化装配；返回 res2");

@@ -416,8 +416,14 @@ __device__ __forceinline__ void fieldAccelKm_d_dev(const Dual6* r_km, Dual6* a3)
 // 二体+J234+阻力+RBF 的对偶版（逐式镜像 tbp_dev）
 __device__ __forceinline__ void tbp_d_dev(const Dual6* xk, double beta, Dual6* res){
     Dual6 pos0=xk[0], pos1=xk[1], pos2=xk[2];
+    const double Q0=c_pole_Q[0], Q1=c_pole_Q[1], Q2=c_pole_Q[2];
+    const double Q3=c_pole_Q[3], Q4=c_pole_Q[4], Q5=c_pole_Q[5];
+    const double Q6=c_pole_Q[6], Q7=c_pole_Q[7], Q8=c_pole_Q[8];
+    Dual6 px = d6_add(d6_add(d6_mul(d6_c(Q0),pos0), d6_mul(d6_c(Q3),pos1)), d6_mul(d6_c(Q6),pos2));
+    Dual6 py = d6_add(d6_add(d6_mul(d6_c(Q1),pos0), d6_mul(d6_c(Q4),pos1)), d6_mul(d6_c(Q7),pos2));
+    Dual6 pz = d6_add(d6_add(d6_mul(d6_c(Q2),pos0), d6_mul(d6_c(Q5),pos1)), d6_mul(d6_c(Q8),pos2));
     Dual6 r = d6_sqrt(d6_add(d6_add(d6_mul(pos0,pos0), d6_mul(pos1,pos1)), d6_mul(pos2,pos2)));
-    Dual6 z_r = d6_div(pos2, r);
+    Dual6 z_r = d6_div(pz, r);
     Dual6 z2 = d6_mul(z_r,z_r), z3=d6_mul(z2,z_r), z4=d6_mul(z3,z_r);
     Dual6 Re_r = d6_div(d6_c(RE_KM), r);
     Dual6 Re2=d6_mul(Re_r,Re_r), Re3=d6_mul(Re2,Re_r), Re4=d6_mul(Re3,Re_r);
@@ -427,21 +433,27 @@ __device__ __forceinline__ void tbp_d_dev(const Dual6* xk, double beta, Dual6* r
     Dual6 j3 = d6_mul(d6_mul(d6_c((5.0/2.0)*J3C), Re3), d6_sub(d6_mul(d6_c(3.0),z_r), d6_mul(d6_c(7.0),z3)));
     Dual6 j4 = d6_mul(d6_mul(d6_c((5.0/8.0)*J4C), Re4), d6_add(d6_sub(d6_c(3.0), d6_mul(d6_c(42.0),z2)), d6_mul(d6_c(63.0),z4)));
     Dual6 fac1 = d6_sub(d6_add(d6_add(d6_c(1.0), j2), j3), j4);
-    res[3] = d6_mul(d6_mul(cf, pos0), fac1);
-    res[4] = d6_mul(d6_mul(cf, pos1), fac1);
+    Dual6 gx = d6_mul(d6_mul(cf, px), fac1);
+    Dual6 gy = d6_mul(d6_mul(cf, py), fac1);
 
     Dual6 j2b = d6_mul(d6_mul(d6_c((3.0/2.0)*J2C), Re2), d6_sub(d6_c(3.0), d6_mul(d6_c(5.0), z2)));
     Dual6 j3b = d6_mul(d6_mul(d6_c((5.0/2.0)*J3C), Re3),
-                       d6_sub(d6_sub(d6_mul(d6_c(6.0), z_r), d6_mul(d6_c(7.0), z3)), d6_mul(d6_c(3.0/5.0), d6_div(r, pos2))));
+                       d6_sub(d6_sub(d6_mul(d6_c(6.0), z_r), d6_mul(d6_c(7.0), z3)), d6_mul(d6_c(3.0/5.0), d6_div(r, pz))));
     Dual6 j4b = d6_mul(d6_mul(d6_c((5.0/8.0)*J4C), Re4), d6_add(d6_sub(d6_c(15.0), d6_mul(d6_c(70.0),z2)), d6_mul(d6_c(63.0),z4)));
     Dual6 fac2 = d6_sub(d6_add(d6_add(d6_c(1.0), j2b), j3b), j4b);
-    res[5] = d6_mul(d6_mul(cf, pos2), fac2);
+    Dual6 gz = d6_mul(d6_mul(cf, pz), fac2);
+    res[3] = d6_add(d6_add(d6_mul(d6_c(Q0),gx), d6_mul(d6_c(Q1),gy)), d6_mul(d6_c(Q2),gz));
+    res[4] = d6_add(d6_add(d6_mul(d6_c(Q3),gx), d6_mul(d6_c(Q4),gy)), d6_mul(d6_c(Q5),gz));
+    res[5] = d6_add(d6_add(d6_mul(d6_c(Q6),gx), d6_mul(d6_c(Q7),gy)), d6_mul(d6_c(Q8),gz));
 
     res[0]=xk[3]; res[1]=xk[4]; res[2]=xk[5];
 
-    Dual6 rvx = d6_add(xk[3], d6_mul(d6_c(OMEGA_EARTH), xk[1]));
-    Dual6 rvy = d6_sub(xk[4], d6_mul(d6_c(OMEGA_EARTH), xk[0]));
-    Dual6 rvz = xk[5];
+    const double wx = OMEGA_EARTH*c_pole[0];
+    const double wy = OMEGA_EARTH*c_pole[1];
+    const double wz = OMEGA_EARTH*c_pole[2];
+    Dual6 rvx = d6_sub(xk[3], d6_sub(d6_mul(d6_c(wy),xk[2]), d6_mul(d6_c(wz),xk[1])));
+    Dual6 rvy = d6_sub(xk[4], d6_sub(d6_mul(d6_c(wz),xk[0]), d6_mul(d6_c(wx),xk[2])));
+    Dual6 rvz = d6_sub(xk[5], d6_sub(d6_mul(d6_c(wx),xk[1]), d6_mul(d6_c(wy),xk[0])));
     Dual6 v = d6_sqrt(d6_add(d6_add(d6_mul(rvx,rvx), d6_mul(rvy,rvy)), d6_mul(rvz,rvz)));
     Dual6 rho = d6_exp(d6_mul(d6_c(-1.0/H1_KM), d6_sub(r, d6_c(RE_KM+H0_KM))));
     Dual6 dc = d6_mul(d6_mul(d6_c(-0.5*RHO_CDA_M*beta), rho), v);
@@ -1166,6 +1178,59 @@ __global__ void stmFoldGveKernel(const double *oe0, int n, int nfr, double dt, i
     }
 }
 
+// 同 stmFoldGveKernel，逐星 beta。
+__global__ void stmFoldGveBetaKernel(const double *oe0, const double *betas, int n, int nfr,
+                                     double dt, int nsub, double *d_A, double *d_phi_all, double *rv_all) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = betas[idx];
+    double y[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    double rv[6], J[18];
+    rvJac_dev(y, rv, J);
+    double Phi[6][6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Phi[a][b] = (a == b) ? 1.0 : 0.0;
+    for (int f = 0; f < nfr; ++f) {
+        double *Ao = d_A + ((size_t)f*n + idx)*18;
+        #pragma unroll
+        for (int a = 0; a < 3; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) { double s = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += J[a*6+c]*Phi[c][b]; Ao[a*6+b] = s; }
+        if (d_phi_all) {
+            double *Po = d_phi_all + ((size_t)f*n + idx)*36;
+            #pragma unroll
+            for (int a = 0; a < 36; ++a) Po[a] = ((const double*)Phi)[a];
+        }
+        if (rv_all) {
+            double *Ro = rv_all + ((size_t)f*n + idx)*6;
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) Ro[c] = rv[c];
+        }
+        if (f + 1 < nfr) {
+            double Ps[6][6];
+            gveStmStepSub_dev(y, beta, dt, nsub, Ps);
+            double Pn[6][6];
+            #pragma unroll
+            for (int a = 0; a < 6; ++a)
+                #pragma unroll
+                for (int b = 0; b < 6; ++b) { double s = 0.0;
+                    #pragma unroll
+                    for (int c = 0; c < 6; ++c) s += Ps[a][c]*Phi[c][b]; Pn[a][b] = s; }
+            #pragma unroll
+            for (int a = 0; a < 6; ++a)
+                #pragma unroll
+                for (int b = 0; b < 6; ++b) Phi[a][b] = Pn[a][b];
+            rvJac_dev(y, rv, J);
+        }
+    }
+}
+
 void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta, double *d_A) {
     const int threads = 256, blocks = (n + threads - 1) / threads;
     stmFoldGveKernel<<<blocks, threads>>>(d_oe, n, nfr, dt, 1, beta, d_A, nullptr, nullptr);
@@ -1198,6 +1263,69 @@ __global__ void gvePropagateSubKernel(const double *oe0, int n, int nfr, double 
         #pragma unroll
         for (int c = 0; c < 6; ++c) rv_all[((size_t)f*n + idx)*6 + c] = rv[c];
     }
+}
+
+// 同上，逐星阻力倍率 beta(idx)。
+__global__ void gvePropagateSubBetaKernel(const double *oe0, const double *betas, int n, int nfr,
+                                          double dt, int nsub, double *rv_all) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = betas[idx];
+    const int nsub1 = (nsub > 1 ? nsub : 1);
+    double y[6], rv[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    oe2rv_dev(y, rv);
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) rv_all[((size_t)0*n + idx)*6 + c] = rv[c];
+    for (int f = 1; f < nfr; ++f) {
+        gveStepSub_dev(y, beta, dt, nsub1);
+        oe2rv_dev(y, rv);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) rv_all[((size_t)f*n + idx)*6 + c] = rv[c];
+    }
+}
+
+// 只输出末帧 QOE 与 QOE→QOE STM（跨窗协方差传播用；避免 9T CPU 递推）。
+__global__ void gveStmLastBetaKernel(const double *oe0, const double *betas, int n, int nfr,
+                                     double dt, double *qend, double *phi_last) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = (betas != nullptr) ? betas[idx] : 1.0;
+    double y[6], Phi[6][6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Phi[a][b] = (a == b) ? 1.0 : 0.0;
+    for (int f = 0; f + 1 < nfr; ++f) {
+        double Ps[6][6];
+        gveStmStepSub_dev(y, beta, dt, 1, Ps);
+        double Pn[6][6];
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) { double ss = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) ss += Ps[a][c] * Phi[c][b]; Pn[a][b] = ss; }
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) Phi[a][b] = Pn[a][b];
+    }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) qend[6*idx + c] = y[c];
+    #pragma unroll
+    for (int a = 0; a < 36; ++a) phi_last[36*idx + a] = ((const double*)Phi)[a];
+}
+
+void gveStmLastBetaDevice(const double *d_oe, const double *d_beta, int n, int nfr, double dt,
+                          double *d_qend, double *d_phi) {
+    const int threads = 64, blocks = (n + threads - 1) / threads;
+    gveStmLastBetaKernel<<<blocks, threads>>>(d_oe, d_beta, n, nfr, dt, d_qend, d_phi);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[gveStmLastBetaDevice] %s\n", cudaGetErrorString(err));
 }
 
 }  // namespace qoejopt
@@ -1960,10 +2088,18 @@ void jointExpandDevice(Ctx &c) {
     const double t0 = _jnow();
     if (!(c.stm_mode == 1 && c.sub_steps > 1)) {    // 段级同源折叠时位置(与 rv0/A0)由 stmFoldGveKernel 一并输出
         oeJacKernel<<<blocks, threads>>>(c.d_X, c.n, c.d_rv0, c.d_A0);   // rv0/A0 设备端（免 host DACE）
-        if (c.sub_steps > 1)
-            gvePropagateSubKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0, c.d_P);
-        else
-            gvePropagateKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, 1.0, c.d_P);
+        if (c.sub_steps > 1) {
+            if (c.d_beta)
+                gvePropagateSubBetaKernel<<<blocks, threads>>>(c.d_X, c.d_beta, c.n, c.nfr,
+                                                              c.dt, c.sub_steps, c.d_P);
+            else
+                gvePropagateSubKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0, c.d_P);
+        } else {
+            if (c.d_beta)
+                gvePropagateBetaKernel<<<blocks, threads>>>(c.d_X, c.d_beta, c.n, c.nfr, c.dt, c.d_P);
+            else
+                gvePropagateKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, 1.0, c.d_P);
+        }
     }
     cudaError_t err = cudaDeviceSynchronize();
     jt_expand += _jnow() - t0;
@@ -1975,9 +2111,14 @@ void jointStmFoldDevice(Ctx &c) {
     const int threads = (c.stm_mode == 1) ? 32 : 256;   // gve 折叠：小块多 block 填满 SM
     const int blocks = (c.n + threads - 1) / threads;
     const double t0 = _jnow();
-    if (c.stm_mode == 1)
-        stmFoldGveKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0,
-                                              c.d_A, c.d_phi_all, c.d_P);
+    if (c.stm_mode == 1) {
+        if (c.d_beta)
+            stmFoldGveBetaKernel<<<blocks, threads>>>(c.d_X, c.d_beta, c.n, c.nfr, c.dt,
+                                                      c.sub_steps, c.d_A, c.d_phi_all, c.d_P);
+        else
+            stmFoldGveKernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, c.sub_steps, 1.0,
+                                                  c.d_A, c.d_phi_all, c.d_P);
+    }
     else if (c.stm_mode == 2)
         stmFoldJ2Kernel<<<blocks, threads>>>(c.d_X, c.n, c.nfr, c.dt, nullptr,
                                              c.d_A, c.d_phi_all);
