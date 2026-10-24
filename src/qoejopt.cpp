@@ -431,6 +431,38 @@ static py::tuple gve_stm(py::array_t<double, py::array::c_style | py::array::for
     return py::make_tuple(OE, PH);
 }
 
+static py::tuple gve_stm_last(py::array_t<double, py::array::c_style | py::array::forcecast> x,
+                             int nfr, double dt, py::object beta) {
+    auto buf = x.request();
+    if (buf.ndim != 2 || buf.shape[1] != 6)
+        throw std::runtime_error("qoejopt.gve_stm_last: x 需 (n,6)");
+    const std::size_t n = (std::size_t)buf.shape[0];
+    std::vector<double> hb(n, 1.0);
+    if (!beta.is_none()) {
+        auto a = beta.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        auto b = a.request();
+        if ((std::size_t)b.size != n) throw std::runtime_error("gve_stm_last: beta 需 (n,)");
+        std::memcpy(hb.data(), b.ptr, n * sizeof(double));
+    }
+    double *dx = nullptr, *db = nullptr, *dq = nullptr, *dPhi = nullptr;
+    cudaMalloc(&dx, n * 6 * sizeof(double));
+    cudaMalloc(&db, n * sizeof(double));
+    cudaMalloc(&dq, n * 6 * sizeof(double));
+    cudaMalloc(&dPhi, n * 36 * sizeof(double));
+    cudaMemcpy(dx, buf.ptr, n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+    cudaMemcpy(db, hb.data(), n * sizeof(double), cudaMemcpyHostToDevice);
+    {
+        py::gil_scoped_release rel;
+        qoejopt::gveStmLastBetaDevice(dx, db, (int)n, nfr, dt, dq, dPhi);
+    }
+    py::array_t<double> OE({(py::ssize_t)n, (py::ssize_t)6});
+    py::array_t<double> PH({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)6});
+    cudaMemcpy(OE.mutable_data(), dq, n * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(PH.mutable_data(), dPhi, n * 36 * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaFree(dx); cudaFree(db); cudaFree(dq); cudaFree(dPhi);
+    return py::make_tuple(OE, PH);
+}
+
 static py::tuple gve_stm_ia(py::array_t<double, py::array::c_style | py::array::forcecast> x,
                             double dt, double beta) {
     auto buf = x.request();
@@ -1562,6 +1594,9 @@ PYBIND11_MODULE(qoejopt, m) {
           "16T QOE0 链 GTS 全局正规方程（mode 0=GTS off, 1=GTS only, 2=all）");
     m.def("gve_stm", &gve_stm, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
           "单步 GVE + 全动力学变分 STM：x(n,6) oe → (oef(n,6), Φ_oe(n,6,6))");
+    m.def("gve_stm_last", &gve_stm_last, py::arg("x"), py::arg("nfr"), py::arg("dt"),
+          py::arg("beta") = py::none(),
+          "整弧末帧 QOE 与 QOE→QOE STM：x(n,6),nfr,dt,beta(n,) → (qend(n,6),Phi(n,6,6))");
     m.def("gve_stm_ia", &gve_stm_ia, py::arg("x"), py::arg("dt"), py::arg("beta") = 1.0,
           "一阶同源 STM：Φ≈I+A·dt（A=∂f/∂oe 解析）→ (oef(n,6), Φ(n,6,6))");
     m.def("gts_weak_cuda", &gts_weak_cuda, py::arg("Q"), py::arg("D"), py::arg("M"),

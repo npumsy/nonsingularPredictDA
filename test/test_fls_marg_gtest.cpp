@@ -288,9 +288,18 @@ void ref_marg(const Case &c, std::vector<double> &Lp, std::vector<double> &Pm) {
         double w[6], V[36];
         eigh6_host(&Pm[(size_t)i * 36], w, V);
         psd_clip6_host(&Pm[(size_t)i * 36], w, V);
+        double wmx = 0.0;                       // 相对下限 wmax·1e-14，与 flsMargKernel 同步：
+        for (int a = 0; a < 6; ++a) wmx = std::max(wmx, w[a]);   // Pm 与 Lp 用同一组 floored w
+        const double wfl = std::max(wmx * 1e-14, 1e-300);
+        for (int a = 0; a < 6; ++a) w[a] = std::max(w[a], wfl);
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+                for (int k = 0; k < 6; ++k) s += V[a * 6 + k] * w[k] * V[b * 6 + k];
+                Pm[(size_t)i * 36 + a * 6 + b] = s;
+            }
         for (int a = 0; a < 6; ++a) {
-            double wa = w[a] > 1e-3 ? w[a] : 1e-3;
-            double si = 1.0 / std::sqrt(wa);
+            double si = 1.0 / std::sqrt(w[a]);
             for (int b = 0; b < 6; ++b) Lp[(size_t)i * 36 + a * 6 + b] = V[b * 6 + a] * si;
         }
     }

@@ -3482,23 +3482,109 @@ void ssCovDevice(const Ctx &c, const double *hX, double *hCov, double *hRv) {
         cudaMemcpy(hRv, c.d_P, (size_t)c.nfr * c.n * 6 * sizeof(double), cudaMemcpyDeviceToHost);
 }
 
+// ---- 全 N gauge 修正归约（固定 EKF dyn）：每区间 g=Gaᵀ(X_a−x_ref)、corr=Gb·C·g ----
+// 每 block 负责一个区间；6N 个分量的点积在 shared memory 中归约，绝不按星分块或只取对角。
+// k 上限 64（shared 2k 个 double）；Ga/Gb 行主序 (6N,k)，C 行主序 (k,k)。
+__global__ void winDynGaugeCorrKernel(const double *d_X, const double *d_xref,
+                                     const double *d_Ga, const double *d_Gb,
+                                     const double *d_C, int n, int k, double *d_corr) {
+    const int iv = blockIdx.x;
+    if (k <= 0 || k > 64) return;
+    __shared__ double sg[64];
+    __shared__ double sw[64];
+    for (int j = threadIdx.x; j < k; j += blockDim.x) sg[j] = 0.0;
+    __syncthreads();
+    const size_t off6 = (size_t)iv * (size_t)n * 6;
+    const double *Xa = d_X + off6;
+    const double *xr = d_xref + off6;
+    const double *Ga = d_Ga + off6 * (size_t)k;
+    for (int a = threadIdx.x; a < n * 6; a += blockDim.x) {
+        const double dx = Xa[a] - xr[a];
+        if (dx == 0.0) continue;
+        const double *gr = Ga + (size_t)a * k;
+        for (int j = 0; j < k; ++j) atomicAdd(&sg[j], gr[j] * dx);
+    }
+    __syncthreads();
+    const double *C = d_C + (size_t)iv * k * k;
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        double s = 0.0;
+        for (int b = 0; b < k; ++b) s += C[j * k + b] * sg[b];
+        sw[j] = s;
+    }
+    __syncthreads();
+    const double *Gb = d_Gb + off6 * (size_t)k;
+    double *co = d_corr + off6;
+    for (int a = threadIdx.x; a < n * 6; a += blockDim.x) {
+        const double *gr = Gb + (size_t)a * k;
+        double s = 0.0;
+        for (int j = 0; j < k; ++j) s += gr[j] * sw[j];
+        co[a] = s;
+    }
+}
+
+void winDynGaugeCorrDevice(const double *d_X, const double *d_xref,
+                           const double *d_Ga, const double *d_Gb, const double *d_C,
+                           int n, int L, int k, double *d_corr) {
+    if (k <= 0 || L <= 1) return;
+    if (d_X == nullptr || d_xref == nullptr || d_Ga == nullptr || d_Gb == nullptr ||
+        d_C == nullptr || d_corr == nullptr)
+        throw std::runtime_error("winDynGaugeCorrDevice: null device pointer");
+    if (k > 64)
+        throw std::runtime_error("winDynGaugeCorrDevice: k>64 不支持（shared 上限）");
+    const int blocks = L - 1;
+    winDynGaugeCorrKernel<<<blocks, 256>>>(d_X, d_xref, d_Ga, d_Gb, d_C, n, k, d_corr);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        throw std::runtime_error(std::string("winDynGaugeCorrDevice: ") +
+                                 cudaGetErrorString(err));
+}
+
+static void winPrepareDynGaugeCorr(WinCtx &c) {
+    if (c.gauge_k <= 0) return;
+    if (c.q_perstar != 2 || c.d_dyn_xref == nullptr)
+        throw std::runtime_error("winDynGaugeCorr: 仅支持固定 EKF dyn (q_perstar=2) 且需 x_ref");
+    if (c.d_gauge_corr == nullptr || c.d_gauge_Ga == nullptr || c.d_gauge_Gb == nullptr ||
+        c.d_gauge_C == nullptr)
+        throw std::runtime_error("winDynGaugeCorr: gauge_k>0 但设备缓冲为空");
+    winDynGaugeCorrDevice(c.d_X, c.d_dyn_xref, c.d_gauge_Ga, c.d_gauge_Gb, c.d_gauge_C,
+                          c.n, c.L, c.gauge_k, c.d_gauge_corr);
+}
+
 // ===================== L 节点批量窗口（每帧一节点，ncol=6NL）：帧间 dyn 连续性装配 =====================
 // 每 (k,i)，k=0..L-2：e = x_{k+1,i} - end_{k,i}（QOE 6 维）；行 = qingt·e，b=-行；
 // Jacobian 块 = qingt·[-Φ, I]（12 非零：节点 k 的 -Φ，节点 k+1 的 I）。行序 = (k,i,a)，与 _lift_struct 一致。
+// gcorr 非空时（固定 EKF 路径）：e ← e − corr_{k,i}，corr=Gb·C·(Gaᵀ(X_k−x_ref)) 已由
+// winDynGaugeCorrKernel 对整段 6N 归约；等价于 e = x_b − x_pred − (T+Gb C Gaᵀ)(x_a−x_ref)。
 __global__ void winDynAsmKernel(const double *d_X, const double *d_end, const double *d_phi,
                                 const double *qingt, int n, int L, int off_dyn, int base_b,
-                                int q_perstar, double *A_val, double *b) {
+                                int q_perstar, const double *gcorr, double *A_val, double *b) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;      // (k*n+i)
     const int nk = (L - 1) * n;
     if (idx >= nk) return;
     const int ii = idx % n;
-    const double *q = qingt + (q_perstar ? (size_t)ii * 36 : 0);   // 每星 Q 白化（否则共享 6×6）
+    const double *q = qingt + (q_perstar == 2 ? (size_t)idx * 36 :
+                               (q_perstar ? (size_t)ii * 36 : 0));// q_perstar=2: 每区间每星 Q
     const double *xnext = d_X + ((size_t)(idx + n)) * 6;        // (k+1,i)
     const double *xe = d_end + (size_t)idx * 6;
     const double *Ph = d_phi + (size_t)idx * 36;
     double e[6];
+    if (q_perstar == 2) {
+        // fixed EKF 仿射约束 r = x_{k+1} − (x_pred − Φx_ref) − Φ·x_k：
+        // end 是常量，必须显式减去 Φ·x_k（GVE 路径 end=GVE(x_k) 已含当前状态，不减）。
+        // 漏掉该项时 b ~ q·Φ·x_ref ~ 1e8，dyn 行完全压垮窗口 GN（node2+ 发散根因）。
+        const double *xk = d_X + ((size_t)idx * 6);
 #pragma unroll
-    for (int c = 0; c < 6; ++c) e[c] = xnext[c] - xe[c];
+        for (int c = 0; c < 6; ++c) {
+            double s = 0.0;
+#pragma unroll
+            for (int j = 0; j < 6; ++j) s += Ph[c * 6 + j] * xk[j];
+            e[c] = xnext[c] - xe[c] - s;
+            if (gcorr != nullptr) e[c] -= gcorr[(size_t)idx * 6 + c];
+        }
+    } else {
+#pragma unroll
+        for (int c = 0; c < 6; ++c) e[c] = xnext[c] - xe[c];
+    }
     for (int a = 0; a < 6; ++a) {
         const size_t row = (size_t)idx * 6 + a;
         double *av = A_val + off_dyn + row * 12;
@@ -3536,12 +3622,20 @@ double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const d
     const int nk = (c.L - 1) * c.n;
     double td = _now();
     if (nk > 0) {
-        if (c.d_beta != nullptr)
+        if (c.dyn_sub == 0) {
+            // fixed EKF dyn: d_end/d_phi/d_qingt already set
+        } else if (c.dyn_sub > 1)
+            gveStmSubstepsDevice(c.d_X, nk, c.n, c.dt, c.dyn_sub, c.d_end, c.d_phi,
+                                 c.d_state_sub, c.d_state_b, c.d_phi_acc,
+                                 c.d_phi_out, c.d_phi_step);
+        else if (c.d_beta != nullptr)
             gveStmDeviceGrpBeta(c.d_X, nk, c.dt, c.d_beta, c.d_end, c.d_phi);
         else
             gveStmDeviceGrp(c.d_X, nk, c.dt, 1.0, c.d_end, c.d_phi);   // 单步 φ + Φ（同一 3/8-RK4）
     }
     wt_dyn += _now() - td;
+
+    winPrepareDynGaugeCorr(c);
 
     double ta = _now();
     const int nISL = c.L * c.E, nGTS = c.L * c.G;
@@ -3557,7 +3651,7 @@ double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const d
     if (nDYN > 0)
         winDynAsmKernel<<<(nk + threads - 1) / threads, threads>>>(
             c.d_X, c.d_end, c.d_phi, c.d_qingt, c.n, c.L, c.off_dyn, nISL + nGTS,
-            c.q_perstar, A_val, b);
+            c.q_perstar, c.gauge_k > 0 ? c.d_gauge_corr : nullptr, A_val, b);
     const int ncol = c.ncol;
     if (ncol > 0 && !c.prior)
         jointDampKernel<<<(ncol + threads - 1) / threads, threads>>>(
@@ -3591,6 +3685,342 @@ double winRes2Only(WinCtx &c) {
     double h = 0.0;
     cudaMemcpy(&h, c.d_res, sizeof(double), cudaMemcpyDeviceToHost);
     wt_res2 += _now() - tr;
+    return h;
+}
+
+// 全代价线搜索：ISL/GTS/dyn/prior 都按各自白化权重累加；与 winAssembleDevice 的
+// A/b 口径一致，避免“ISL 下降但 GTS/速度变差”的步被接受。
+__global__ void winIslRes2Kernel(const double *d_rv, const int *isl_i, const int *isl_jj,
+                                 const double *isl_D, const double *isl_W, int n, int E,
+                                 int nISL, double s_isl, double *acc) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nISL) return;
+    if (isl_W[idx] <= 0.0) return;
+    const int f = idx / E;
+    const int i = isl_i[idx], j = isl_jj[idx];
+    const double *pi = d_rv + ((size_t)f * n + i) * 6;
+    const double *pj = d_rv + ((size_t)f * n + j) * 6;
+    const double d0 = pi[0] - pj[0], d1 = pi[1] - pj[1], d2 = pi[2] - pj[2];
+    const double rr = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+    const double r = rr - isl_D[idx];
+    atomicAdd(acc, isl_W[idx] * s_isl * s_isl * r * r);
+}
+
+__global__ void winGtsRes2Kernel(const double *d_rv, const int *gts_a, const double *gts_D,
+                                 const double *gts_W, const double *gts_Q, int n, int G,
+                                 int nGTS, double s_gts, double *acc) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nGTS) return;
+    if (gts_W[idx] <= 0.0) return;
+    const int f = idx / G;
+    const int a = gts_a[idx];
+    const double *p = d_rv + ((size_t)f * n + a) * 6;
+    const double *q = gts_Q + (size_t)idx * 3;
+    const double d0 = p[0] - q[0], d1 = p[1] - q[1], d2 = p[2] - q[2];
+    const double r = sqrt(d0 * d0 + d1 * d1 + d2 * d2) - gts_D[idx];
+    atomicAdd(acc, gts_W[idx] * s_gts * s_gts * r * r);
+}
+
+__global__ void winDynRes2Kernel(const double *d_X, const double *d_end, const double *d_phi,
+                                 const double *qingt, const double *gcorr,
+                                 int n, int L, int q_perstar, double *acc) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;      // (k*n+i)
+    const int nk = (L - 1) * n;
+    if (idx >= nk) return;
+    const int ii = idx % n;
+    const double *q = qingt + (q_perstar == 2 ? (size_t)idx * 36 :
+                               (q_perstar ? (size_t)ii * 36 : 0));
+    const double *xnext = d_X + ((size_t)(idx + n)) * 6;
+    const double *xe = d_end + (size_t)idx * 6;
+    double dif[6];
+    if (q_perstar == 2) {
+        // fixed EKF：r = x_{k+1} − end − Φ·x_k − corr（与 winDynAsmKernel 同口径）
+        const double *xk = d_X + ((size_t)idx * 6);
+        const double *Ph = d_phi + (size_t)idx * 36;
+#pragma unroll
+        for (int c2 = 0; c2 < 6; ++c2) {
+            double s = 0.0;
+#pragma unroll
+            for (int j = 0; j < 6; ++j) s += Ph[c2 * 6 + j] * xk[j];
+            dif[c2] = xnext[c2] - xe[c2] - s;
+            if (gcorr != nullptr) dif[c2] -= gcorr[(size_t)idx * 6 + c2];
+        }
+    } else {
+#pragma unroll
+        for (int c2 = 0; c2 < 6; ++c2) dif[c2] = xnext[c2] - xe[c2];
+    }
+    double c = 0.0;
+#pragma unroll
+    for (int a = 0; a < 6; ++a) {
+        double s = 0.0;
+#pragma unroll
+        for (int j = 0; j < 6; ++j) s += q[a * 6 + j] * dif[j];
+        c += s * s;
+    }
+    atomicAdd(acc, c);
+}
+
+__global__ void winPriorRes2Kernel(const double *d_X, const double *pri_fac, const double *zp,
+                                   int n, int pnode, double *acc) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double *x = d_X + ((size_t)pnode * n + i) * 6;
+    const double *F = pri_fac + (size_t)i * 36;
+    const double *z = zp + (size_t)i * 6;
+    double c = 0.0;
+#pragma unroll
+    for (int a = 0; a < 6; ++a) {
+        double s = 0.0;
+#pragma unroll
+        for (int j = 0; j < 6; ++j) s += F[a * 6 + j] * (z[j] - x[j]);
+        c += s * s;
+    }
+    atomicAdd(acc, c);
+}
+
+// ---- 关键帧 dyn 多子步：Φ_total = Φ_step · Φ_total，状态逐步前推 ----
+__global__ void setPhiEyeKernel(double *phi, int nk) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nk) return;
+    double *p = phi + (size_t)idx * 36;
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) p[a * 6 + b] = (a == b) ? 1.0 : 0.0;
+}
+__global__ void composePhiKernel(const double *step, const double *acc, int nk,
+                                 double *out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nk) return;
+    const double *A = step + (size_t)idx * 36;
+    const double *B = acc + (size_t)idx * 36;
+    double *C = out + (size_t)idx * 36;
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += A[a * 6 + k] * B[k * 6 + b];
+            C[a * 6 + b] = s;
+        }
+}
+void gveStmSubstepsDevice(const double *d_oe, int nk, int n, double dt, int nsub,
+                          double *d_end, double *d_phi,
+                          double *d_state_a, double *d_state_b,
+                          double *d_phi_a, double *d_phi_b, double *d_phi_step) {
+    const int nsub_eff = (nsub > 1) ? nsub : 1;
+    const size_t ns = (size_t)nk;
+    cudaGetLastError();
+    if (getenv("FLS_SUBDBG")) {
+        cudaPointerAttributes ao{}, as{};
+        cudaError_t eo = cudaPointerGetAttributes(&ao, d_oe);
+        cudaError_t es = cudaPointerGetAttributes(&as, d_state_a);
+        fprintf(stderr, "[sub] ptr oe=%p type=%d dev=%d err=%s | sa=%p type=%d dev=%d err=%s\n",
+            (void*)d_oe, (int)ao.type, ao.device, cudaGetErrorString(eo),
+            (void*)d_state_a, (int)as.type, as.device, cudaGetErrorString(es));
+    }
+    cudaError_t ec = cudaMemcpy(d_state_a, d_oe, ns * 6 * sizeof(double), cudaMemcpyDeviceToDevice);
+    if (getenv("FLS_SUBDBG")) fprintf(stderr, "[sub] copy err=%s d_oe=%p sa=%p\n",
+        cudaGetErrorString(ec), (void*)d_oe, (void*)d_state_a);
+    const int threads = 256;
+    setPhiEyeKernel<<<(ns + threads - 1) / threads, threads>>>(d_phi_a, nk);
+    if (getenv("FLS_SUBDBG")) fprintf(stderr, "[sub] eye err=%s\n", cudaGetErrorString(cudaGetLastError()));
+    double *sa = d_state_a, *sb = d_state_b;
+    double *pa = d_phi_a, *pb = d_phi_b;
+    for (int s = 0; s < nsub_eff; ++s) {
+        gveStmDeviceGrp(sa, nk, dt / (double)nsub_eff, 1.0, sb, d_phi_step);
+        composePhiKernel<<<(ns + threads - 1) / threads, threads>>>(
+            d_phi_step, pa, nk, pb);
+        if (getenv("FLS_SUBDBG")) fprintf(stderr, "[sub] s=%d compose err=%s\n", s, cudaGetErrorString(cudaGetLastError()));
+        std::swap(sa, sb); std::swap(pa, pb);
+    }
+    cudaError_t e1 = cudaMemcpy(d_end, sa, ns * 6 * sizeof(double), cudaMemcpyDeviceToDevice);
+    cudaError_t e2 = cudaMemcpy(d_phi, pa, ns * 36 * sizeof(double), cudaMemcpyDeviceToDevice);
+    cudaError_t e3 = cudaDeviceSynchronize();
+    if (getenv("FLS_SUBDBG")) fprintf(stderr, "[sub] end mem=%s/%s sync=%s nk=%d n=%d ns=%zu\n",
+        cudaGetErrorString(e1), cudaGetErrorString(e2), cudaGetErrorString(e3), nk, n, ns);
+}
+
+__device__ __forceinline__ void eigh6_sym(const double *A, double *w, double *V);
+// ---- 固定 EKF 区间因子：Q_eff = P_pred - Phi P_prev Phi^T，q=chol(Q_eff)^-T ----
+__global__ void ekfDynFactorKernel(const double *xref, const double *xpred, const double *phi,
+                                   const double *Pprev, const double *Ppred, int nk,
+                                   double *end, double *qout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nk) return;
+    const double *xr = xref + (size_t)idx * 6;
+    const double *xp = xpred + (size_t)idx * 6;
+    const double *Ph = phi + (size_t)idx * 36;
+    const double *Pp = Pprev + (size_t)idx * 36;
+    const double *Pn = Ppred + (size_t)idx * 36;
+    double *eo = end + (size_t)idx * 6;
+    double *qo = qout + (size_t)idx * 36;
+    double PhP[36];
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += Ph[a * 6 + k] * Pp[k * 6 + b];
+            PhP[a * 6 + b] = s;
+        }
+    double Qs[36];
+    double tr = 0.0;
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double s = Pn[a * 6 + b];
+            for (int k = 0; k < 6; ++k) s -= PhP[a * 6 + k] * Ph[b * 6 + k];
+            Qs[a * 6 + b] = s;
+            tr += fabs(s);
+        }
+    double Q[36];
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            Q[a * 6 + b] = 0.5 * (Qs[a * 6 + b] + Qs[b * 6 + a]);
+            if (a == b) Q[a * 6 + b] += fmax(tr * 1e-12, 1e-12);
+        }
+    // 复合 T/P 在数值上可能给出负的 Q_eff；在 CUDA 内做对称 PSD 投影，
+    // 再 Cholesky，避免负特征值把窗口 P 变成 NaN。
+    double wq[6], Vq[36];
+    eigh6_sym(Q, wq, Vq);
+    const double qfloor = fmax(tr * 1e-12, 1e-12);
+    for (int a = 0; a < 6; ++a) wq[a] = fmax(wq[a], qfloor);
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += Vq[a * 6 + k] * wq[k] * Vq[b * 6 + k];
+            Q[a * 6 + b] = s;
+        }
+    double L[36] = {0};
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j <= i; ++j) {
+            double s = Q[i * 6 + j];
+            for (int k = 0; k < j; ++k) s -= L[i * 6 + k] * L[j * 6 + k];
+            if (i == j) L[i * 6 + j] = sqrt(fmax(s, 1e-30));
+            else L[i * 6 + j] = s / L[j * 6 + j];
+        }
+    for (int col = 0; col < 6; ++col) {
+        double y[6] = {0};
+        for (int i = 0; i < 6; ++i) {
+            double s = (i == col) ? 1.0 : 0.0;
+            for (int k = 0; k < i; ++k) s -= L[i * 6 + k] * y[k];
+            y[i] = s / L[i * 6 + i];
+        }
+        for (int i = 0; i < 6; ++i) qo[i * 6 + col] = y[i];
+    }
+    for (int a = 0; a < 6; ++a) {
+        double s = xp[a];
+        for (int k = 0; k < 6; ++k) s -= Ph[a * 6 + k] * xr[k];
+        eo[a] = s;
+    }
+}
+
+__global__ void ekfDynQeffKernel(const double *xref, const double *xpred, const double *phi,
+                                 const double *qeff, int nk, double *end, double *qout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= nk) return;
+    const double *xr = xref + (size_t)idx * 6;
+    const double *xp = xpred + (size_t)idx * 6;
+    const double *Ph = phi + (size_t)idx * 36;
+    const double *Qin = qeff + (size_t)idx * 36;
+    double *eo = end + (size_t)idx * 6;
+    double *qo = qout + (size_t)idx * 36;
+    double Q[36];
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b)
+            Q[a * 6 + b] = 0.5 * (Qin[a * 6 + b] + Qin[b * 6 + a]);
+    double w[6], Vv[36];
+    eigh6_sym(Q, w, Vv);
+    double wmx = 0.0;                                        // 相对下限 wmax·1e-14，同 fls_win 口径
+    for (int a = 0; a < 6; ++a) wmx = fmax(wmx, w[a]);
+    const double wfl = fmax(wmx * 1e-14, 1e-300);
+    for (int a = 0; a < 6; ++a) w[a] = fmax(w[a], wfl);
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += Vv[a * 6 + k] * w[k] * Vv[b * 6 + k];
+            Q[a * 6 + b] = s;
+        }
+    double L[36] = {0};
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j <= i; ++j) {
+            double s = Q[i * 6 + j];
+            for (int k = 0; k < j; ++k) s -= L[i * 6 + k] * L[j * 6 + k];
+            if (i == j) L[i * 6 + j] = sqrt(fmax(s, 1e-30));
+            else L[i * 6 + j] = s / L[j * 6 + j];
+        }
+    for (int col = 0; col < 6; ++col) {
+        double y[6] = {0};
+        for (int i = 0; i < 6; ++i) {
+            double s = (i == col) ? 1.0 : 0.0;
+            for (int k = 0; k < i; ++k) s -= L[i * 6 + k] * y[k];
+            y[i] = s / L[i * 6 + i];
+        }
+        for (int i = 0; i < 6; ++i) qo[i * 6 + col] = y[i];
+    }
+    for (int a = 0; a < 6; ++a) {
+        double s = xp[a];
+        for (int k = 0; k < 6; ++k) s -= Ph[a * 6 + k] * xr[k];
+        eo[a] = s;
+    }
+}
+
+void ekfDynQeffDevice(const double *d_xref, const double *d_xpred, const double *d_phi,
+                      const double *d_qeff, int nk, int n,
+                      double *d_end, double *d_q) {
+    const int threads = 256, blocks = (nk * n + threads - 1) / threads;
+    ekfDynQeffKernel<<<blocks, threads>>>(d_xref, d_xpred, d_phi, d_qeff, nk * n, d_end, d_q);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[ekfDynQeff] %s\n", cudaGetErrorString(err));
+}
+
+void ekfDynFactorDevice(const double *d_xref, const double *d_xpred, const double *d_phi,
+                        const double *d_Pprev, const double *d_Ppred, int nk, int n,
+                        double *d_end, double *d_q) {
+    const int threads = 256, blocks = (nk * n + threads - 1) / threads;
+    ekfDynFactorKernel<<<blocks, threads>>>(d_xref, d_xpred, d_phi, d_Pprev, d_Ppred,
+                                            nk * n, d_end, d_q);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[ekfDynFactor] %s\n", cudaGetErrorString(err));
+}
+
+double winTotalCostDevice(WinCtx &c, const double *d_pri_fac, const double *d_zp,
+                          int prior_on, int prior_node) {
+    using clk = std::chrono::steady_clock;
+    auto _now = [] { return std::chrono::duration<double>(clk::now().time_since_epoch()).count(); };
+    const double t0 = _now();
+    const int threads = 256;
+    const int nk = (c.L - 1) * c.n;
+    if (nk > 0) {
+        if (c.dyn_sub == 0) {
+            // fixed EKF dyn: d_end/d_phi/d_qingt already set
+        } else if (c.dyn_sub > 1)
+            gveStmSubstepsDevice(c.d_X, nk, c.n, c.dt, c.dyn_sub, c.d_end, c.d_phi,
+                                 c.d_state_sub, c.d_state_b, c.d_phi_acc,
+                                 c.d_phi_out, c.d_phi_step);
+        else if (c.d_beta != nullptr)
+            gveStmDeviceGrpBeta(c.d_X, nk, c.dt, c.d_beta, c.d_end, c.d_phi);
+        else
+            gveStmDeviceGrp(c.d_X, nk, c.dt, 1.0, c.d_end, c.d_phi);
+    }
+    winPrepareDynGaugeCorr(c);
+    cudaMemset(c.d_res, 0, sizeof(double));
+    const int nISL = c.L * c.E, nGTS = c.L * c.G;
+    if (nISL > 0)
+        winIslRes2Kernel<<<(nISL + threads - 1) / threads, threads>>>(
+            c.d_rv, c.d_isl_i, c.d_isl_jj, c.d_isl_D, c.d_isl_W, c.n, c.E, nISL,
+            c.s_isl, c.d_res);
+    if (nGTS > 0)
+        winGtsRes2Kernel<<<(nGTS + threads - 1) / threads, threads>>>(
+            c.d_rv, c.d_gts_a, c.d_gts_D, c.d_gts_W, c.d_gts_Q, c.n, c.G, nGTS,
+            c.s_gts, c.d_res);
+    if (nk > 0)
+        winDynRes2Kernel<<<(nk + threads - 1) / threads, threads>>>(
+            c.d_X, c.d_end, c.d_phi, c.d_qingt,
+            c.gauge_k > 0 ? c.d_gauge_corr : nullptr,
+            c.n, c.L, c.q_perstar, c.d_res);
+    if (prior_on && d_pri_fac && d_zp && prior_node >= 0 && prior_node < c.L)
+        winPriorRes2Kernel<<<(c.n + threads - 1) / threads, threads>>>(
+            c.d_X, d_pri_fac + (size_t)prior_node * c.n * 36,
+            d_zp + (size_t)prior_node * c.n * 6, c.n, prior_node, c.d_res);
+    cudaDeviceSynchronize();
+    double h = 0.0;
+    cudaMemcpy(&h, c.d_res, sizeof(double), cudaMemcpyDeviceToHost);
+    wt_res2 += _now() - t0;
     return h;
 }
 
@@ -3799,6 +4229,25 @@ __device__ __forceinline__ void eigh6_sym(const double *A, double *w, double *V)
         for (int j = 0; j < 6; ++j) V[i * 6 + j] = v[i][j];
     }
 }
+// clip + 相对下限 wmax·1e-14，并用同一组 w 重构 P=VwVᵀ 与白化 Lp（行 a = w_a^{-1/2}·eigvec_aᵀ）。
+// P 与 LpᵀLp 必须严格互逆：否则 T/Pprev/Ppred/Qeff 与下一帧先验行不同源，
+// Qeff=Ppred−T·Pprev·Tᵀ 的负特征值会随复合区间放大（1T 实测 λmin ~ −1e12）。
+__device__ __forceinline__ void psd_floor_recon6(double *P, double *w, double *V, double *Lp) {
+    double wmax = 0.0;
+    for (int a = 0; a < 6; ++a) { w[a] = fmax(w[a], 0.0); wmax = fmax(wmax, w[a]); }
+    const double wfl = fmax(wmax * 1e-14, 1e-300);
+    for (int a = 0; a < 6; ++a) w[a] = fmax(w[a], wfl);
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += V[a * 6 + k] * w[k] * V[b * 6 + k];
+            P[a * 6 + b] = s;
+        }
+    for (int a = 0; a < 6; ++a) {
+        double si = 1.0 / sqrt(w[a]);
+        for (int b = 0; b < 6; ++b) Lp[a * 6 + b] = V[b * 6 + a] * si;
+    }
+}
 __device__ __forceinline__ void psd_clip6(double *P, double *w, double *V) {
     double wmax = 0.0;
 #pragma unroll
@@ -3902,16 +4351,14 @@ __global__ void flsMargKernel(const double *A_val, const double *sc,
     for (int a = 0; a < 6; ++a)
 #pragma unroll
         for (int b = 0; b < 6; ++b) P[a * 6 + b] = 0.5 * (P[a * 6 + b] + P[b * 6 + a]);
-    double w[6], Vv[36]; eigh6_sym(P, w, Vv); psd_clip6(P, w, Vv);
+    double w[6], Vv[36]; eigh6_sym(P, w, Vv);
+    double Lpl[36];
+    psd_floor_recon6(P, w, Vv, Lpl);           // Pm 与 Lp 同一组 floored w，严格互逆
 #pragma unroll
-    for (int a = 0; a < 6; ++a) {
-        double wa = w[a] > 1e-3 ? w[a] : 1e-3;
-        double si = 1.0 / sqrt(wa);
-#pragma unroll
-        for (int b = 0; b < 6; ++b) Lp[(size_t)i * 36 + a * 6 + b] = Vv[b * 6 + a] * si;
+    for (int a = 0; a < 36; ++a) {
+        Lp[(size_t)i * 36 + a] = Lpl[a];
+        Pm[(size_t)i * 36 + a] = P[a];
     }
-#pragma unroll
-    for (int a = 0; a < 36; ++a) Pm[(size_t)i * 36 + a] = P[a];
 }
 void flsMargDevice(const double *d_Aval, const double *d_sc,
                    const int64_t *d00_p, const int64_t *d00_s, const int64_t *d00_c,
@@ -4103,22 +4550,34 @@ void flsCouplingDevice(const double *d_Aval, const double *d_sc, int n, int m, i
     if (err != cudaSuccess) fprintf(stderr, "[flsCouplingDevice] %s\n", cudaGetErrorString(err));
 }
 
-// ===================== FLS L=1（EKF 式单帧交接） =====================
-// P⁺,ii = (prior+ISL+GTS)⁻¹（scaled→物理）→ P⁻ = ΦP⁺Φᵀ + Q → Lp = chol⁻ᵀ(P⁻)（特征值下限 1e-3，同 P1' 口径）。
-__global__ void flsEkfHandoffKernel(const double *A_val, const double *sc,
-                                    const int64_t *p00, const int64_t *s00, const int64_t *c00,
-                                    const double *phi, const double *linv, int n,
-                                    double *Lp, double *Pm) {
+// ===================== FLS L=1（EKF 式单帧交接，固定每星缩放空间） =====================
+// QOE 混合量纲（a[m] vs 角度[rad]）下 cond(P)~1e14，直接在原空间做 Joseph/inv6 的
+// 消元噪声（eps·‖J‖²·‖P‖）会淹没角度方向协方差，T 链与 P 链随之脱钩
+// （1T 实测 Qeff λmin ~ −2.7e12 的根因）。因此全部协方差运算在固定缩放空间
+// P_s = D⁻¹PD⁻¹ 中进行（D=diag(d)，d=√diag(P0)，由 set_P_init 冻结，全程不变）：
+//   信息形式：P⁺_s = (Λp_s+O_s)⁻¹，J_s = P⁺_s·Λp_s（== I−P⁺_sO_s，与 GN 敏感性严格同源）；
+//   P⁻_s = Φ_sP⁺_sΦ_sᵀ + Q_s（Φ_s=D⁻¹ΦD、Q_s=D⁻¹QD⁻¹），特征值相对下限，Pm_s/Lp_s 严格互逆；
+//   输出折回 QOE：Pm/Pplus=D(·)D、Lp=Lp_s·D⁻¹（LpᵀLp=Pm⁻¹）、KH=I−D⁻¹J_sD。
+__global__ void flsEkfHandoffKernel(const double *A_val,
+                                    const int64_t *p00, const int64_t *s00,
+                                    const double *phi, const double *linv, const double *P0,
+                                    const double *dscale,
+                                    int n, double *Lp, double *Pm, double *Pplus, double *KH) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
-    double L00[36];
+    double d6[6];
 #pragma unroll
-    for (int a = 0; a < 36; ++a) L00[a] = 0.0;
-    for (int64_t q = p00[i]; q < p00[i + 1] - 1; ++q) {   // 末条为 dyn(0→1)（L=1 无该行）→ 跳过
+    for (int c = 0; c < 6; ++c) d6[c] = (dscale != nullptr) ? dscale[(size_t)i * 6 + c] : 1.0;
+    // Λp_s（prior：d00 前 6 行）与总信息 Λ_s（含 ISL/GTS；末条 L=1 占位行跳过）
+    double Lps[36], L00[36];
+#pragma unroll
+    for (int a = 0; a < 36; ++a) Lps[a] = L00[a] = 0.0;
+    for (int64_t q = p00[i]; q < p00[i + 1] - 1; ++q) {
         double v[6];
 #pragma unroll
-        for (int c = 0; c < 6; ++c) v[c] = A_val[s00[q] + c] * sc[c00[q] + c];
+        for (int c = 0; c < 6; ++c) v[c] = A_val[s00[q] + c] * d6[c];
         outer6_add(L00, v);
+        if (q < p00[i] + 6) outer6_add(Lps, v);
     }
     {
         double tr = 0.0;
@@ -4126,15 +4585,12 @@ __global__ void flsEkfHandoffKernel(const double *A_val, const double *sc,
         for (int a = 0; a < 6; ++a) tr += L00[a * 6 + a];
         const double eps = fmax(tr * 1e-12, 1e-30);
 #pragma unroll
-        for (int a = 0; a < 6; ++a) L00[a * 6 + a] += eps;
+        for (int a = 0; a < 6; ++a) { L00[a * 6 + a] += eps; Lps[a * 6 + a] += eps; }
     }
-    double Ps[36], P[36];
-    inv6(L00, Ps);
-#pragma unroll
-    for (int a = 0; a < 6; ++a)
-#pragma unroll
-        for (int b = 0; b < 6; ++b) P[a * 6 + b] = Ps[a * 6 + b] * sc[i * 6 + a] * sc[i * 6 + b];
-    double Qt[36], Q[36];                                  // Q = Linv⁻¹ Linv⁻ᵀ
+    double Ps[36], Js[36];
+    inv6(L00, Ps);                                        // P⁺_s
+    mm6_dev(Ps, Lps, Js);                                 // J_s = P⁺_s·Λp_s
+    double Qt[36], Qs[36];                                // Q_s = D⁻¹(Linv⁻¹Linv⁻ᵀ)D⁻¹
     inv6(linv + (size_t)i * 36, Qt);
 #pragma unroll
     for (int a = 0; a < 6; ++a)
@@ -4142,43 +4598,121 @@ __global__ void flsEkfHandoffKernel(const double *A_val, const double *sc,
         for (int b = 0; b < 6; ++b) {
             double s = 0.0;
             for (int c = 0; c < 6; ++c) s += Qt[a * 6 + c] * Qt[b * 6 + c];
-            Q[a * 6 + b] = s;
+            Qs[a * 6 + b] = s / (d6[a] * d6[b]);
         }
-    double Pn[36];                                         // P⁻ = ΦPΦᵀ + Q
+    double Phs[36], TP[36], Pn[36];                       // P⁻_s = Φ_sP⁺_sΦ_sᵀ + Q_s
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b)
+            Phs[a * 6 + b] = phi[(size_t)i * 36 + a * 6 + b] * d6[b] / d6[a];
+    mm6_dev(Phs, Ps, TP);
 #pragma unroll
     for (int a = 0; a < 6; ++a)
 #pragma unroll
         for (int b = 0; b < 6; ++b) {
             double s = 0.0;
-            for (int p = 0; p < 6; ++p)
-                for (int q = 0; q < 6; ++q)
-                    s += phi[(size_t)i * 36 + a * 6 + p] * P[p * 6 + q] *
-                         phi[(size_t)i * 36 + b * 6 + q];
-            Pn[a * 6 + b] = s + Q[a * 6 + b];
+            for (int c = 0; c < 6; ++c) s += TP[a * 6 + c] * Phs[b * 6 + c];
+            Pn[a * 6 + b] = s + Qs[a * 6 + b];
         }
 #pragma unroll
     for (int a = 0; a < 6; ++a)
 #pragma unroll
         for (int b = 0; b < 6; ++b) Pn[a * 6 + b] = 0.5 * (Pn[a * 6 + b] + Pn[b * 6 + a]);
-    double w[6], Vv[36];
-    eigh6_sym(Pn, w, Vv); psd_clip6(Pn, w, Vv);
+    bool bad = false;
+    for (int a = 0; a < 36; ++a) if (!isfinite(Pn[a])) bad = true;
+    if (bad) {
 #pragma unroll
-    for (int a = 0; a < 6; ++a) {
-        double wa = w[a] > 1e-3 ? w[a] : 1e-3;
-        double si = 1.0 / sqrt(wa);
+        for (int a = 0; a < 6; ++a)
 #pragma unroll
-        for (int b = 0; b < 6; ++b) Lp[(size_t)i * 36 + a * 6 + b] = Vv[b * 6 + a] * si;
+            for (int b = 0; b < 6; ++b)
+                Pn[a * 6 + b] = P0[(size_t)i * 36 + a * 6 + b] / (d6[a] * d6[b]);
     }
+    double w[6], Vv[36], Lps_out[36];
+    eigh6_sym(Pn, w, Vv);
+    psd_floor_recon6(Pn, w, Vv, Lps_out);                 // 相对下限；Pm_s 与 Lp_s 严格互逆
 #pragma unroll
-    for (int a = 0; a < 36; ++a) Pm[(size_t)i * 36 + a] = Pn[a];
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b) {
+            const size_t o = (size_t)i * 36 + a * 6 + b;
+            Pm[o] = Pn[a * 6 + b] * d6[a] * d6[b];
+            Pplus[o] = Ps[a * 6 + b] * d6[a] * d6[b];
+            Lp[o] = Lps_out[a * 6 + b] / d6[b];
+            // J_qoe = D·J_s·D⁻¹（状态映射与协方差变换 P_s=D⁻¹PD⁻¹ 互为逆变换）
+            KH[o] = (a == b ? 1.0 : 0.0) - Js[a * 6 + b] * d6[a] / d6[b];
+        }
 }
-void flsEkfHandoffDevice(const double *d_Aval, const double *d_sc,
-                         const int64_t *d00_p, const int64_t *d00_s, const int64_t *d00_c,
-                         const double *d_phi, const double *d_linv, int n,
-                         double *d_Lp, double *d_Pm) {
+// L=1 关键帧 skip 更新：不经过 A/GN；P⁻_s = Φ_sP_sΦ_sᵀ + Q_s（缩放空间），输出折回 QOE。
+__global__ void flsEkfPredKernel(const double *P0, const double *phi, const double *linv,
+                                 const double *dscale, int n, double *Lp, double *Pm) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double d6[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) d6[c] = (dscale != nullptr) ? dscale[(size_t)i * 6 + c] : 1.0;
+    double P[36], Pn[36], Qt[36], Qs[36];
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b)
+            P[a * 6 + b] = P0[(size_t)i * 36 + a * 6 + b] / (d6[a] * d6[b]);
+    inv6(linv + (size_t)i * 36, Qt);
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b) {
+            double ss = 0.0;
+            for (int c = 0; c < 6; ++c) ss += Qt[a * 6 + c] * Qt[b * 6 + c];
+            Qs[a * 6 + b] = ss / (d6[a] * d6[b]);
+        }
+    double Phs[36], TP[36];
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b)
+            Phs[a * 6 + b] = phi[(size_t)i * 36 + a * 6 + b] * d6[b] / d6[a];
+    mm6_dev(Phs, P, TP);
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int b = 0; b < 6; ++b) {
+            double ss = 0.0;
+            for (int c = 0; c < 6; ++c) ss += TP[a * 6 + c] * Phs[b * 6 + c];
+            Pn[a * 6 + b] = ss + Qs[a * 6 + b];            // 标准 EKF：P⁻ = ΦPΦᵀ + Q（不减半）
+        }
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < a; ++b) {
+            double ss = 0.5 * (Pn[a * 6 + b] + Pn[b * 6 + a]);
+            Pn[a * 6 + b] = Pn[b * 6 + a] = ss;
+        }
+    double w[6], Vv[36], Lps[36];
+    eigh6_sym(Pn, w, Vv);
+    psd_floor_recon6(Pn, w, Vv, Lps);          // Pm_s 与 Lp_s 同一组 floored w，严格互逆
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            const size_t o = (size_t)i * 36 + a * 6 + b;
+            Pm[o] = Pn[a * 6 + b] * d6[a] * d6[b];
+            Lp[o] = Lps[a * 6 + b] / d6[b];
+        }
+}
+void flsEkfPredDevice(const double *d_P0, const double *d_phi, const double *d_linv,
+                      const double *d_scale, int n, double *d_Lp, double *d_Pm) {
     const int threads = 256, blocks = (n + threads - 1) / threads;
-    flsEkfHandoffKernel<<<blocks, threads>>>(d_Aval, d_sc, d00_p, d00_s, d00_c, d_phi, d_linv, n,
-                                             d_Lp, d_Pm);
+    flsEkfPredKernel<<<blocks, threads>>>(d_P0, d_phi, d_linv, d_scale, n, d_Lp, d_Pm);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[flsEkfPredDevice] %s\n", cudaGetErrorString(err));
+}
+
+void flsEkfHandoffDevice(const double *d_Aval,
+                         const int64_t *d00_p, const int64_t *d00_s, const int64_t *d00_c,
+                         const double *d_phi, const double *d_linv, const double *d_P0,
+                         const double *d_scale,
+                         int n, double *d_Lp, double *d_Pm, double *d_Pplus, double *d_KH) {
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    (void)d00_c;
+    flsEkfHandoffKernel<<<blocks, threads>>>(d_Aval, d00_p, d00_s, d_phi, d_linv,
+                                             d_P0, d_scale, n, d_Lp, d_Pm, d_Pplus, d_KH);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) fprintf(stderr, "[flsEkfHandoffDevice] %s\n", cudaGetErrorString(err));
 }
@@ -4856,6 +5390,165 @@ void winAssembleBatchDevice(const WinBatchCtx &c) {
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess)
         throw std::runtime_error(std::string("winAssembleBatchDevice: ") + cudaGetErrorString(err));
+}
+
+
+// ===================== FLS 局部 r=1/r=2 Schur（78×78 上限） =====================
+// 输入（均为 n 个局部块）：
+//   H00 (m×m): 帧 0 块信息；H01 (m×m): 帧 0→1 耦合；H11 (m×m): 帧 1 块信息。
+// 输出 Pm (n,6,6)：目标星（局部 0..5）在帧 1 的边缘协方差，
+//   S = H11 − H01ᵀ H00⁻¹ H01，Pm = (S⁻¹)[0:6,0:6]。
+// 注意：不是 inv(H11 − Dᵀ H00⁻¹ D) 的 6×6 版本；帧 1 其余节点的相关性必须经 S⁻¹ 保留。
+#define FLS_LOCAL_MAXM 78
+__global__ void flsLocalSchurKernel(const double *H00, const double *H01, const double *H11,
+                                    int n, int m, double *Pm, double *Sg, double *Xg,
+                                    double *Pg) {
+    const int s = blockIdx.x;
+    if (s >= n) return;
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    const size_t st = (size_t)s * m * m;
+    double *S = Sg + st;            // H00 → L → Schur S → L
+    double *X = Xg + st;            // H00⁻¹ H01
+    double *Y = Pg + (size_t)s * m * 6;   // S⁻¹ 的前 6 列
+    for (int q = tid; q < m * m; q += nt) {
+        S[q] = H00[st + q];
+        X[q] = H01[st + q];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        double tr = 0.0;
+        for (int a = 0; a < m; ++a) tr += S[a * m + a];
+        const double eps = fmax(tr * 1e-12, 1e-30);
+        for (int a = 0; a < m; ++a) S[a * m + a] += eps;
+    }
+    __syncthreads();
+    // Cholesky（下三角，就地）
+    for (int k = 0; k < m; ++k) {
+        if (tid == 0) {
+            double v = S[k * m + k];
+            for (int p = 0; p < k; ++p) v -= S[k * m + p] * S[k * m + p];
+            S[k * m + k] = sqrt(fmax(v, 1e-300));
+        }
+        __syncthreads();
+        for (int i = k + 1 + tid; i < m; i += nt) {
+            double v = S[i * m + k];
+            for (int p = 0; p < k; ++p) v -= S[i * m + p] * S[k * m + p];
+            S[i * m + k] = v / S[k * m + k];
+        }
+        __syncthreads();
+    }
+    // X = H00⁻¹ H01（逐列前代/回代）
+    for (int c = tid; c < m; c += nt) {
+        for (int i = 0; i < m; ++i) {
+            double v = X[i * m + c];
+            for (int p = 0; p < i; ++p) v -= S[i * m + p] * X[p * m + c];
+            X[i * m + c] = v / S[i * m + i];
+        }
+        for (int i = m - 1; i >= 0; --i) {
+            double v = X[i * m + c];
+            for (int p = i + 1; p < m; ++p) v -= S[p * m + i] * X[p * m + c];
+            X[i * m + c] = v / S[i * m + i];
+        }
+    }
+    __syncthreads();
+    // S = H11 − H01ᵀ X；只算上三角并镜像
+    for (int a = 0; a < m; ++a) {
+        for (int b = a + tid; b < m; b += nt) {
+            double v = H11[st + a * m + b];
+            double acc = 0.0;
+            for (int k = 0; k < m; ++k) acc += H01[st + k * m + a] * X[k * m + b];
+            v -= acc;
+            S[a * m + b] = v;
+            S[b * m + a] = v;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        double tr = 0.0;
+        for (int a = 0; a < m; ++a) tr += S[a * m + a];
+        const double eps = fmax(tr * 1e-12, 1e-30);
+        for (int a = 0; a < m; ++a) S[a * m + a] += eps;
+    }
+    __syncthreads();
+    // Cholesky S
+    for (int k = 0; k < m; ++k) {
+        if (tid == 0) {
+            double v = S[k * m + k];
+            for (int p = 0; p < k; ++p) v -= S[k * m + p] * S[k * m + p];
+            S[k * m + k] = sqrt(fmax(v, 1e-300));
+        }
+        __syncthreads();
+        for (int i = k + 1 + tid; i < m; i += nt) {
+            double v = S[i * m + k];
+            for (int p = 0; p < k; ++p) v -= S[i * m + p] * S[k * m + p];
+            S[i * m + k] = v / S[k * m + k];
+        }
+        __syncthreads();
+    }
+    // Y = S⁻¹ E6（E6 前 6 行为单位阵）
+    for (int c = tid; c < 6; c += nt) {
+        for (int i = 0; i < m; ++i) {
+            double v = (i == c) ? 1.0 : 0.0;
+            for (int p = 0; p < i; ++p) v -= S[i * m + p] * Y[p * 6 + c];
+            Y[i * 6 + c] = v / S[i * m + i];
+        }
+        for (int i = m - 1; i >= 0; --i) {
+            double v = Y[i * 6 + c];
+            for (int p = i + 1; p < m; ++p) v -= S[p * m + i] * Y[p * 6 + c];
+            Y[i * 6 + c] = v / S[i * m + i];
+        }
+    }
+    __syncthreads();
+    if (tid < 36) {
+        const int a = tid / 6, b = tid % 6;
+        Pm[(size_t)s * 36 + tid] = 0.5 * (Y[a * 6 + b] + Y[b * 6 + a]);
+    }
+}
+
+void flsLocalSchurBatchDev(const double *dH00, const double *dH01, const double *dH11,
+                           int n, int m, double *dPm) {
+    if (n <= 0) return;
+    m = min(max(m, 6), FLS_LOCAL_MAXM);
+    double *Sg = nullptr, *Xg = nullptr, *Pg = nullptr;
+    const size_t nM = (size_t)n * m * m;
+    if (cudaMalloc(&Sg, nM * sizeof(double)) != cudaSuccess ||
+        cudaMalloc(&Xg, nM * sizeof(double)) != cudaSuccess ||
+        cudaMalloc(&Pg, (size_t)n * m * 6 * sizeof(double)) != cudaSuccess) {
+        fprintf(stderr, "[flsLocalSchurBatch] cudaMalloc failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        cudaFree(Sg); cudaFree(Xg); cudaFree(Pg);
+        return;
+    }
+    (void)cudaGetLastError();
+    flsLocalSchurKernel<<<n, 128>>>(dH00, dH01, dH11, n, m, dPm, Sg, Xg, Pg);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) fprintf(stderr, "[flsLocalSchurBatch] %s\n", cudaGetErrorString(err));
+    cudaFree(Sg); cudaFree(Xg); cudaFree(Pg);
+}
+
+void flsLocalSchurBatch(const double *H00, const double *H01, const double *H11,
+                        int n, int m, double *Pm) {
+    if (n <= 0) return;
+    m = min(max(m, 6), FLS_LOCAL_MAXM);
+    const size_t nM = (size_t)n * m * m;
+    double *dH00 = nullptr, *dH01 = nullptr, *dH11 = nullptr, *dPm = nullptr;
+    if (cudaMalloc(&dH00, nM * sizeof(double)) != cudaSuccess ||
+        cudaMalloc(&dH01, nM * sizeof(double)) != cudaSuccess ||
+        cudaMalloc(&dH11, nM * sizeof(double)) != cudaSuccess ||
+        cudaMalloc(&dPm, (size_t)n * 36 * sizeof(double)) != cudaSuccess) {
+        fprintf(stderr, "[flsLocalSchurBatch] cudaMalloc failed: %s\n", cudaGetErrorString(cudaGetLastError()));
+        cudaFree(dH00); cudaFree(dH01); cudaFree(dH11); cudaFree(dPm);
+        return;
+    }
+    cudaError_t err = cudaMemcpy(dH00, H00, nM * sizeof(double), cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) err = cudaMemcpy(dH01, H01, nM * sizeof(double), cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) err = cudaMemcpy(dH11, H11, nM * sizeof(double), cudaMemcpyHostToDevice);
+    if (err == cudaSuccess) {
+        flsLocalSchurBatchDev(dH00, dH01, dH11, n, m, dPm);
+        err = cudaMemcpy(Pm, dPm, (size_t)n * 36 * sizeof(double), cudaMemcpyDeviceToHost);
+    }
+    if (err != cudaSuccess) fprintf(stderr, "[flsLocalSchurBatch] %s\n", cudaGetErrorString(err));
+    cudaFree(dH00); cudaFree(dH01); cudaFree(dH11); cudaFree(dPm);
 }
 
 }  // namespace qoejopt

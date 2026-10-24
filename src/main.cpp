@@ -23,6 +23,8 @@
 #include "kepler.h"
 #include "integrater.h"
 #include "dastates.h"
+#include "qoejopt.h"
+#include <cuda_runtime.h>
 
 using namespace Eigen;
 namespace py = pybind11;
@@ -284,6 +286,57 @@ PYBIND11_MODULE(qoe, m)
             return py::make_tuple(XF, PH);
             }, py::arg("x"), py::arg("dt"), py::arg("nthreads")=16,
             "批量单步（全动力学状态 + 解析二体 STM）：(n,6) numpy → ((n,6),(n,36))");
+
+      // EKF 快层：rv → QOE → 同源 GVE φ/Φ_oe → rv φ/Φ_rv，一次 C++/CUDA 调用。
+      m.def("ekfPredictRvFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv, double dt,
+               int nthreads) {
+            auto a = rv.request();
+            const int n = (int)(a.size / 6);
+            std::vector<Vector6d> rvs = _v6_from_np(rv, "ekfPredictRvFlat");
+            std::vector<double> oe((size_t)n * 6);
+            { py::gil_scoped_release release; rv2OEOscBatch(rvs, nthreads, oe); }
+            std::vector<Vector6d> oev(n);
+            for (int i = 0; i < n; ++i)
+                for (int c = 0; c < 6; ++c) oev[i](c) = oe[(size_t)i * 6 + c];
+            double *d_oe = nullptr, *d_oef = nullptr, *d_Phi = nullptr;
+            cudaMalloc(&d_oe, (size_t)n * 6 * sizeof(double));
+            cudaMalloc(&d_oef, (size_t)n * 6 * sizeof(double));
+            cudaMalloc(&d_Phi, (size_t)n * 36 * sizeof(double));
+            cudaMemcpy(d_oe, oe.data(), (size_t)n * 6 * sizeof(double), cudaMemcpyHostToDevice);
+            { py::gil_scoped_release release;
+              qoejopt::gveStmDeviceGrp(d_oe, n, dt, 1.0, d_oef, d_Phi); }
+            std::vector<double> oef((size_t)n * 6), phi((size_t)n * 36);
+            cudaMemcpy(oef.data(), d_oef, (size_t)n * 6 * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaMemcpy(phi.data(), d_Phi, (size_t)n * 36 * sizeof(double), cudaMemcpyDeviceToHost);
+            cudaFree(d_oe); cudaFree(d_oef); cudaFree(d_Phi);
+            std::vector<Vector6d> oefv(n);
+            for (int i = 0; i < n; ++i)
+                for (int c = 0; c < 6; ++c) oefv[i](c) = oef[(size_t)i * 6 + c];
+            std::vector<double> rvf((size_t)n * 6), Jf((size_t)n * 36), J0((size_t)n * 36);
+            { py::gil_scoped_release release;
+              noeOsc2rvBatch(oefv, nthreads, rvf);
+              noeOsc2rvJacBatch(oefv, nthreads, Jf);
+              noeOsc2rvJacBatch(oev, nthreads, J0); }
+            py::array_t<double> out_x({(py::ssize_t)n, (py::ssize_t)6});
+            py::array_t<double> out_P({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)6});
+            auto *px = out_x.mutable_data(); auto *pP = out_P.mutable_data();
+            for (int i = 0; i < n; ++i) {
+                Eigen::Matrix<double, 6, 6> Jf_m, J0_m, Ph;
+                for (int r = 0; r < 6; ++r)
+                    for (int c = 0; c < 6; ++c) {
+                        Jf_m(r, c) = Jf[(size_t)i * 36 + r * 6 + c];
+                        J0_m(r, c) = J0[(size_t)i * 36 + r * 6 + c];
+                        Ph(r, c) = phi[(size_t)i * 36 + r * 6 + c];
+                    }
+                Eigen::Matrix<double, 6, 6> Pr = Jf_m * Ph * J0_m.inverse();
+                for (int r = 0; r < 6; ++r) {
+                    px[(size_t)i * 6 + r] = rvf[(size_t)i * 6 + r];
+                    for (int c = 0; c < 6; ++c) pP[(size_t)i * 36 + r * 6 + c] = Pr(r, c);
+                }
+            }
+            return py::make_tuple(out_x, out_P);
+            }, py::arg("x_rv"), py::arg("dt"), py::arg("nthreads") = 16);
       m.def("noeOsc2rvBatchFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nthreads){
             std::vector<Vector6d> v = _v6_from_np(oe, "noeOsc2rvBatchFlat");

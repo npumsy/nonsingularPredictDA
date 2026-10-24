@@ -193,7 +193,16 @@ struct WinCtx {
     double *d_beta = nullptr;                                  // (n,) 逐星阻力倍率；空=beta=1
     double *d_X = nullptr, *d_rv = nullptr, *d_Ap = nullptr;   // 节点 QOE / rv / ∂p/∂oe(18)
     double *d_end = nullptr, *d_phi = nullptr;                 // ((L-1)*n) 单步 φ 末态(QOE) 与 Φ_oe(36)
+    int dyn_sub = 1;                                           // 关键帧 dyn 子步数（1=单步；710s 用 710）
+    double *d_state_sub = nullptr, *d_state_b = nullptr;
+    double *d_phi_acc = nullptr, *d_phi_out = nullptr, *d_phi_step = nullptr;
     double *d_res = nullptr;
+    // 全 N gauge 修正（仅固定 EKF dyn，q_perstar=2）：每区间 Ga/Gb (6N,k)、C (k,k)。
+    // corr = Gb·C·(Gaᵀ(X_a−x_ref)) 在核内按区间整体归约；d_dyn_xref 为 (L−1,n,6)。
+    int gauge_k = 0;
+    const double *d_gauge_Ga = nullptr, *d_gauge_Gb = nullptr, *d_gauge_C = nullptr;
+    const double *d_dyn_xref = nullptr;
+    double *d_gauge_corr = nullptr;                            // (L−1,n,6) 当前 X 上的修正量
 };
 
 // 144 块同图案批量窗口装配：B 个独立 13 节点块，A/b 为 (B,nnz)/(B,nrows)；
@@ -218,10 +227,32 @@ void winAssembleBatchDevice(const WinBatchCtx &c);
 // L 节点批量窗口装配：host 传 X(L*n,6,QOE)、rv(L*n,6)、Ap(L*n,18)=∂p/∂oe；写 A_val/b(device)；返回 ISL res2。
 double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const double *hAp,
                          double *A_val, double *b);
+// 全 N gauge 修正归约：每区间 g=Gaᵀ(X_a−x_ref)（6N 全星座点积）、corr=Gb·C·g。
+// 输入 Ga/Gb (L−1,6n,k)、C (L−1,k,k)、x_ref (L−1,n,6)；输出 corr (L−1,n,6)。
+void winDynGaugeCorrDevice(const double *d_X, const double *d_xref,
+                           const double *d_Ga, const double *d_Gb, const double *d_C,
+                           int n, int L, int k, double *d_corr);
 void winResetTiming();
 std::vector<double> winGetTiming();
 // 仅算 ISL res2（线搜索用）：假定 WinCtx.d_rv 已刷新；不做 A/b 装配、不算 STM。
 double winRes2Only(WinCtx &c);
+// 全代价（ISL+GTS+dyn+prior）线搜索：需 d_X/d_rv/d_Ap 已刷新；prior_on=1 时
+// d_pri_fac=(L*n,36)、d_zp=(L*n,6)，只对 prior_node 节点计 prior 代价。
+double winTotalCostDevice(WinCtx &c, const double *d_pri_fac, const double *d_zp,
+                          int prior_on, int prior_node);
+// 关键帧 dyn 多子步：对 nk 个区间分别积分 nsub 步，复合 φ 和 Φ_oe。
+void gveStmSubstepsDevice(const double *d_oe, int nk, int n, double dt, int nsub,
+                          double *d_end, double *d_phi,
+                          double *d_state_a, double *d_state_b,
+                          double *d_phi_a, double *d_phi_b, double *d_phi_step);
+// 固定 EKF 区间因子：输入 x_ref/x_pred/Phi_q/P_prev/P_pred (nk,n,6/6/36)，
+// 输出 end = x_pred - Phi x_ref、q = chol(Q_eff)^-T，Q_eff = P_pred - Phi P_prev Phi^T。
+void ekfDynFactorDevice(const double *d_xref, const double *d_xpred, const double *d_phi,
+                        const double *d_Pprev, const double *d_Ppred, int nk, int n,
+                        double *d_end, double *d_q);
+void ekfDynQeffDevice(const double *d_xref, const double *d_xpred, const double *d_phi,
+                      const double *d_qeff, int nk, int n,
+                      double *d_end, double *d_q);
 // 全帧 consensus/锚帧 FLS 先验行：zcons/u (L,n,6) device，Lp(n,6,6) 或空，zp(n,6)。
 void winConsensusAsmDevice(const WinCtx &c, const double *d_zcons, const double *d_u,
                            const double *d_Lp, const double *d_zp, int prior_mode,
@@ -243,10 +274,17 @@ void flsCouplingDevice(const double *d_Aval, const double *d_sc, int n, int m, i
 // FLS L=1（EKF 式单帧交接）：每星 P⁺=(prior+ISL+GTS)⁻¹（scaled→物理）→ P⁻=ΦP⁺Φᵀ+Q → 白化 Lp＝chol⁻ᵀ(P⁻)。
 // d00 行表复用（prior@0+ISL@0+GTS@0+dyn），核内跳过每星最后一条（dyn(0→1)，L=1 无该行）。
 // d_phi=(n,6,6) 单步同源 Φ；d_linv=(n,6,6) 为 Q^{-1/2}（Linv = Lq⁻¹，Q=Linv⁻¹Linv⁻ᵀ）。
-void flsEkfHandoffDevice(const double *d_Aval, const double *d_sc,
+// d_scale=(n,6) 固定每星缩放 D=diag(d)（=√diag(P0)，set_P_init 冻结）：核内全部
+// 协方差运算在 P_s=D⁻¹PD⁻¹ 缩放空间做（QOE 混合量纲 cond~1e14 会让原空间运算失效），
+// 输出折回 QOE：Pm/Pplus=D·(·)·D、Lp=Lp_s·D⁻¹、KH=I−D⁻¹J_sD。
+void flsEkfHandoffDevice(const double *d_Aval,
                          const int64_t *d00_p, const int64_t *d00_s, const int64_t *d00_c,
-                         const double *d_phi, const double *d_linv, int n,
-                         double *d_Lp, double *d_Pm);
+                         const double *d_phi, const double *d_linv, const double *d_P0,
+                         const double *d_scale,
+                         int n, double *d_Lp, double *d_Pm, double *d_Pplus, double *d_KH);
+// L=1 关键帧 skip 更新：P^- = ΦPΦᵀ+Q（缩放空间），直接由 P 计算，不经过 A/GN/先验行。
+void flsEkfPredDevice(const double *d_P0, const double *d_phi, const double *d_linv,
+                      const double *d_scale, int n, double *d_Lp, double *d_Pm);
 
 // ===================== 子块内环（144 块锚帧 ΔQOE）device 常驻装配 =====================
 // 变量：仅每块 r=1 的 4 节点锚帧 ΔQOE（B×24）；中心 = 网络 dq（固定）、r2 = Q_anJ2（固定位置）。
@@ -296,6 +334,13 @@ void blkExpandDevice(BlkCtx &c, const double *hY, double *A24, double *Apar, dou
 void blkCopyRvDevice(const BlkCtx &c, double *hRvK, double *hRv4);
 // 细粒度计时（秒，累计）：[pack, cartBwd, foldBwd, cartFwd, foldFwd, asm]
 void blkResetTiming();
+// FLS 局部 Schur：H00/H01/H11 均为 (n,m,m)，输出目标星 6×6 边缘 Pm (n,6,6)
+// S = H11 − H01ᵀH00⁻¹H01，Pm = (S⁻¹)[0:6,0:6]。
+void flsLocalSchurBatch(const double *H00, const double *H01, const double *H11,
+                        int n, int m, double *Pm);
+// device 常驻版本：输入/输出都在 device（Host 装配行表后直调，避免 H2D/D2H）
+void flsLocalSchurBatchDev(const double *dH00, const double *dH01, const double *dH11,
+                           int n, int m, double *dPm);
 std::vector<double> blkGetTiming();
 
 }  // namespace qoejopt
