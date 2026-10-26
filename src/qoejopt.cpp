@@ -796,6 +796,8 @@ static void _free_wctx() {
     cudaFree(c.d_ctr); cudaFree(c.d_qingt); cudaFree(c.d_beta);
     cudaFree(c.d_X); cudaFree(c.d_rv); cudaFree(c.d_Ap);
     cudaFree(c.d_end); cudaFree(c.d_phi); cudaFree(c.d_res);
+    cudaFree(c.d_state_sub); cudaFree(c.d_state_b);
+    cudaFree(c.d_phi_acc); cudaFree(c.d_phi_out); cudaFree(c.d_phi_step);
     g_wctx = qoejopt::WinCtx{};
 }
 
@@ -829,6 +831,20 @@ static void setup_win(int n, int L, int E, int G, int ncol, int nnz, int nrows,
     cudaMalloc(&c.d_X, bRv); cudaMalloc(&c.d_rv, bRv); cudaMalloc(&c.d_Ap, bAp);
     cudaMalloc(&c.d_end, bEnd); cudaMalloc(&c.d_phi, bEnd * 6);
     cudaMalloc(&c.d_res, sizeof(double));
+}
+
+static void set_win_substeps(int64_t sub) {
+    qoejopt::WinCtx &c = g_wctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.set_win_substeps: 未先 setup_win");
+    c.dyn_sub = int(std::max<int64_t>(1, sub));
+    if (c.dyn_sub > 1 && !c.d_state_sub) {
+        const std::size_t nk = (std::size_t)std::max(0, c.L - 1) * c.n;
+        cudaMalloc(&c.d_state_sub, nk * 6 * sizeof(double));
+        cudaMalloc(&c.d_state_b, nk * 6 * sizeof(double));
+        cudaMalloc(&c.d_phi_acc, nk * 36 * sizeof(double));
+        cudaMalloc(&c.d_phi_out, nk * 36 * sizeof(double));
+        cudaMalloc(&c.d_phi_step, nk * 36 * sizeof(double));
+    }
 }
 
 static void set_win_beta(py::array_t<double, py::array::c_style | py::array::forcecast> beta) {
@@ -1714,6 +1730,8 @@ PYBIND11_MODULE(qoejopt, m) {
           py::arg("isl_i"), py::arg("isl_jj"), py::arg("isl_D"), py::arg("isl_W"),
           py::arg("gts_a"), py::arg("gts_D"), py::arg("gts_W"), py::arg("gts_Q"),
           py::arg("ctr"), py::arg("qingt"), "L 节点批量窗口：一次注册结构/观测到 device（prior=1 时末组为 6×6 先验行）");
+    m.def("set_win_substeps", &set_win_substeps, py::arg("sub"),
+          "L 节点批量窗口：关键帧 dyn 子步数（dt 按 sub 等分；关键帧间隔 1440 s 时用 144）");
     m.def("set_win_beta", &set_win_beta, py::arg("beta"),
           "L 节点批量窗口：设置逐星阻力倍率 beta(n,)；缺省/不调用时 beta=1");
     m.def("win_consensus_asm", &win_consensus_asm, py::arg("zcons"), py::arg("u"),

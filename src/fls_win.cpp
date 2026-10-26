@@ -12,6 +12,9 @@
 #include <limits>
 #include <string>
 #include <memory>
+#include <queue>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <Eigen/Dense>
@@ -21,6 +24,7 @@
 
 #include "dastates.h"
 #include "extlib/baspacho_solver.h"
+#include "extlib/cusolver_lu_solver.h"
 #include "kepler.h"
 #include "qoejopt.h"
 #include "fls_lists.h"
@@ -222,7 +226,7 @@ struct FlsStruct {
 static FlsStruct fls_struct_impl(int n, int L,
                                  const std::vector<int> &isl_i, const std::vector<int> &isl_j,
                                  const std::vector<int> &gts, double damp, bool prior,
-                                 int prior_node = -1) {
+                                 int prior_node = -1, int r_cross = 1) {
     FlsStruct s;
     s.n = n; s.L = L; s.E = (int)isl_i.size(); s.G = (int)gts.size();
     s.nISL = L * s.E; s.nGTS = L * s.G; s.nDYN = (L - 1) * n * 6;
@@ -280,6 +284,31 @@ static FlsStruct fls_struct_impl(int n, int L,
         for (int e = 0; e < s.E; ++e) addb(k * n + isl_i[e], k * n + isl_j[e]);
     for (int k = 1; k < L; ++k)
         for (int i = 0; i < n; ++i) addb((k - 1) * n + i, k * n + i);
+    // r_cross>=2：把同历元 ISL 图的 r 跳邻域也加入块结构，供 set_prior_cross
+    // 注入局部联合边界先验的跨星块（默认 1 = 只到 1 跳，保持旧结构）。
+    if (r_cross >= 2) {
+        std::vector<std::vector<int>> g((size_t)n);
+        for (int e = 0; e < s.E; ++e) {
+            const int a = isl_i[e], b = isl_j[e];
+            if (a != b) { g[(size_t)a].push_back(b); g[(size_t)b].push_back(a); }
+        }
+        for (int k = 0; k < L; ++k)
+            for (int u = 0; u < n; ++u) {
+                std::vector<int> dist((size_t)n, -1);
+                std::queue<int> q; q.push(u); dist[(size_t)u] = 0;
+                while (!q.empty()) {
+                    const int x = q.front(); q.pop();
+                    if (dist[(size_t)x] >= r_cross) continue;
+                    for (int y : g[(size_t)x])
+                        if (dist[(size_t)y] < 0) {
+                            dist[(size_t)y] = dist[(size_t)x] + 1;
+                            q.push(y);
+                        }
+                }
+                for (int v = 0; v < n; ++v)
+                    if (v != u && dist[(size_t)v] > 0) addb(k * n + u, k * n + v);
+            }
+    }
     s.bptrs.reserve((size_t)nblk + 1); s.bptrs.push_back(0);
     for (int i = 0; i < nblk; ++i) {
         auto &v = adj[i];
@@ -365,13 +394,13 @@ static py::dict fls_build_struct(int n, int L,
                                  py::array_t<int, py::array::c_style | py::array::forcecast> ei,
                                  py::array_t<int, py::array::c_style | py::array::forcecast> ej,
                                  py::array_t<int, py::array::c_style | py::array::forcecast> gts,
-                                 double damp, int prior_node = -1) {
+                                 double damp, int prior_node = -1, int r_cross = 1) {
     auto req_i = ei.request(); auto req_j = ej.request(); auto req_g = gts.request();
     const int *pi = static_cast<const int *>(req_i.ptr);
     const int *pj = static_cast<const int *>(req_j.ptr);
     const int *pg = static_cast<const int *>(req_g.ptr);
     std::vector<int> vi(pi, pi + req_i.size), vj(pj, pj + req_j.size), vg(pg, pg + req_g.size);
-    FlsStruct s = fls_struct_impl(n, L, vi, vj, vg, damp, true, prior_node);
+    FlsStruct s = fls_struct_impl(n, L, vi, vj, vg, damp, true, prior_node, r_cross);
     py::dict d;
     d["n"] = s.n; d["L"] = s.L; d["E"] = s.E; d["G"] = s.G;
     d["ncol"] = s.ncol; d["nrows"] = s.nrows; d["nnz"] = s.nnz;
@@ -433,12 +462,12 @@ class FlsWindow {
     FlsWindow(int n, int L, int E, int G, double dt, double sigma_isl, double sigma_gts,
               std::vector<int> isl_i, std::vector<int> isl_j, std::vector<int> gts,
               std::vector<double> Q, double damp, bool prior, int prior_node = -1,
-              int dyn_sub = 1)
+              int dyn_sub = 1, int r_cross = 1)
         : n_(n), L_(L), E_(E), G_(G), dt_(dt), sigma_isl_(sigma_isl), sigma_gts_(sigma_gts),
           isl_i_(std::move(isl_i)), isl_j_(std::move(isl_j)), gts_(std::move(gts)),
           prior_(prior), prior_node_(prior_node), dyn_sub_(dyn_sub),
-          dyn_sub_cfg_(dyn_sub > 0 ? dyn_sub : 1) {
-        S_ = fls_struct_impl(n_, L_, isl_i_, isl_j_, gts_, damp, prior_, prior_node_);
+          dyn_sub_cfg_(dyn_sub > 0 ? dyn_sub : 1), r_cross_(r_cross) {
+        S_ = fls_struct_impl(n_, L_, isl_i_, isl_j_, gts_, damp, prior_, prior_node_, r_cross_);
         // GTS→Pg 的节点范围默认全部节点 [0,L)；滑窗第二窗起由
         // set_gts_pg_node_range(L-1, L) 只让新进入的末节点贡献 G 分量。
         gts_pg_node_first_ = 0;
@@ -3543,6 +3572,797 @@ class FlsWindow {
             const double *p = xj.data_ptr<double>();
             for (int64_t a = 0; a < S_.ncol; ++a) op[a * k + j] = p[a];
         }
+        return out;
+    }
+
+    // 精确节点联合信息 Λ_node = (Σ_node)^{-1}，Σ_node 为 H^{-1} 的 node-node 块。
+    // 用 solve_multi 对单位右端做多右端求解；selected inverse 只在因子填充模式上
+    // 精确，拿不到跨星长程块。返回物理 QOE 空间的 (6n,6n) 稠密阵。
+    // 仅用于方法论验证/小窗口；6N=6912 时单次峰值约 2 GB。
+    py::array_t<double> joint_node_info(int node, double eps = 0.0) {
+        if (node < 0 || node >= L_) throw std::runtime_error("joint_node_info: node 越界");
+        assemble();
+        auto mtm = scaled_AtA_Atb();
+        const int64_t ncol = S_.ncol;
+        const int64_t q = (int64_t)n_ * 6;
+        if (q > 12288) throw std::runtime_error("joint_node_info: 6N > 12288，拒绝分配");
+        const int64_t off = (int64_t)node * q;
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        const bool cuda = torch::cuda::is_available();
+        auto sc_cpu = mtm_scl_.to(torch::kCPU).contiguous();
+
+        // scaled 单位右端：B[:, r] = D e_{off+r}
+        auto X = torch::zeros({1, q * ncol}, optsD);
+        {
+            auto xa = X.accessor<double, 2>();
+            auto sa = sc_cpu.accessor<double, 1>();
+            for (int64_t r = 0; r < q; ++r) xa[0][r * ncol + (off + r)] = sa[off + r];
+        }
+        if (cuda) {
+            X = X.to(torch::kCUDA);
+            auto Av = mtm.first.to(torch::kCUDA).contiguous();
+            auto rp = A_rp_t_.to(torch::kCUDA);
+            auto ci = A_ci_t_.to(torch::kCUDA);
+            auto nd = sym_->createNumericDecomposition(1);
+            nd.add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_(nd);
+            if (eps > 0.0) {                      // 物理对角正则（scaled: eps·sc²）
+                auto ev_cpu = torch::zeros({1, (int64_t)ncol},
+                                           torch::TensorOptions().dtype(torch::kFloat64));
+                auto sa = sc_cpu.accessor<double, 1>();
+                auto ea = ev_cpu.accessor<double, 2>();
+                for (int64_t a = 0; a < ncol; ++a) ea[0][a] = eps * sa[a] * sa[a];
+                nd.add_M(ev_cpu.to(torch::kCUDA), rp_eps_t_, ci_eps_t_);
+            }
+            nd.factor();
+            nd.solve_multi(X, q);
+        } else {
+            auto Av = mtm.first.to(torch::kCPU).contiguous();
+            auto rp = A_rp_t_.to(torch::kCPU);
+            auto ci = A_ci_t_.to(torch::kCPU);
+            auto nd = symc_->createNumericDecomposition(1);
+            nd.add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_cpu_(nd);
+            if (eps > 0.0) {
+                auto ev = torch::zeros({1, (int64_t)ncol},
+                                       torch::TensorOptions().dtype(torch::kFloat64));
+                auto sa = sc_cpu.accessor<double, 1>();
+                auto ea = ev.accessor<double, 2>();
+                for (int64_t a = 0; a < ncol; ++a) ea[0][a] = eps * sa[a] * sa[a];
+                nd.add_M(ev, rp_eps_t_.to(torch::kCPU), ci_eps_t_.to(torch::kCPU));
+            }
+            nd.factor();
+            nd.solve_multi(X, q);
+        }
+        auto Xc = X.to(torch::kCPU).contiguous();
+        const double *xp = Xc.data_ptr<double>();
+        const double *sp = sc_cpu.data_ptr<double>();
+        auto Sig = torch::zeros({q, q}, optsD);
+        {
+            auto sg = Sig.accessor<double, 2>();
+            for (int64_t r = 0; r < q; ++r)
+                for (int64_t a = 0; a < q; ++a)
+                    sg[a][r] = sp[off + a] * xp[r * ncol + (off + a)];
+        }
+        Sig = 0.5 * (Sig + Sig.transpose(0, 1));
+        torch::Tensor Lam;
+        if (cuda) {
+            auto Sg = Sig.to(torch::kCUDA);
+            Lam = torch::linalg_inv(Sg).to(torch::kCPU);
+        } else {
+            Lam = torch::linalg_inv(Sig);
+        }
+        Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+        py::array_t<double> out({(py::ssize_t)q, (py::ssize_t)q});
+        std::memcpy(out.mutable_data(), Lam.contiguous().data_ptr<double>(),
+                    sizeof(double) * (size_t)q * (size_t)q);
+        return out;
+    }
+
+    // 含过程噪声的精确信息预测：Λ⁺ = (Φ Σ Φᵀ + Q)^{-1}，Σ = Λ^{-1}。
+    // Lam (6N,6N) 物理信息；Phi/Q (n,6,6) 逐星。返回 (6N,6N) 物理信息。
+    py::array_t<double> info_predict(
+        py::array_t<double, py::array::c_style | py::array::forcecast> Lam,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Phi,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Q) {
+        auto rl = Lam.request(); auto rp = Phi.request(); auto rq = Q.request();
+        const int64_t q = (int64_t)n_ * 6;
+        if (rl.ndim != 2 || rl.shape[0] != q || rl.shape[1] != q)
+            throw std::runtime_error("info_predict: Lam 需 (6N,6N)");
+        if (rp.ndim != 3 || rp.shape[0] != n_ || rp.shape[1] != 6 || rp.shape[2] != 6)
+            throw std::runtime_error("info_predict: Phi 需 (n,6,6)");
+        if (rq.ndim != 3 || rq.shape[0] != n_ || rq.shape[1] != 6 || rq.shape[2] != 6)
+            throw std::runtime_error("info_predict: Q 需 (n,6,6)");
+        if (q > 12288) throw std::runtime_error("info_predict: 6N > 12288，拒绝分配");
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        const bool cuda = torch::cuda::is_available();
+        auto dev = cuda ? torch::kCUDA : torch::kCPU;
+        auto optsI = torch::TensorOptions().dtype(torch::kInt64).device(dev);
+        auto T = [&](const void *p, std::initializer_list<int64_t> sh) {
+            return torch::from_blob((void *)p, sh, optsD).clone().to(dev);
+        };
+        auto Lm = T(rl.ptr, {q, q});
+        auto Ph = T(rp.ptr, {n_, 6, 6});
+        auto Qm = T(rq.ptr, {n_, 6, 6});
+        auto idx = torch::arange(n_, optsI).view({n_, 1, 1});
+        auto a6 = torch::arange(6, optsI);
+        auto rr = (idx * 6 + a6.view({1, 6, 1})).expand({n_, 6, 6});
+        auto cc = (idx * 6 + a6.view({1, 1, 6})).expand({n_, 6, 6});
+        auto Pb = torch::zeros({q, q}, optsD.device(dev));
+        auto Qb = torch::zeros({q, q}, optsD.device(dev));
+        Pb.index_put_({rr, cc}, Ph);
+        Qb.index_put_({rr, cc}, Qm);
+        auto Sig = torch::linalg_inv(Lm);
+        auto Sp = Pb.matmul(Sig).matmul(Pb.transpose(0, 1)) + Qb;
+        auto Lp = torch::linalg_inv(Sp);
+        Lp = 0.5 * (Lp + Lp.transpose(0, 1));
+        auto Lc = Lp.to(torch::kCPU).contiguous();
+        py::array_t<double> out({(py::ssize_t)q, (py::ssize_t)q});
+        std::memcpy(out.mutable_data(), Lc.data_ptr<double>(),
+                    sizeof(double) * (size_t)q * (size_t)q);
+        return out;
+    }
+
+    // 局部联合信息：以 (node, center) 为心、r 跳 ISL 邻域 S，取
+    //   Σ_S = [H^{-1}]_{SS},  Λ_S = Σ_S^{-1},
+    // 返回 (center,j) 的物理信息跨块 (B,6,6) 与 bi/bj（变量号 node*n+j），
+    // 直接供 set_prior_cross 注入。S 的列用 solve_multi 求，不做全局稠密逆。
+    py::tuple local_cross_info(int node, int center, int r = 1, double eps = 0.0) {
+        if (node < 0 || node >= L_ || center < 0 || center >= n_ || r < 1)
+            throw std::runtime_error("local_cross_info: 参数越界");
+        assemble();
+        auto mtm = scaled_AtA_Atb();
+        const int64_t ncol = S_.ncol;
+        std::vector<std::vector<int>> g((size_t)n_);
+        for (int e = 0; e < E_; ++e) {
+            const int a = isl_i_[e], b = isl_j_[e];
+            if (a != b) { g[(size_t)a].push_back(b); g[(size_t)b].push_back(a); }
+        }
+        std::vector<int> dist((size_t)n_, -1);
+        std::queue<int> qu; qu.push(center); dist[(size_t)center] = 0;
+        while (!qu.empty()) {
+            const int x = qu.front(); qu.pop();
+            if (dist[(size_t)x] >= r) continue;
+            for (int y : g[(size_t)x])
+                if (dist[(size_t)y] < 0) { dist[(size_t)y] = dist[(size_t)x] + 1; qu.push(y); }
+        }
+        std::vector<int> Sset;
+        for (int i = 0; i < n_; ++i) if (dist[(size_t)i] >= 0) Sset.push_back(i);
+        const int64_t m = (int64_t)Sset.size() * 6;
+        const int64_t off = (int64_t)node * n_ * 6;
+        if (m > 12288) throw std::runtime_error("local_cross_info: 邻域太大");
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        const bool cuda = torch::cuda::is_available();
+        auto sc_cpu = mtm_scl_.to(torch::kCPU).contiguous();
+        auto X = torch::zeros({1, m * ncol}, optsD);
+        {
+            auto xa = X.accessor<double, 2>();
+            auto sa = sc_cpu.accessor<double, 1>();
+            for (int64_t rcol = 0; rcol < m; ++rcol) {
+                const int64_t a = off + (int64_t)Sset[(size_t)(rcol / 6)] * 6 + (rcol % 6);
+                xa[0][rcol * ncol + a] = sa[a];
+            }
+        }
+        auto apply_eps = [&](NumericDecomposition &nd, bool is_cuda) {
+            if (!(eps > 0.0)) return;
+            auto ev_cpu = torch::zeros({1, (int64_t)ncol}, optsD);
+            auto ea = ev_cpu.accessor<double, 2>();
+            auto sa = sc_cpu.accessor<double, 1>();
+            for (int64_t a = 0; a < ncol; ++a) ea[0][a] = eps * sa[a] * sa[a];
+            if (is_cuda) nd.add_M(ev_cpu.to(torch::kCUDA), rp_eps_t_, ci_eps_t_);
+            else nd.add_M(ev_cpu, rp_eps_t_.to(torch::kCPU), ci_eps_t_.to(torch::kCPU));
+        };
+        if (cuda) {
+            X = X.to(torch::kCUDA);
+            auto Av = mtm.first.to(torch::kCUDA).contiguous();
+            auto rp = A_rp_t_.to(torch::kCUDA);
+            auto ci = A_ci_t_.to(torch::kCUDA);
+            auto nd = sym_->createNumericDecomposition(1);
+            nd.add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_(nd);
+            apply_eps(nd, true);
+            nd.factor();
+            nd.solve_multi(X, m);
+        } else {
+            auto Av = mtm.first.to(torch::kCPU).contiguous();
+            auto rp = A_rp_t_.to(torch::kCPU);
+            auto ci = A_ci_t_.to(torch::kCPU);
+            auto nd = symc_->createNumericDecomposition(1);
+            nd.add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_cpu_(nd);
+            apply_eps(nd, false);
+            nd.factor();
+            nd.solve_multi(X, m);
+        }
+        auto Xc = X.to(torch::kCPU).contiguous();
+        const double *xp = Xc.data_ptr<double>();
+        const double *sp = sc_cpu.data_ptr<double>();
+        auto Sig = torch::zeros({m, m}, optsD);
+        {
+            auto sg = Sig.accessor<double, 2>();
+            for (int64_t rcol = 0; rcol < m; ++rcol)
+                for (int64_t arow = 0; arow < m; ++arow) {
+                    const int64_t a = off + (int64_t)Sset[(size_t)(arow / 6)] * 6 + (arow % 6);
+                    sg[arow][rcol] = sp[a] * xp[rcol * ncol + a];
+                }
+        }
+        Sig = 0.5 * (Sig + Sig.transpose(0, 1));
+        torch::Tensor Lam;
+        if (cuda) Lam = torch::linalg_inv(Sig.to(torch::kCUDA)).to(torch::kCPU);
+        else Lam = torch::linalg_inv(Sig);
+        Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+        {   // PSD 投影：局部逆在极端条件数下会出负特征值，按相对下限钳制
+            auto ev = torch::linalg_eigh(Lam);
+            auto w = std::get<0>(ev), V = std::get<1>(ev);
+            auto fl = torch::clamp_min(w.max(), 1e-300) * 1e-12;
+            w = torch::clamp_min(w, fl);
+            Lam = V.matmul(torch::diag(w)).matmul(V.transpose(0, 1));
+            Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+        }
+        const double *lp = Lam.contiguous().data_ptr<double>();
+        const int64_t cbase = (int64_t)(std::find(Sset.begin(), Sset.end(), center) - Sset.begin()) * 6;
+        std::vector<double> vals;
+        std::vector<int> bi, bj;
+        for (size_t jj = 0; jj < Sset.size(); ++jj) {
+            if (Sset[jj] == center) continue;
+            const int64_t jbase = (int64_t)jj * 6;
+            for (int a = 0; a < 6; ++a)
+                for (int b = 0; b < 6; ++b)
+                    vals.push_back(lp[(cbase + a) * m + (jbase + b)]);
+            bi.push_back(node * n_ + center);
+            bj.push_back(node * n_ + Sset[jj]);
+        }
+        const int64_t B = (int64_t)bi.size();
+        py::array_t<double> val({(py::ssize_t)B, (py::ssize_t)6, (py::ssize_t)6});
+        std::memcpy(val.mutable_data(), vals.data(), sizeof(double) * vals.size());
+        py::array_t<int> ai({(py::ssize_t)B}), aj({(py::ssize_t)B});
+        std::memcpy(ai.mutable_data(), bi.data(), sizeof(int) * bi.size());
+        std::memcpy(aj.mutable_data(), bj.data(), sizeof(int) * bj.size());
+        return py::make_tuple(val, ai, aj);
+    }
+
+    // 多中心局部联合信息的全局组装：一次分解，逐中心求 Λ_{S_r(c)}；
+    // 每个无序对 (i,j) 只由较小端点 i 的邻域提供，避免重叠重复计数。
+    // 返回 (val(B,6,6), bi(B,), bj(B,), s_g)；s_g 是 Gershgorin 收缩系数，
+    // global_shrink!=0 时把 val 乘以 s_g，保证“对角先验+跨块”严格对角占优。
+    py::tuple local_cross_info_global(int node, int r = 1, double eps = 0.0,
+                                      int global_shrink = 0) {
+        if (node < 0 || node >= L_ || r < 1)
+            throw std::runtime_error("local_cross_info_global: 参数越界");
+        assemble();
+        auto mtm = scaled_AtA_Atb();
+        const int64_t ncol = S_.ncol;
+        const int64_t off = (int64_t)node * n_ * 6;
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        const bool cuda = torch::cuda::is_available();
+        auto sc_cpu = mtm_scl_.to(torch::kCPU).contiguous();
+        std::vector<std::vector<int>> g((size_t)n_);
+        for (int e = 0; e < E_; ++e) {
+            const int a = isl_i_[e], b = isl_j_[e];
+            if (a != b) { g[(size_t)a].push_back(b); g[(size_t)b].push_back(a); }
+        }
+        auto apply_eps = [&](NumericDecomposition &nd, bool is_cuda) {
+            if (!(eps > 0.0)) return;
+            auto ev_cpu = torch::zeros({1, (int64_t)ncol}, optsD);
+            auto ea = ev_cpu.accessor<double, 2>();
+            auto sa = sc_cpu.accessor<double, 1>();
+            for (int64_t a = 0; a < ncol; ++a) ea[0][a] = eps * sa[a] * sa[a];
+            if (is_cuda) nd.add_M(ev_cpu.to(torch::kCUDA), rp_eps_t_, ci_eps_t_);
+            else nd.add_M(ev_cpu, rp_eps_t_.to(torch::kCPU), ci_eps_t_.to(torch::kCPU));
+        };
+        std::unique_ptr<NumericDecomposition> nd;
+        if (cuda) {
+            auto Av = mtm.first.to(torch::kCUDA).contiguous();
+            auto rp = A_rp_t_.to(torch::kCUDA);
+            auto ci = A_ci_t_.to(torch::kCUDA);
+            nd = std::make_unique<NumericDecomposition>(sym_->createNumericDecomposition(1));
+            nd->add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_(*nd);
+            apply_eps(*nd, true);
+        } else {
+            auto Av = mtm.first.to(torch::kCPU).contiguous();
+            auto rp = A_rp_t_.to(torch::kCPU);
+            auto ci = A_ci_t_.to(torch::kCPU);
+            nd = std::make_unique<NumericDecomposition>(symc_->createNumericDecomposition(1));
+            nd->add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_cpu_(*nd);
+            apply_eps(*nd, false);
+        }
+        nd->factor();
+
+        std::vector<double> vals;
+        std::vector<int> bi, bj;
+        std::vector<double> dvals((size_t)n_ * 36, 0.0);   // 与跨块同源的逐星对角信息
+        // 按批合并 r 跳邻域的多右端：每个中心一次 D2H 改为每批一次，
+        // 因子只建一次；CUDA 侧用一次 solve_multi 解整批 RHS。
+        const int kCenterBatch = 1;
+        const double *sp = sc_cpu.data_ptr<double>();
+        for (int c0 = 0; c0 < n_; c0 += kCenterBatch) {
+            const int c1 = std::min(n_, c0 + kCenterBatch);
+            std::vector<std::vector<int>> neigh((size_t)(c1 - c0));
+            int64_t total_m = 0;
+            for (int center = c0; center < c1; ++center) {
+                std::vector<int> dist((size_t)n_, -1);
+                std::queue<int> qu; qu.push(center); dist[(size_t)center] = 0;
+                while (!qu.empty()) {
+                    const int x = qu.front(); qu.pop();
+                    if (dist[(size_t)x] >= r) continue;
+                    for (int y : g[(size_t)x])
+                        if (dist[(size_t)y] < 0) {
+                            dist[(size_t)y] = dist[(size_t)x] + 1; qu.push(y);
+                        }
+                }
+                auto &S = neigh[(size_t)(center - c0)];
+                for (int i = 0; i < n_; ++i) if (dist[(size_t)i] >= 0) S.push_back(i);
+                total_m += (int64_t)S.size() * 6;
+            }
+            if (total_m <= 0) continue;
+            auto X = torch::zeros({1, total_m * ncol}, optsD);
+            {
+                auto xa = X.accessor<double, 2>();
+                int64_t rbase = 0;
+                for (const auto &S : neigh) {
+                    const int64_t m = (int64_t)S.size() * 6;
+                    for (int64_t rcol = 0; rcol < m; ++rcol) {
+                        const int64_t a = off + (int64_t)S[(size_t)(rcol / 6)] * 6 + (rcol % 6);
+                        xa[0][(rbase + rcol) * ncol + a] = sp[a];
+                    }
+                    rbase += m;
+                }
+            }
+            if (cuda) X = X.to(torch::kCUDA);
+            {
+                auto Xmut = X;
+                nd->solve_multi(Xmut, total_m);
+            }
+            auto Xc = X.to(torch::kCPU).contiguous();
+            const double *xp = Xc.data_ptr<double>();
+            int64_t rbase = 0;
+            for (int center = c0; center < c1; ++center) {
+                const auto &Sset = neigh[(size_t)(center - c0)];
+                if (Sset.size() < 2) { rbase += (int64_t)Sset.size() * 6; continue; }
+                const int64_t m = (int64_t)Sset.size() * 6;
+                auto Sig = torch::zeros({m, m}, optsD);
+                {
+                    auto sg = Sig.accessor<double, 2>();
+                    for (int64_t rcol = 0; rcol < m; ++rcol)
+                        for (int64_t arow = 0; arow < m; ++arow) {
+                            const int64_t a = off + (int64_t)Sset[(size_t)(arow / 6)] * 6 + (arow % 6);
+                            sg[arow][rcol] = sp[a] * xp[(rbase + rcol) * ncol + a];
+                        }
+                }
+                Sig = 0.5 * (Sig + Sig.transpose(0, 1));
+                torch::Tensor Lam;
+                if (cuda) Lam = torch::linalg_inv(Sig.to(torch::kCUDA)).to(torch::kCPU);
+                else Lam = torch::linalg_inv(Sig);
+                Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+                {   // PSD 投影（与 local_cross_info 同口径）
+                    auto ev = torch::linalg_eigh(Lam);
+                    auto w = std::get<0>(ev), V = std::get<1>(ev);
+                    auto fl = torch::clamp_min(w.max(), 1e-300) * 1e-12;
+                    w = torch::clamp_min(w, fl);
+                    Lam = V.matmul(torch::diag(w)).matmul(V.transpose(0, 1));
+                    Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+                }
+                const double *lp = Lam.contiguous().data_ptr<double>();
+                const int64_t cbase =
+                    (int64_t)(std::find(Sset.begin(), Sset.end(), center) - Sset.begin()) * 6;
+                for (int a = 0; a < 6; ++a)
+                    for (int b = 0; b < 6; ++b)
+                        dvals[(size_t)center * 36 + a * 6 + b] =
+                            lp[(cbase + a) * m + (cbase + b)];
+                for (size_t jj = 0; jj < Sset.size(); ++jj) {
+                    if (Sset[jj] <= center) continue;      // 较小端点拥有该对
+                    const int64_t jbase = (int64_t)jj * 6;
+                    for (int a = 0; a < 6; ++a)
+                        for (int b = 0; b < 6; ++b)
+                            vals.push_back(lp[(cbase + a) * m + (jbase + b)]);
+                    bi.push_back(node * n_ + center);
+                    bj.push_back(node * n_ + Sset[jj]);
+                }
+                rbase += m;
+            }
+        }
+        // Gershgorin：对角先验 A_i=Lp_i^T Lp_i 与跨块行范数 r_i，
+        // s_g=min_i 0.9 λmin(A_i)/r_i；s_g<1 时全局矩阵可能不定。
+        double s_g = 1.0;
+        if (!bi.empty()) {
+            std::vector<double> rn((size_t)n_, 0.0), lmin((size_t)n_, 0.0);
+            for (int i = 0; i < n_; ++i) {
+                Eigen::Matrix<double, 6, 6> A;
+                for (int a = 0; a < 36; ++a) A.data()[a] = dvals[(size_t)i * 36 + a];
+                A = 0.5 * (A + A.transpose());
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(A);
+                lmin[(size_t)i] = es.eigenvalues().minCoeff();
+            }
+            for (size_t q = 0; q < bi.size(); ++q) {
+                Eigen::Matrix<double, 6, 6> C;
+                for (int a = 0; a < 36; ++a) C.data()[a] = vals[q * 36 + a];
+                Eigen::JacobiSVD<Eigen::Matrix<double, 6, 6>> sv(C);
+                const double nrm = sv.singularValues()(0);
+                const int i = bi[q] - node * n_, j = bj[q] - node * n_;
+                if (i >= 0 && i < n_) rn[(size_t)i] += nrm;
+                if (j >= 0 && j < n_) rn[(size_t)j] += nrm;
+            }
+            for (int i = 0; i < n_; ++i)
+                if (rn[(size_t)i] > 0.0 && lmin[(size_t)i] > 0.0)
+                    s_g = std::min(s_g, 0.9 * lmin[(size_t)i] / rn[(size_t)i]);
+            s_g = std::max(0.0, std::min(1.0, s_g));
+            if (global_shrink)
+                for (double &v : vals) v *= s_g;
+        }
+        const int64_t B = (int64_t)bi.size();
+        py::array_t<double> val({(py::ssize_t)B, (py::ssize_t)6, (py::ssize_t)6});
+        if (B) std::memcpy(val.mutable_data(), vals.data(), sizeof(double) * vals.size());
+        py::array_t<int> ai({(py::ssize_t)B}), aj({(py::ssize_t)B});
+        if (B) {
+            std::memcpy(ai.mutable_data(), bi.data(), sizeof(int) * bi.size());
+            std::memcpy(aj.mutable_data(), bj.data(), sizeof(int) * bj.size());
+        }
+        py::array_t<double> dval({(py::ssize_t)n_, (py::ssize_t)6, (py::ssize_t)6});
+        std::memcpy(dval.mutable_data(), dvals.data(), sizeof(double) * dvals.size());
+        return py::make_tuple(val, ai, aj, s_g, dval);
+    }
+
+    // 不相交 r 跳簇的局部联合信息：贪心覆盖把星集划成互不相交的簇，
+    // 每个簇用一次多右端解取 Σ_C=[H^{-1}]_{CC}，求逆并 PSD 投影；
+    // 簇间跨块置零，组装矩阵天然块对角 PSD。返回
+    //   (val(B,6,6), bi(B,), bj(B,), diag(n,6,6), cluster_id(n,))
+    py::tuple local_cross_info_partition(int node, int r = 1, double eps = 0.0) {
+        if (node < 0 || node >= L_ || r < 1)
+            throw std::runtime_error("local_cross_info_partition: 参数越界");
+        assemble();
+        auto mtm = scaled_AtA_Atb();
+        const int64_t ncol = S_.ncol;
+        const int64_t off = (int64_t)node * n_ * 6;
+        const int64_t total_m = (int64_t)n_ * 6;
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        const bool cuda = torch::cuda::is_available();
+        auto sc_cpu = mtm_scl_.to(torch::kCPU).contiguous();
+        std::vector<std::vector<int>> g((size_t)n_);
+        for (int e = 0; e < E_; ++e) {
+            const int a = isl_i_[e], b = isl_j_[e];
+            if (a != b) { g[(size_t)a].push_back(b); g[(size_t)b].push_back(a); }
+        }
+        // 贪心划分：每个未分配中心取 r 跳邻域内未分配的星组成一个簇
+        std::vector<int> assigned((size_t)n_, -1), cid((size_t)n_, -1);
+        std::vector<std::vector<int>> clusters;
+        for (int c = 0; c < n_; ++c) {
+            if (assigned[(size_t)c] >= 0) continue;
+            std::vector<int> dist((size_t)n_, -1);
+            std::queue<int> qu; qu.push(c); dist[(size_t)c] = 0;
+            while (!qu.empty()) {
+                const int x = qu.front(); qu.pop();
+                if (dist[(size_t)x] >= r) continue;
+                for (int y : g[(size_t)x])
+                    if (dist[(size_t)y] < 0) {
+                        dist[(size_t)y] = dist[(size_t)x] + 1; qu.push(y);
+                    }
+            }
+            std::vector<int> C;
+            for (int i = 0; i < n_; ++i)
+                if (dist[(size_t)i] >= 0 && assigned[(size_t)i] < 0) C.push_back(i);
+            if (C.empty()) C.push_back(c);
+            const int id = (int)clusters.size();
+            for (int i : C) { assigned[(size_t)i] = id; cid[(size_t)i] = id; }
+            clusters.push_back(std::move(C));
+        }
+        auto apply_eps = [&](NumericDecomposition &nd, bool is_cuda) {
+            if (!(eps > 0.0)) return;
+            auto ev_cpu = torch::zeros({1, ncol}, optsD);   // add_M 需要整窗 ncol 长度
+            auto ea = ev_cpu.accessor<double, 2>();
+            auto sa = sc_cpu.accessor<double, 1>();
+            for (int64_t a = 0; a < ncol; ++a) ea[0][a] = eps * sa[a] * sa[a];
+            if (is_cuda) nd.add_M(ev_cpu.to(torch::kCUDA), rp_eps_t_, ci_eps_t_);
+            else nd.add_M(ev_cpu, rp_eps_t_.to(torch::kCPU), ci_eps_t_.to(torch::kCPU));
+        };
+        std::unique_ptr<NumericDecomposition> nd;
+        if (cuda) {
+            auto Av = mtm.first.to(torch::kCUDA).contiguous();
+            auto rp = A_rp_t_.to(torch::kCUDA);
+            auto ci = A_ci_t_.to(torch::kCUDA);
+            nd = std::make_unique<NumericDecomposition>(sym_->createNumericDecomposition(1));
+            nd->add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_(*nd);
+            apply_eps(*nd, true);
+        } else {
+            auto Av = mtm.first.to(torch::kCPU).contiguous();
+            auto rp = A_rp_t_.to(torch::kCPU);
+            auto ci = A_ci_t_.to(torch::kCPU);
+            nd = std::make_unique<NumericDecomposition>(symc_->createNumericDecomposition(1));
+            nd->add_MtM(Av.reshape({1, S_.nnz}), rp, ci);
+            add_cross_to_nd_cpu_(*nd);
+            apply_eps(*nd, false);
+        }
+        nd->factor();
+        auto X = torch::zeros({1, total_m * ncol}, optsD);
+        {
+            auto xa = X.accessor<double, 2>();
+            auto sa = sc_cpu.accessor<double, 1>();
+            for (int64_t rcol = 0; rcol < total_m; ++rcol)
+                xa[0][rcol * ncol + (off + rcol)] = sa[off + rcol];
+        }
+        if (cuda) X = X.to(torch::kCUDA);
+        { auto Xmut = X; nd->solve_multi(Xmut, total_m); }
+        auto Xc = X.to(torch::kCPU).contiguous();
+        const double *xp = Xc.data_ptr<double>();
+        const double *sp = sc_cpu.data_ptr<double>();
+
+        std::vector<double> vals, dvals((size_t)n_ * 36, 0.0);
+        std::vector<int> bi, bj;
+        for (const auto &C : clusters) {
+            const int64_t m = (int64_t)C.size() * 6;
+            auto Sig = torch::zeros({m, m}, optsD);
+            {
+                auto sg = Sig.accessor<double, 2>();
+                for (int64_t rcol = 0; rcol < m; ++rcol)
+                    for (int64_t arow = 0; arow < m; ++arow) {
+                        const int64_t a = off + (int64_t)C[(size_t)(arow / 6)] * 6 + (arow % 6);
+                        const int64_t rglobal = (int64_t)C[(size_t)(rcol / 6)] * 6 + (rcol % 6);
+                        sg[arow][rcol] = sp[a] * xp[rglobal * ncol + a];
+                    }
+            }
+            Sig = 0.5 * (Sig + Sig.transpose(0, 1));
+            torch::Tensor Lam;
+            if (cuda) Lam = torch::linalg_inv(Sig.to(torch::kCUDA)).to(torch::kCPU);
+            else Lam = torch::linalg_inv(Sig);
+            Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+            {   // PSD 投影（相对下限）
+                auto ev = torch::linalg_eigh(Lam);
+                auto w = std::get<0>(ev), V = std::get<1>(ev);
+                auto fl = torch::clamp_min(w.max(), 1e-300) * 1e-12;
+                w = torch::clamp_min(w, fl);
+                Lam = V.matmul(torch::diag(w)).matmul(V.transpose(0, 1));
+                Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+            }
+            const double *lp = Lam.contiguous().data_ptr<double>();
+            for (size_t ii = 0; ii < C.size(); ++ii) {
+                const int gi = C[ii];
+                for (int a = 0; a < 6; ++a)
+                    for (int b = 0; b < 6; ++b)
+                        dvals[(size_t)gi * 36 + a * 6 + b] =
+                            lp[((int64_t)ii * 6 + a) * m + (int64_t)ii * 6 + b];
+                for (size_t jj = ii + 1; jj < C.size(); ++jj) {
+                    const int gj = C[jj];
+                    for (int a = 0; a < 6; ++a)
+                        for (int b = 0; b < 6; ++b)
+                            vals.push_back(lp[((int64_t)ii * 6 + a) * m + (int64_t)jj * 6 + b]);
+                    bi.push_back(node * n_ + gi);
+                    bj.push_back(node * n_ + gj);
+                }
+            }
+        }
+        const int64_t B = (int64_t)bi.size();
+        py::array_t<double> val({(py::ssize_t)B, (py::ssize_t)6, (py::ssize_t)6});
+        if (B) std::memcpy(val.mutable_data(), vals.data(), sizeof(double) * vals.size());
+        py::array_t<int> ai({(py::ssize_t)B}), aj({(py::ssize_t)B});
+        if (B) {
+            std::memcpy(ai.mutable_data(), bi.data(), sizeof(int) * bi.size());
+            std::memcpy(aj.mutable_data(), bj.data(), sizeof(int) * bj.size());
+        }
+        py::array_t<double> dval({(py::ssize_t)n_, (py::ssize_t)6, (py::ssize_t)6});
+        std::memcpy(dval.mutable_data(), dvals.data(), sizeof(double) * dvals.size());
+        py::array_t<int> cida({(py::ssize_t)n_});
+        std::memcpy(cida.mutable_data(), cid.data(), sizeof(int) * cid.size());
+        return py::make_tuple(val, ai, aj, dval, cida);
+    }
+
+    // 含过程噪声的增广求解（式 (12)）：解
+    //   [H_new+Q^-1  B; B^T  -M] [δ; y] = [g; 0],
+    // 等价于 (H_new + Λ⁺) δ = g，Λ⁺=(Φ H_prev^-1 Φ^T+Q)^-1。
+    // H_new/H_prev 为物理 6N×6N 稠密信息；Phi/Q 为 (n,6,6)。
+    // 当前只支持小 N（稠密 CSR 模式）；生产稀疏模式后续实现。
+    py::array_t<double> augmented_solve(
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_new,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_prev,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Phi,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Q,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g) {
+        auto rn = H_new.request(); auto rp = H_prev.request();
+        auto rph = Phi.request(); auto rq = Q.request(); auto rg = g.request();
+        const int64_t q = (int64_t)n_ * 6;
+        if (rn.ndim != 2 || rn.shape[0] != q || rn.shape[1] != q)
+            throw std::runtime_error("augmented_solve: H_new 需 (6N,6N)");
+        if (rp.ndim != 2 || rp.shape[0] != q || rp.shape[1] != q)
+            throw std::runtime_error("augmented_solve: H_prev 需 (6N,6N)");
+        if (rph.ndim != 3 || rph.shape[0] != n_ || rph.shape[1] != 6 || rph.shape[2] != 6)
+            throw std::runtime_error("augmented_solve: Phi 需 (n,6,6)");
+        if (rq.ndim != 3 || rq.shape[0] != n_ || rq.shape[1] != 6 || rq.shape[2] != 6)
+            throw std::runtime_error("augmented_solve: Q 需 (n,6,6)");
+        if (rg.ndim != 1 || rg.shape[0] != q)
+            throw std::runtime_error("augmented_solve: g 需 (6N,)");
+        if (q > 384) throw std::runtime_error("augmented_solve: 当前仅支持 6N<=384（稠密模式）");
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        auto dev = torch::kCUDA;
+        auto T = [&](const void *p, std::initializer_list<int64_t> sh) {
+            return torch::from_blob((void *)p, sh, optsD).clone();
+        };
+        auto Hn = T(rn.ptr, {q, q});
+        auto Hp = T(rp.ptr, {q, q});
+        auto Ph = T(rph.ptr, {n_, 6, 6});
+        auto Qm = T(rq.ptr, {n_, 6, 6});
+        auto gg = T(rg.ptr, {q});
+        auto optsI32 = torch::TensorOptions().dtype(torch::kInt);
+        auto idx = torch::arange(n_, optsI32).view({n_, 1, 1});
+        auto a6 = torch::arange(6, optsI32);
+        auto rr = (idx * 6 + a6.view({1, 6, 1})).expand({n_, 6, 6});
+        auto cc = (idx * 6 + a6.view({1, 1, 6})).expand({n_, 6, 6});
+        auto Qinv_b = torch::zeros({q, q}, optsD);
+        auto Ph_b = torch::zeros({q, q}, optsD);
+        // 逐星 6×6 逆与块对角嵌入（小 N）
+        for (int i = 0; i < n_; ++i) {
+            auto Qi = Qm[i];
+            auto Pi = torch::linalg_inv(0.5 * (Qi + Qi.transpose(0, 1)));
+            Qinv_b.index_put_({rr[i], cc[i]}, Pi);
+            Ph_b.index_put_({rr[i], cc[i]}, Ph[i]);
+        }
+        auto B = Qinv_b.matmul(Ph_b);
+        auto M = Hp + Ph_b.transpose(0, 1).matmul(B);
+        const int64_t N = 2 * q;
+        auto Aug = torch::zeros({N, N}, optsD);
+        Aug.slice(0, 0, q).slice(1, 0, q).copy_(Hn + Qinv_b);
+        Aug.slice(0, 0, q).slice(1, q, N).copy_(B);
+        Aug.slice(0, q, N).slice(1, 0, q).copy_(B.transpose(0, 1));
+        Aug.slice(0, q, N).slice(1, q, N).copy_(-M);
+        // 稠密 → CSR（小 N：保留完整模式，避免漏掉结构零）
+        auto rowPtr = torch::empty({N + 1}, optsI32);
+        auto colInd = torch::empty({N * N}, optsI32);
+        auto vals = torch::empty({1, N * N}, optsD);
+        {
+            auto rpa = rowPtr.accessor<int, 1>();
+            auto cia = colInd.accessor<int, 1>();
+            auto va = vals.accessor<double, 2>();
+            auto Aa = Aug.accessor<double, 2>();
+            int64_t p = 0;
+            rpa[0] = 0;
+            for (int64_t i = 0; i < N; ++i) {
+                for (int64_t j = 0; j < N; ++j) {
+                    cia[p] = (int)j;
+                    va[0][p] = Aa[i][j];
+                    ++p;
+                }
+                rpa[i + 1] = (int)p;
+            }
+        }
+        CusolverLUSolver lu(1, N, rowPtr.to(torch::kCUDA), colInd.to(torch::kCUDA), AMD);
+        auto sing = lu.factor(vals.to(torch::kCUDA));
+        if (!sing.empty() && sing[0] >= 0)
+            throw std::runtime_error("augmented_solve: LU 奇异");
+        auto rhs = torch::zeros({1, N}, optsD);
+        rhs.slice(1, 0, q) = gg;
+        rhs = rhs.to(torch::kCUDA);
+        lu.solve(rhs);
+        auto sol = rhs.to(torch::kCPU).contiguous();
+        py::array_t<double> out({(py::ssize_t)q});
+        std::memcpy(out.mutable_data(), sol.data_ptr<double>(), sizeof(double) * q);
+        return out;
+    }
+
+    // 含 Q 的增广系统（块稀疏 CSR 版）：输入 H_new/H_prev 的 CSR（物理 6N×6N），
+    // 按 [H_new+Q^-1, B; B^T, -(H_prev+Phi^T Q^-1 Phi)] 组装 2N×2N 的 CSR，
+    // 再走 Theseus 的 cuSOLVER RF LU。支持 N=1152（2N=13824）。
+    py::array_t<double> augmented_solve_sparse(
+        py::array_t<int, py::array::c_style | py::array::forcecast> Hn_rp,
+        py::array_t<int, py::array::c_style | py::array::forcecast> Hn_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Hn_val,
+        py::array_t<int, py::array::c_style | py::array::forcecast> Hp_rp,
+        py::array_t<int, py::array::c_style | py::array::forcecast> Hp_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Hp_val,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Phi,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Q,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g) {
+        auto rnrp = Hn_rp.request(); auto rnci = Hn_ci.request(); auto rnv = Hn_val.request();
+        auto rprp = Hp_rp.request(); auto rpci = Hp_ci.request(); auto rpv = Hp_val.request();
+        auto rph = Phi.request(); auto rq = Q.request(); auto rg = g.request();
+        const int64_t q = (int64_t)n_ * 6;
+        if (rnrp.ndim != 1 || rnrp.shape[0] != q + 1 ||
+            rnv.ndim != 1 || rnv.shape[0] != rnci.shape[0])
+            throw std::runtime_error("augmented_solve_sparse: H_new CSR 形状不符");
+        if (rprp.ndim != 1 || rprp.shape[0] != q + 1 ||
+            rpv.ndim != 1 || rpv.shape[0] != rpci.shape[0])
+            throw std::runtime_error("augmented_solve_sparse: H_prev CSR 形状不符");
+        if (rph.ndim != 3 || rph.shape[0] != n_ || rph.shape[1] != 6 || rph.shape[2] != 6)
+            throw std::runtime_error("augmented_solve_sparse: Phi 需 (n,6,6)");
+        if (rq.ndim != 3 || rq.shape[0] != n_ || rq.shape[1] != 6 || rq.shape[2] != 6)
+            throw std::runtime_error("augmented_solve_sparse: Q 需 (n,6,6)");
+        if (rg.ndim != 1 || rg.shape[0] != q)
+            throw std::runtime_error("augmented_solve_sparse: g 需 (6N,)");
+        const int *hnrp = (const int *)rnrp.ptr, *hnci = (const int *)rnci.ptr;
+        const double *hnv = (const double *)rnv.ptr;
+        const int *hprp = (const int *)rprp.ptr, *hpci = (const int *)rpci.ptr;
+        const double *hpv = (const double *)rpv.ptr;
+        const double *phi = (const double *)rph.ptr, *qv = (const double *)rq.ptr;
+        const double *gv = (const double *)rg.ptr;
+        const int64_t N = 2 * q;
+        std::vector<std::tuple<int, int, double>> trips;
+        trips.reserve((size_t)(rnv.shape[0] + rpv.shape[0] + (int64_t)n_ * 3 * 36) + 64);
+        auto addt = [&](int r, int c, double v) { trips.emplace_back(r, c, v); };
+        // 左上：H_new；右下：-H_prev
+        for (int64_t r = 0; r < q; ++r) {
+            for (int64_t p = hnrp[r]; p < hnrp[r + 1]; ++p)
+                addt((int)r, hnci[p], hnv[p]);
+            for (int64_t p = hprp[r]; p < hprp[r + 1]; ++p)
+                addt((int)(r + q), (int)(hpci[p] + q), -hpv[p]);
+        }
+        // 逐星：Q^-1、B=Q^-1 Phi、-(Phi^T Q^-1 Phi)
+        for (int i = 0; i < n_; ++i) {
+            Eigen::Matrix<double, 6, 6> Qi, Pi, Phi_i, Qinv, B, Md;
+            for (int a = 0; a < 36; ++a) {
+                Qi.data()[a] = qv[(size_t)i * 36 + a];
+                Phi_i.data()[a] = phi[(size_t)i * 36 + a];
+            }
+            Qi = 0.5 * (Qi + Qi.transpose());
+            Eigen::SelfAdjointEigenSolver<Eigen::Matrix<double, 6, 6>> es(Qi);
+            const auto &w = es.eigenvalues();
+            const auto &V = es.eigenvectors();
+            const double fl = std::max(std::max(0.0, w.maxCoeff()) * 1e-12, 1e-300);
+            Qinv = V * w.cwiseMax(fl).cwiseInverse().asDiagonal() * V.transpose();
+            B = Qinv * Phi_i;
+            Md = Phi_i.transpose() * Qinv * Phi_i;
+            const int r0 = i * 6;
+            for (int a = 0; a < 6; ++a)
+                for (int b = 0; b < 6; ++b) {
+                    addt(r0 + a, r0 + b, Qinv(a, b));
+                    addt(r0 + a, (int)q + r0 + b, B(a, b));
+                    addt((int)q + r0 + a, r0 + b, B(b, a));
+                    addt((int)q + r0 + a, (int)q + r0 + b, -Md(a, b));
+                }
+        }
+        std::sort(trips.begin(), trips.end(),
+                  [](const auto &a, const auto &b) {
+                      return std::get<0>(a) < std::get<0>(b) ||
+                             (std::get<0>(a) == std::get<0>(b) && std::get<1>(a) < std::get<1>(b));
+                  });
+        std::vector<int> rp((size_t)N + 1, 0), ci;
+        std::vector<double> vals;
+        ci.reserve(trips.size()); vals.reserve(trips.size());
+        {
+            size_t k = 0;
+            for (int r = 0; r < N; ++r) {
+                while (k < trips.size() && std::get<0>(trips[k]) == r) {
+                    const int c = std::get<1>(trips[k]);
+                    double v = std::get<2>(trips[k]);
+                    ++k;
+                    while (k < trips.size() && std::get<0>(trips[k]) == r &&
+                           std::get<1>(trips[k]) == c) {
+                        v += std::get<2>(trips[k]); ++k;
+                    }
+                    ci.push_back(c); vals.push_back(v);
+                }
+                rp[(size_t)r + 1] = (int)ci.size();
+            }
+        }
+        auto optsI32 = torch::TensorOptions().dtype(torch::kInt);
+        auto rp_t = torch::from_blob(rp.data(), {(py::ssize_t)rp.size()}, optsI32).clone();
+        auto ci_t = torch::from_blob(ci.data(), {(py::ssize_t)ci.size()}, optsI32).clone();
+        auto v_t = torch::from_blob(vals.data(), {(py::ssize_t)vals.size()},
+                                    torch::TensorOptions().dtype(torch::kFloat64))
+                       .clone().reshape({1, (int64_t)vals.size()});
+        auto _tk = [] {
+            return std::chrono::duration<double>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+        const double _t0 = _tk();
+        CusolverLUSolver lu(1, N, rp_t.to(torch::kCUDA), ci_t.to(torch::kCUDA), AMD);
+        const double _t1 = _tk();
+        auto sing = lu.factor(v_t.to(torch::kCUDA));
+        const double _t2 = _tk();
+        if (!sing.empty() && sing[0] >= 0)
+            throw std::runtime_error("augmented_solve_sparse: LU 奇异");
+        auto rhs = torch::zeros({1, N}, torch::TensorOptions().dtype(torch::kFloat64));
+        auto rg_t = torch::from_blob((void *)gv, {q},
+                                     torch::TensorOptions().dtype(torch::kFloat64)).clone();
+        rhs.slice(1, 0, q).copy_(rg_t);
+        rhs = rhs.to(torch::kCUDA);
+        lu.solve(rhs);
+        const double _t3 = _tk();
+        fprintf(stderr, "[aug/sparse] N=%lld A_nnz=%zu LU_nnz=%lld "
+                        "t_setup=%.2fs t_factor=%.2fs t_solve=%.2fs\n",
+                (long long)N, vals.size(), (long long)(lu.L_nnz + lu.U_nnz),
+                _t1 - _t0, _t2 - _t1, _t3 - _t2);
+        auto sol = rhs.to(torch::kCPU).contiguous();
+        py::array_t<double> out({(py::ssize_t)q});
+        std::memcpy(out.mutable_data(), sol.data_ptr<double>(), sizeof(double) * q);
         return out;
     }
 
@@ -6823,6 +7643,7 @@ class FlsWindow {
     bool prior_ = true, has_prior_ = false;
     int prior_node_ = -1;
     int dyn_sub_ = 1;                                  // >=0：结构只建该节点的 prior 行
+    int r_cross_ = 1;                                  // >=2：块结构加 ISL r 跳邻域（局部联合先验）
     int dyn_sub_cfg_ = 1;                              // 构造时 KF_DYN_SUB，GVE 切换时恢复
     double qphys_sigma_ = 1e-7;                        // set_Q_phys 的 sigma_a
     std::vector<double> qphys_Q_host_;                 // set_Q_phys_arr 的物理 Q（诊断）
@@ -7292,18 +8113,1699 @@ static py::array_t<double> fls_local_schur_py(
     return out;
 }
 
+static py::array_t<double> boundary_info_csr(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol, int64_t off, int64_t q) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    if (r.ndim != 1 || c.ndim != 1 || v.ndim != 1)
+        throw std::runtime_error("boundary_info_csr: H_rp/H_ci/H_val 需 1D");
+    if (r.size != ncol + 1) throw std::runtime_error("boundary_info_csr: H_rp size != ncol+1");
+    if (c.size != v.size) throw std::runtime_error("boundary_info_csr: H_ci/H_val size 不一致");
+    if (q <= 0 || off < 0 || off + q > ncol)
+        throw std::runtime_error("boundary_info_csr: off/q 越界");
+    if (!torch::cuda::is_available())
+        throw std::runtime_error("boundary_info_csr: CUDA 不可用");
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI64 = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto rp = torch::from_blob((void *)r.ptr, {ncol + 1}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto ci = torch::from_blob((void *)c.ptr, {(int64_t)c.size}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto va = torch::from_blob((void *)v.ptr, {(int64_t)v.size}, optsD).clone().to(dev);
+    CusolverLUSolver lu(1, ncol, rp, ci, AMD);
+    auto sing = lu.factor(va.reshape({1, va.numel()}));
+    if (!sing.empty() && sing[0] >= 0)
+        throw std::runtime_error("boundary_info_csr: LU 奇异 at " + std::to_string(sing[0]));
+    auto B = torch::zeros({1, q * ncol}, optsD);
+    {
+        auto ba = B.accessor<double, 2>();
+        for (int64_t k = 0; k < q; ++k) ba[0][k * ncol + off + k] = 1.0;
+    }
+    B = B.to(dev);
+    lu.solve_multi(B, q);
+    auto X = B[0].view({q, ncol}).narrow(1, off, q);
+    auto Sig = 0.5 * (X + X.transpose(0, 1));
+    auto Lam = torch::linalg_inv(Sig);
+    Lam = 0.5 * (Lam + Lam.transpose(0, 1));
+    auto Lc = Lam.to(torch::kCPU).contiguous();
+    py::array_t<double> out({(py::ssize_t)q, (py::ssize_t)q});
+    std::memcpy(out.mutable_data(), Lc.data_ptr<double>(),
+                sizeof(double) * (size_t)q * (size_t)q);
+    return out;
+}
+
+static py::tuple woodbury_solve_baspacho(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> ps,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> bp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> bi,
+        py::array_t<double, py::array::c_style | py::array::forcecast> U,
+        py::array_t<double, py::array::c_style | py::array::forcecast> C,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g,
+        int64_t off, int64_t q) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto rp = ps.request(); auto rb = bp.request(); auto ri = bi.request();
+    auto ru = U.request(); auto rc = C.request(); auto rg = g.request();
+    const int64_t n = (int64_t)rg.shape[0];
+    const int64_t nr = (int64_t)ru.shape[1];
+    if (rg.ndim != 1 || ru.ndim != 2 || rc.ndim != 2 ||
+        ru.shape[0] != q || rc.shape[0] != nr || rc.shape[1] != nr ||
+        off < 0 || off + q > n)
+        throw std::runtime_error("woodbury_solve_baspacho: 参数维数不符");
+    if (r.size != n + 1 || c.size != v.size)
+        throw std::runtime_error("woodbury_solve_baspacho: H CSR 形状不符");
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto ps_t = torch::from_blob((void *)rp.ptr, {(int64_t)rp.size}, optsI).clone();
+    auto bp_t = torch::from_blob((void *)rb.ptr, {(int64_t)rb.size}, optsI).clone();
+    auto bi_t = torch::from_blob((void *)ri.ptr, {(int64_t)ri.size}, optsI).clone();
+    SymbolicDecomposition sym(ps_t, bp_t, bi_t, "cuda");
+    auto nd = sym.createNumericDecomposition(1);
+    auto hrp = torch::from_blob((void *)r.ptr, {n + 1}, optsI).clone().to(dev);
+    auto hci = torch::from_blob((void *)c.ptr, {(int64_t)c.size}, optsI).clone().to(dev);
+    auto hv = torch::from_blob((void *)v.ptr, {(int64_t)v.size}, optsD).clone().to(dev);
+    nd.add_M(hv.reshape({1, hv.numel()}), hrp, hci);
+    nd.factor();
+    auto B = torch::zeros({1, (nr + 1) * n}, optsD);
+    {
+        auto ba = B.accessor<double, 2>();
+        const double *gp = (const double *)rg.ptr;
+        const double *up = (const double *)ru.ptr;
+        for (int64_t i = 0; i < n; ++i) ba[0][i] = gp[i];
+        for (int64_t j = 0; j < nr; ++j)
+            for (int64_t i = 0; i < q; ++i)
+                ba[0][(j + 1) * n + off + i] = up[i * nr + j];
+    }
+    B = B.to(dev);
+    nd.solve_multi(B, nr + 1);                 // BaSpaCho CUDA parallel multi-RHS
+    auto X = B[0].view({nr + 1, n}).to(torch::kCPU).contiguous();
+    auto x0 = X[0].to(dev);
+    auto Y = X.narrow(0, 1, nr).transpose(0, 1).contiguous().to(dev);
+    auto Ut = torch::from_blob((void *)ru.ptr, {q, nr}, optsD).clone().to(dev);
+    auto Ct = torch::from_blob((void *)rc.ptr, {nr, nr}, optsD).clone().to(dev);
+    auto S = torch::linalg_inv(Ct) + Ut.transpose(0, 1).matmul(Y.narrow(0, off, q));
+    S = 0.5 * (S + S.transpose(0, 1));
+    auto jit = 1e-10 * torch::diagonal(S).abs().max().clamp_min(1e-30);
+    auto Sinv = torch::linalg_inv(S + jit * torch::eye(nr, optsD.device(dev)));
+    auto rhs = Ut.transpose(0, 1).matmul(x0.narrow(0, off, q));
+    auto delta = x0 - Y.matmul(Sinv.matmul(rhs));
+    auto dc = delta.to(torch::kCPU).contiguous();
+    auto Yc = Y.to(torch::kCPU).contiguous();
+    auto Sc = Sinv.to(torch::kCPU).contiguous();
+    py::array_t<double> od({(py::ssize_t)n});
+    py::array_t<double> oy({(py::ssize_t)n, (py::ssize_t)nr});
+    py::array_t<double> os({(py::ssize_t)nr, (py::ssize_t)nr});
+    std::memcpy(od.mutable_data(), dc.data_ptr<double>(), sizeof(double) * (size_t)n);
+    std::memcpy(oy.mutable_data(), Yc.data_ptr<double>(), sizeof(double) * (size_t)n * (size_t)nr);
+    std::memcpy(os.mutable_data(), Sc.data_ptr<double>(), sizeof(double) * (size_t)nr * (size_t)nr);
+    return py::make_tuple(od, oy, os);
+}
+
+static py::tuple woodbury_solve_csr(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        py::array_t<double, py::array::c_style | py::array::forcecast> U,
+        py::array_t<double, py::array::c_style | py::array::forcecast> C,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g,
+        int64_t off, int64_t q) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto ru = U.request(); auto rc = C.request(); auto rg = g.request();
+    if (rg.ndim != 1 || ru.ndim != 2 || rc.ndim != 2)
+        throw std::runtime_error("woodbury_solve_csr: U/C/g 维数不符");
+    const int64_t n = (int64_t)rg.shape[0];
+    const int64_t nr = (int64_t)ru.shape[1];
+    if (ru.shape[0] != q || rc.shape[0] != nr || rc.shape[1] != nr || off + q > n)
+        throw std::runtime_error("woodbury_solve_csr: U/C/off/q 越界");
+    if (r.size != n + 1 || c.size != v.size)
+        throw std::runtime_error("woodbury_solve_csr: H CSR 形状不符");
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI64 = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto rp = torch::from_blob((void *)r.ptr, {n + 1}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto ci = torch::from_blob((void *)c.ptr, {(int64_t)c.size}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto hv = torch::from_blob((void *)v.ptr, {(int64_t)v.size}, optsD).clone().to(dev);
+    CusolverLUSolver lu(1, n, rp, ci, AMD);
+    auto sing = lu.factor(hv.reshape({1, hv.numel()}));
+    if (!sing.empty() && sing[0] >= 0)
+        throw std::runtime_error("woodbury_solve_csr: LU 奇异 at " + std::to_string(sing[0]));
+    // [g, U] 一次 C++/CUDA 多右端
+    auto B = torch::zeros({1, (nr + 1) * n}, optsD);
+    {
+        auto ba = B.accessor<double, 2>();
+        const double *gp = (const double *)rg.ptr;
+        const double *up = (const double *)ru.ptr;
+        for (int64_t i = 0; i < n; ++i) ba[0][i] = gp[i];
+        for (int64_t j = 0; j < nr; ++j)
+            for (int64_t i = 0; i < q; ++i)
+                ba[0][(j + 1) * n + off + i] = up[i * nr + j];
+    }
+    B = B.to(dev);
+    lu.solve_multi(B, nr + 1);
+    auto X = B[0].view({nr + 1, n}).to(torch::kCPU).contiguous();
+    auto x0 = X[0].to(dev);
+    auto Y = X.narrow(0, 1, nr).transpose(0, 1).contiguous().to(dev);   // (n,nr)
+    auto Ut = torch::from_blob((void *)ru.ptr, {q, nr}, optsD).clone().to(dev);
+    auto Ct = torch::from_blob((void *)rc.ptr, {nr, nr}, optsD).clone().to(dev);
+    auto S = torch::linalg_inv(Ct) + Ut.transpose(0, 1).matmul(Y.narrow(0, off, q));
+    S = 0.5 * (S + S.transpose(0, 1));
+    auto jit = 1e-10 * torch::diagonal(S).abs().max().clamp_min(1e-30);
+    auto Sinv = torch::linalg_inv(S + jit * torch::eye(nr, optsD.device(dev)));
+    auto rhs = Ut.transpose(0, 1).matmul(x0.narrow(0, off, q));
+    auto delta = x0 - Y.matmul(Sinv.matmul(rhs));
+    auto dc = delta.to(torch::kCPU).contiguous();
+    auto Yc = Y.to(torch::kCPU).contiguous();
+    auto Sc = Sinv.to(torch::kCPU).contiguous();
+    py::array_t<double> od({(py::ssize_t)n});
+    py::array_t<double> oy({(py::ssize_t)n, (py::ssize_t)nr});
+    py::array_t<double> os({(py::ssize_t)nr, (py::ssize_t)nr});
+    std::memcpy(od.mutable_data(), dc.data_ptr<double>(), sizeof(double) * (size_t)n);
+    std::memcpy(oy.mutable_data(), Yc.data_ptr<double>(), sizeof(double) * (size_t)n * (size_t)nr);
+    std::memcpy(os.mutable_data(), Sc.data_ptr<double>(), sizeof(double) * (size_t)nr * (size_t)nr);
+    return py::make_tuple(od, oy, os);
+}
+
+static py::array_t<double> solve_csr_csr(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        py::array_t<double, py::array::c_style | py::array::forcecast> B) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto b = B.request();
+    if (b.ndim != 2) throw std::runtime_error("solve_csr_csr: B 需 (n,r)");
+    const int64_t n = (int64_t)b.shape[0];
+    const int64_t nr = (int64_t)b.shape[1];
+    if (r.size != n + 1 || c.size != v.size)
+        throw std::runtime_error("solve_csr_csr: H CSR 形状不符");
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI64 = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto rp = torch::from_blob((void *)r.ptr, {n + 1}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto ci = torch::from_blob((void *)c.ptr, {(int64_t)c.size}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto va = torch::from_blob((void *)v.ptr, {(int64_t)v.size}, optsD).clone().to(dev);
+    CusolverLUSolver lu(1, n, rp, ci, AMD);
+    auto sing = lu.factor(va.reshape({1, va.numel()}));
+    if (!sing.empty() && sing[0] >= 0)
+        throw std::runtime_error("solve_csr_csr: LU 奇异 at " + std::to_string(sing[0]));
+    // B (n,r) row-major → 每个 RHS 连续的 (r,n) 缓冲，再转 CUDA
+    auto Bt = torch::from_blob((void *)b.ptr, {n, nr}, optsD).clone().transpose(0, 1).contiguous();
+    auto X = torch::zeros({1, nr * n}, optsD);
+    std::memcpy(X.data_ptr<double>(), Bt.data_ptr<double>(),
+                sizeof(double) * (size_t)n * (size_t)nr);
+    X = X.to(dev);
+    lu.solve_multi(X, nr);
+    auto Xc = X[0].view({nr, n}).transpose(0, 1).contiguous().to(torch::kCPU).contiguous();
+    py::array_t<double> out({(py::ssize_t)n, (py::ssize_t)nr});
+    std::memcpy(out.mutable_data(), Xc.data_ptr<double>(),
+                sizeof(double) * (size_t)n * (size_t)nr);
+    return out;
+}
+
+static py::array_t<double> boundary_probe_csr(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Omega,
+        int64_t ncol, int64_t off, int64_t q) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto o = Omega.request();
+    if (o.ndim != 2 || o.shape[0] != q)
+        throw std::runtime_error("boundary_probe_csr: Omega 需 (q,r)");
+    const int64_t nr = (int64_t)o.shape[1];
+    if (nr <= 0 || q <= 0 || off < 0 || off + q > ncol)
+        throw std::runtime_error("boundary_probe_csr: off/q/r 越界");
+    if (r.size != ncol + 1 || c.size != v.size)
+        throw std::runtime_error("boundary_probe_csr: H CSR 形状不符");
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI64 = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto rp = torch::from_blob((void *)r.ptr, {ncol + 1}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto ci = torch::from_blob((void *)c.ptr, {(int64_t)c.size}, optsI64)
+                  .clone().to(torch::kInt32).to(dev);
+    auto va = torch::from_blob((void *)v.ptr, {(int64_t)v.size}, optsD).clone().to(dev);
+    CusolverLUSolver lu(1, ncol, rp, ci, AMD);
+    auto sing = lu.factor(va.reshape({1, va.numel()}));
+    if (!sing.empty() && sing[0] >= 0)
+        throw std::runtime_error("boundary_probe_csr: LU 奇异 at " + std::to_string(sing[0]));
+    auto B = torch::zeros({1, nr * ncol}, optsD);
+    const double *om = (const double *)o.ptr;
+    {
+        auto ba = B.accessor<double, 2>();
+        for (int64_t j = 0; j < nr; ++j)
+            for (int64_t i = 0; i < q; ++i)
+                ba[0][j * ncol + off + i] = om[i * nr + j];
+    }
+    B = B.to(dev);
+    lu.solve_multi(B, nr);
+    auto X = B[0].view({nr, ncol}).narrow(1, off, q).transpose(0, 1).contiguous();
+    auto Xc = X.to(torch::kCPU).contiguous();
+    py::array_t<double> out({(py::ssize_t)q, (py::ssize_t)nr});
+    std::memcpy(out.mutable_data(), Xc.data_ptr<double>(),
+                sizeof(double) * (size_t)q * (size_t)nr);
+    return out;
+}
+
+// P2 边界信息：一次 C++/CUDA 调用完成 Schur probe、gauge QR、低秩 C 与尺度门禁。
+// 输入 H 为整窗信息 CSR，D 为边界逐星 6×6 协方差（由 Baspacho 精确输出），
+// Omega 为未正交化探针；返回 (DLa, U, C, info, stats)。Python 只做窗循环。
+static py::dict boundary_lowrank_csr(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        py::array_t<double, py::array::c_style | py::array::forcecast> D,
+        py::array_t<double, py::array::c_style | py::array::forcecast> Omega,
+        int64_t ncol, int64_t off, int64_t q, double cap_rel,
+        int64_t rank_out) {
+    auto rp_a = H_rp.request(); auto ci_a = H_ci.request(); auto val_a = H_val.request();
+    auto d_a = D.request(); auto o_a = Omega.request();
+    if (rp_a.size != ncol + 1 || ci_a.size != val_a.size)
+        throw std::runtime_error("boundary_lowrank_csr: H CSR 形状不符");
+    if (d_a.ndim != 3 || d_a.shape[1] != 6 || d_a.shape[2] != 6 ||
+        d_a.shape[0] * 6 != q)
+        throw std::runtime_error("boundary_lowrank_csr: D 需 (q/6,6,6)");
+    if (o_a.ndim != 2 || o_a.shape[0] != q)
+        throw std::runtime_error("boundary_lowrank_csr: Omega 需 (q,r)");
+    if (off <= 0 || q <= 0 || off + q != ncol)
+        throw std::runtime_error("boundary_lowrank_csr: 要求边界列在末尾");
+    const int64_t r0 = (int64_t)o_a.shape[1];
+    const int64_t r = (rank_out > 0) ? (int64_t)rank_out : r0;
+    if (r < r0 || r > 32)
+        throw std::runtime_error("boundary_lowrank_csr: rank_out 需在 [r0,32]");
+    const int64_t N = q / 6;
+    const int64_t *rp = (const int64_t *)rp_a.ptr;
+    const int64_t *ci = (const int64_t *)ci_a.ptr;
+    const double *hv = (const double *)val_a.ptr;
+    const double *dp = (const double *)d_a.ptr;
+    const double *op = (const double *)o_a.ptr;
+
+    // Omega 正交化（小 r，Eigen QR）。numpy 的 Omega 是 C 行主序，
+    // 必须用 RowMajor Map；默认列主序会把 q×r 缓冲错位成另一个子空间。
+    using RowMajorXd = Eigen::Matrix<double, Eigen::Dynamic,
+                                     Eigen::Dynamic, Eigen::RowMajor>;
+    Eigen::Map<const RowMajorXd> Om0(op, q, r0);
+    Eigen::HouseholderQR<Eigen::MatrixXd> qr(Om0);
+    Eigen::MatrixXd Q0 = qr.householderQ() *
+        Eigen::MatrixXd::Identity(q, std::min(q, r0));
+    Q0 = Q0.leftCols(r0);
+
+    // Hss 的 CSR（行/列都 < off）。
+    std::vector<int64_t> srp((size_t)off + 1, 0), sci;
+    std::vector<double> sv;
+    sci.reserve((size_t)ci_a.size / 4);
+    sv.reserve((size_t)ci_a.size / 4);
+    for (int64_t i = 0; i < off; ++i) {
+        for (int64_t p = rp[i]; p < rp[i + 1]; ++p) {
+            int64_t j = ci[p];
+            if (j >= 0 && j < off) { sci.push_back(j); sv.push_back(hv[p]); }
+        }
+        srp[i + 1] = (int64_t)sci.size();
+    }
+
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto srp_t = torch::from_blob(srp.data(), {off + 1}, optsI).clone()
+                     .to(torch::kInt32).to(dev);
+    auto sci_t = torch::from_blob(sci.data(), {(int64_t)sci.size()}, optsI).clone()
+                     .to(torch::kInt32).to(dev);
+    auto sv_t = torch::from_blob(sv.data(), {(int64_t)sv.size()}, optsD).clone().to(dev);
+    CusolverLUSolver lu(1, off, srp_t, sci_t, AMD);
+    auto sing = lu.factor(sv_t.reshape({1, sv_t.numel()}));
+    if (!sing.empty() && sing[0] >= 0)
+        throw std::runtime_error("boundary_lowrank_csr: Hss LU 奇异 at " +
+                                 std::to_string(sing[0]));
+    // 同一 Hss 分解上反复作用 Lambda_b，构造 gauge-Krylov 基：
+    // Q0 = gauge, Q1 = Lambda_b Q0, Q2 = Lambda_b Q1, ...
+    auto apply_lambda = [&](const Eigen::MatrixXd& Qb) -> Eigen::MatrixXd {
+        const int64_t rb = Qb.cols();
+        std::vector<double> W((size_t)off * rb, 0.0);
+        for (int64_t i = 0; i < off; ++i)
+            for (int64_t p = rp[i]; p < rp[i + 1]; ++p) {
+                int64_t j = ci[p];
+                if (j >= off)
+                    for (int64_t b = 0; b < rb; ++b)
+                        W[(size_t)i * rb + b] += hv[p] * Qb(j - off, b);
+            }
+        auto B = torch::zeros({1, rb * off}, optsD);
+        {
+            auto ba = B.accessor<double, 2>();
+            for (int64_t b = 0; b < rb; ++b)
+                for (int64_t i = 0; i < off; ++i)
+                    ba[0][b * off + i] = W[(size_t)i * rb + b];
+        }
+        B = B.to(dev);
+        lu.solve_multi(B, rb);
+        auto Yt = B[0].view({rb, off}).transpose(0, 1).contiguous()
+                      .to(torch::kCPU).contiguous();
+        const double *Y = Yt.data_ptr<double>();
+        Eigen::MatrixXd Z(q, rb);
+        Z.setZero();
+        for (int64_t i = 0; i < q; ++i)
+            for (int64_t p = rp[off + i]; p < rp[off + i + 1]; ++p) {
+                int64_t j = ci[p];
+                if (j >= off)
+                    for (int64_t b = 0; b < rb; ++b)
+                        Z(i, b) += hv[p] * Qb(j - off, b);
+                else
+                    for (int64_t b = 0; b < rb; ++b)
+                        Z(i, b) -= hv[p] * Y[(size_t)j * rb + b];
+            }
+        return Z;
+    };
+
+    Eigen::MatrixXd K(q, r0);
+    K.leftCols(r0) = Q0;
+    int64_t nblk = 1;
+    Eigen::MatrixXd Qblk = Q0;
+    while (K.cols() < r && nblk < 4) {
+        Qblk = apply_lambda(Qblk);
+        const int64_t old = K.cols();
+        K.conservativeResize(q, old + Qblk.cols());
+        K.rightCols(Qblk.cols()) = Qblk;
+        ++nblk;
+    }
+    if (K.cols() < r) {
+        const int64_t old = K.cols();
+        K.conservativeResize(q, r);
+        for (int64_t b = old; b < r; ++b)
+            for (int64_t i = 0; i < q; ++i)
+                K(i, b) = std::sin(1e-4 * (double)(i + 1) * (double)(b + 1));
+    }
+    Eigen::HouseholderQR<Eigen::MatrixXd> qk(K);
+    Eigen::MatrixXd Q = qk.householderQ() *
+        Eigen::MatrixXd::Identity(q, std::min(q, K.cols()));
+    Q = Q.leftCols(r);
+    Eigen::MatrixXd Z = apply_lambda(Q);
+
+    // D^{-1} 与 G = Q^T D^{-1} Q
+    Eigen::MatrixXd Di(N * 6, 6);
+    for (int64_t s = 0; s < N; ++s) {
+        Eigen::Matrix<double, 6, 6, Eigen::RowMajor> d6;
+        std::memcpy(d6.data(), dp + (size_t)s * 36, sizeof(double) * 36);
+        Di.block<6, 6>(s * 6, 0) = Eigen::MatrixXd(d6).inverse();
+    }
+    Eigen::MatrixXd G = Eigen::MatrixXd::Zero(r, r);
+    for (int64_t s = 0; s < N; ++s) {
+        Eigen::MatrixXd Qs = Q.block(s * 6, 0, 6, r);
+        Eigen::MatrixXd Dis = Di.block<6, 6>(s * 6, 0);
+        G.noalias() += Qs.transpose() * Dis * Qs;
+    }
+    Eigen::MatrixXd Ys = Q.transpose() * Z;              // Omega^T Lambda_b Omega
+    Ys = 0.5 * (Ys + Ys.transpose());
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> eg(G);
+    Eigen::VectorXd gev = eg.eigenvalues().cwiseMax(1e-30);
+    Eigen::MatrixXd Gh = eg.eigenvectors() *
+        gev.cwiseInverse().cwiseSqrt().asDiagonal() *
+        eg.eigenvectors().transpose();
+    Eigen::MatrixXd M = Gh * Ys * Gh;
+    M = 0.5 * (M + M.transpose());
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> em(M);
+    double alpha = std::min(1.0, std::max(0.0, em.eigenvalues().minCoeff()));
+    Eigen::MatrixXd C = Ys - alpha * G;
+    C = 0.5 * (C + C.transpose());
+    Eigen::SelfAdjointEigenSolver<Eigen::MatrixXd> ec(C);
+    Eigen::VectorXd cw = ec.eigenvalues().cwiseMax(0.0);
+    double raw_max = ec.eigenvalues().size() ? ec.eigenvalues().maxCoeff() : 0.0;
+    double gmax = G.diagonal().maxCoeff();
+    double cap = 0.0; int64_t n_capped = 0;
+    if (cap_rel > 0.0) {
+        cap = cap_rel * std::max(gmax, 1e-30);
+        for (int64_t b = 0; b < r; ++b) {
+            if (cw(b) > cap) { cw(b) = cap; ++n_capped; }
+        }
+    }
+    C = ec.eigenvectors() * cw.asDiagonal() * ec.eigenvectors().transpose();
+    double jit = std::max(1e-8 * raw_max, 1e-12);
+    C += jit * Eigen::MatrixXd::Identity(r, r);
+
+    py::array_t<double> DLa({(py::ssize_t)N, (py::ssize_t)6, (py::ssize_t)6});
+    {
+        auto *p = DLa.mutable_data();
+        for (int64_t s = 0; s < N; ++s)
+            for (int a = 0; a < 6; ++a)
+                for (int b = 0; b < 6; ++b)
+                    p[((size_t)s * 6 + a) * 6 + b] = alpha * Di(s * 6 + a, b);
+    }
+    py::dict out;
+    out["DLa"] = DLa;
+    out["U"] = eigen_to_np_rowmajor(Q);
+    out["C"] = eigen_to_np_rowmajor(C);
+    out["info"] = eigen_to_np_rowmajor(Ys);
+    out["alpha"] = alpha;
+    out["raw_max"] = raw_max;
+    out["cap"] = cap;
+    out["n_capped"] = n_capped;
+    out["gmax"] = gmax;
+    return out;
+}
+
+// ---- 精确边界信息 Λ_b（Baspacho 分解 H_mm，信息形式，不求逆）----
+struct CsrSub {
+    std::vector<int64_t> rp, ci;
+    std::vector<double> v;
+    int64_t rows = 0, cols = 0;
+};
+
+static CsrSub _extract_csr(
+        const int64_t *rp, const int64_t *ci, const double *hv, int64_t ncol,
+        const std::vector<int64_t> &rows, const std::vector<int64_t> &cols,
+        const std::vector<double> &d);
+
+static void _block_pattern_from_csr(const CsrSub &A, int64_t bs,
+                                    std::vector<int64_t> &bp,
+                                    std::vector<int64_t> &bi) {
+    if (A.rows != A.cols || bs <= 0 || A.rows % bs != 0)
+        throw std::runtime_error("boundary_info_baspacho: H_mm 需方阵且可被块大小整除");
+    const int64_t nb = A.rows / bs;
+    std::vector<std::vector<int64_t>> rows((size_t)nb);
+    for (int64_t i = 0; i < A.rows; ++i) {
+        const int64_t br = i / bs;
+        for (int64_t p = A.rp[i]; p < A.rp[i + 1]; ++p) {
+            const int64_t bc = A.ci[p] / bs;
+            rows[(size_t)br].push_back(bc);
+            rows[(size_t)bc].push_back(br);       // 对称块图
+        }
+    }
+    bp.assign((size_t)nb + 1, 0);
+    bi.clear();
+    for (int64_t b = 0; b < nb; ++b) {
+        auto &v = rows[(size_t)b];
+        v.push_back(b);
+        std::sort(v.begin(), v.end());
+        v.erase(std::unique(v.begin(), v.end()), v.end());
+        bp[(size_t)b + 1] = bp[(size_t)b] + (int64_t)v.size();
+        for (int64_t c : v) bi.push_back(c);
+    }
+}
+
+static py::tuple boundary_info_baspacho(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol, int64_t off, int64_t q, py::object scale_obj,
+        double jitter_rel) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    if (r.ndim != 1 || c.ndim != 1 || v.ndim != 1 ||
+        r.size != ncol + 1 || c.size != v.size)
+        throw std::runtime_error("boundary_info_baspacho: H CSR 形状不符");
+    if (q <= 0 || off <= 0 || off + q > ncol || off % 6 != 0)
+        throw std::runtime_error("boundary_info_baspacho: off/q 越界或 off 非 6 的倍数");
+    const int64_t *rp = (const int64_t *)r.ptr;
+    const int64_t *ci = (const int64_t *)c.ptr;
+    const double *hv = (const double *)v.ptr;
+
+    std::vector<double> d((size_t)ncol, 1.0);
+    bool scaled = false;
+    if (!scale_obj.is_none()) {
+        auto sc = scale_obj.cast<
+            py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        auto sa = sc.request();
+        if (sa.size != ncol)
+            throw std::runtime_error("boundary_info_baspacho: scale 长度 != ncol");
+        std::memcpy(d.data(), sa.ptr, sizeof(double) * (size_t)ncol);
+        scaled = true;
+    }
+    std::vector<int64_t> M, B, I;
+    M.reserve((size_t)off); B.reserve((size_t)q); I.reserve((size_t)off);
+    for (int64_t i = 0; i < off; ++i) M.push_back(i);
+    for (int64_t i = 0; i < q; ++i) B.push_back(off + i);
+    auto t0 = std::chrono::steady_clock::now();
+    CsrSub hMM = _extract_csr(rp, ci, hv, ncol, M, M, d);
+    CsrSub hMB = _extract_csr(rp, ci, hv, ncol, M, B, d);
+    CsrSub hBB = _extract_csr(rp, ci, hv, ncol, B, B, d);
+    if (hMM.rows != off || hMM.cols != off || hMB.cols != q || hBB.rows != q)
+        throw std::runtime_error("boundary_info_baspacho: 子块抽取失败");
+
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    if (jitter_rel > 0.0) {
+        double dmax = 0.0;
+        for (int64_t i = 0; i < hMM.rows; ++i)
+            for (int64_t p = hMM.rp[i]; p < hMM.rp[i + 1]; ++p)
+                if (hMM.ci[p] == i) dmax = std::max(dmax, std::abs(hMM.v[p]));
+        const double add = jitter_rel * std::max(dmax, 1e-300);
+        for (int64_t i = 0; i < hMM.rows; ++i)
+            for (int64_t p = hMM.rp[i]; p < hMM.rp[i + 1]; ++p)
+                if (hMM.ci[p] == i) hMM.v[p] += add;
+    }
+    auto rp_t = torch::from_blob(hMM.rp.data(), {(int64_t)hMM.rp.size()}, optsI)
+                    .clone().to(dev);
+    auto ci_t = torch::from_blob(hMM.ci.data(), {(int64_t)hMM.ci.size()}, optsI)
+                    .clone().to(dev);
+    auto v_t = torch::from_blob(hMM.v.data(), {(int64_t)hMM.v.size()}, optsD)
+                   .clone().to(dev);
+    std::vector<int64_t> bp, bi;
+    _block_pattern_from_csr(hMM, 6, bp, bi);
+    auto ps_t = torch::full({off / 6}, 6, optsI);
+    auto bp_t = torch::from_blob(bp.data(), {(int64_t)bp.size()}, optsI).clone();
+    auto bi_t = torch::from_blob(bi.data(), {(int64_t)bi.size()}, optsI).clone();
+    auto sym = SymbolicDecomposition(ps_t, bp_t, bi_t, "cuda");
+    auto nd = sym.createNumericDecomposition(1);
+    nd.add_M(v_t.reshape({1, v_t.numel()}), rp_t, ci_t);
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::steady_clock::now();
+    nd.factor();
+    cudaDeviceSynchronize();
+    auto t2 = std::chrono::steady_clock::now();
+
+    // 解 H_mm X = H_mb（q 个右端）；B 布局 (q, off)。
+    auto Bcpu = torch::zeros({1, q * off}, optsD);
+    {
+        auto ba = Bcpu.accessor<double, 2>();
+        for (int64_t i = 0; i < hMB.rows; ++i)
+            for (int64_t p = hMB.rp[i]; p < hMB.rp[i + 1]; ++p)
+                ba[0][hMB.ci[p] * off + i] = hMB.v[p];
+    }
+    auto Bg = Bcpu.to(dev);
+    nd.solve_multi(Bg, q);
+    cudaDeviceSynchronize();
+    auto t3 = std::chrono::steady_clock::now();
+    auto Xc = Bg[0].to(torch::kCPU).contiguous();
+    const double *xp = Xc.data_ptr<double>();
+
+    // Λ_b = H_bb - H_bm X；再按列平衡还原到原始 QOE 坐标。
+    std::vector<double> out((size_t)q * q, 0.0);
+    for (int64_t i = 0; i < hBB.rows; ++i)
+        for (int64_t p = hBB.rp[i]; p < hBB.rp[i + 1]; ++p)
+            out[(size_t)i * q + hBB.ci[p]] += hBB.v[p];
+    double xnorm2 = 0.0, corrmax = 0.0, corrn2 = 0.0;
+    for (int64_t b = 0; b < q; ++b)
+        for (int64_t i = 0; i < off; ++i) {
+            const double xv = xp[b * off + i];
+            xnorm2 += xv * xv;
+        }
+    for (int64_t i = 0; i < hMB.rows; ++i)
+        for (int64_t p = hMB.rp[i]; p < hMB.rp[i + 1]; ++p) {
+            const int64_t a = hMB.ci[p];
+            const double val = hMB.v[p];
+            for (int64_t b = 0; b < q; ++b) {
+                const double c = val * xp[b * off + i];
+                out[(size_t)a * q + b] -= c;
+                corrmax = std::max(corrmax, std::abs(c));
+                corrn2 += c * c;
+            }
+        }
+    double dg_scaled_min = std::numeric_limits<double>::infinity();
+    double dg_scaled_max = -std::numeric_limits<double>::infinity();
+    for (int64_t a = 0; a < q; ++a) {
+        const double dv = out[(size_t)a * q + a];
+        dg_scaled_min = std::min(dg_scaled_min, dv);
+        dg_scaled_max = std::max(dg_scaled_max, dv);
+    }
+    for (int64_t a = 0; a < q; ++a) {
+        const double da = scaled ? d[(size_t)(off + a)] : 1.0;
+        for (int64_t b = a; b < q; ++b) {
+            const double db = scaled ? d[(size_t)(off + b)] : 1.0;
+            const double s = 0.5 * (out[(size_t)a * q + b] +
+                                    out[(size_t)b * q + a]) / (da * db);
+            out[(size_t)a * q + b] = s;
+            out[(size_t)b * q + a] = s;
+        }
+    }
+    bool finite = true;
+    for (double x : out) finite = finite && std::isfinite(x);
+    py::array_t<double> Lam({(py::ssize_t)q, (py::ssize_t)q});
+    std::memcpy(Lam.mutable_data(), out.data(), sizeof(double) * (size_t)q * q);
+    auto t4 = std::chrono::steady_clock::now();
+    auto sec = [](auto a, auto b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    py::dict stats;
+    stats["extract_s"] = sec(t0, t1);
+    stats["factor_s"] = sec(t1, t2);
+    stats["solve_s"] = sec(t2, t3);
+    stats["update_s"] = sec(t3, t4);
+    stats["n_mm"] = off;
+    stats["nnz_mm"] = (int64_t)hMM.ci.size();
+    stats["nnz_mb"] = (int64_t)hMB.ci.size();
+    stats["finite"] = finite;
+    stats["scaled"] = scaled;
+    stats["x_norm"] = std::sqrt(xnorm2);
+    stats["corr_max"] = corrmax;
+    stats["corr_norm"] = std::sqrt(corrn2);
+    stats["diag_scaled_min"] = dg_scaled_min;
+    stats["diag_scaled_max"] = dg_scaled_max;
+    return py::make_tuple(Lam, stats);
+}
+
+// ---- GPU 局部三角解 vs CPU 对拍 ----
+static py::dict partial_tri_probe(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol, int64_t span, int64_t bs) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    if (r.size != ncol + 1 || c.size != v.size || bs <= 0 || ncol % bs != 0)
+        throw std::runtime_error("partial_tri_probe: 参数不符");
+    const int64_t *rp = (const int64_t *)r.ptr;
+    const int64_t *ci = (const int64_t *)c.ptr;
+    const double *hv = (const double *)v.ptr;
+    std::vector<int64_t> all((size_t)ncol);
+    for (int64_t i = 0; i < ncol; ++i) all[(size_t)i] = i;
+    std::vector<double> ones((size_t)ncol, 1.0);
+    CsrSub hA = _extract_csr(rp, ci, hv, ncol, all, all, ones);
+    std::vector<int64_t> bp, bi;
+    _block_pattern_from_csr(hA, bs, bp, bi);
+    const int64_t nblk = hA.rows / bs;
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto ps_t = torch::full({nblk}, bs, optsI);
+    auto bp_t = torch::from_blob(bp.data(), {(int64_t)bp.size()}, optsI).clone();
+    auto bi_t = torch::from_blob(bi.data(), {(int64_t)bi.size()}, optsI).clone();
+    auto rp_c = torch::from_blob(hA.rp.data(), {(int64_t)hA.rp.size()}, optsI).clone();
+    auto ci_c = torch::from_blob(hA.ci.data(), {(int64_t)hA.ci.size()}, optsI).clone();
+    auto v_c = torch::from_blob(hA.v.data(), {(int64_t)hA.v.size()}, optsD).clone();
+    auto sym_cpu = SymbolicDecomposition(ps_t, bp_t, bi_t, "cpu");
+    auto nd_cpu = sym_cpu.createNumericDecomposition(1);
+    nd_cpu.add_M(v_c.reshape({1, v_c.numel()}), rp_c, ci_c);
+    nd_cpu.factor();
+    auto sym_gpu = SymbolicDecomposition(ps_t, bp_t, bi_t, "cuda");
+    auto nd_gpu = sym_gpu.createNumericDecomposition(1);
+    nd_gpu.add_M(v_c.to(torch::kCUDA).reshape({1, v_c.numel()}),
+                 rp_c.to(torch::kCUDA), ci_c.to(torch::kCUDA));
+    nd_gpu.factor();
+    auto x0 = torch::randn({1, ncol}, optsD);
+    auto xc = x0.clone();
+    auto xg = x0.clone().to(torch::kCUDA);
+    nd_cpu.solveL_upto(xc, span);
+    nd_gpu.solveL_upto_gpu(xg, span);
+    auto eL = (xc - xg.to(torch::kCPU)).norm().item<double>() /
+              std::max(xc.norm().item<double>(), 1e-300);
+    auto xc2 = x0.clone();
+    auto xg2 = x0.clone().to(torch::kCUDA);
+    nd_cpu.solveLt_upto(xc2, span);
+    nd_gpu.solveLt_upto_gpu(xg2, span);
+    auto eLt = (xc2 - xg2.to(torch::kCPU)).norm().item<double>() /
+               std::max(xc2.norm().item<double>(), 1e-300);
+    py::dict out;
+    out["rel_L"] = eL; out["rel_Lt"] = eLt;
+    return out;
+}
+
+// ---- 精确内部条件：factorUpTo + GPU 局部三角解，不做 factorFrom ----
+static std::shared_ptr<SymbolicDecomposition> _partial_symbolic(
+        const torch::Tensor &ps_t, const torch::Tensor &bp_t,
+        const torch::Tensor &bi_t, const std::vector<int64_t> &last,
+        const std::vector<int64_t> &bp, const std::vector<int64_t> &bi,
+        const std::vector<int64_t> &ids, int64_t nblk, int64_t bs,
+        bool &hit);
+
+static py::array_t<double> partial_interior_solve(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> ids_arr,
+        py::array_t<double, py::array::c_style | py::array::forcecast> rhs_arr,
+        int64_t bs) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto ia = ids_arr.request(); auto ra = rhs_arr.request();
+    if (r.size != ncol + 1 || c.size != v.size || ia.ndim != 1 || ia.size <= 0 ||
+        ra.size != ncol || bs <= 0 || ncol % bs != 0)
+        throw std::runtime_error("partial_interior_solve: 参数不符");
+    const int64_t *rp = (const int64_t *)r.ptr;
+    const int64_t *ci = (const int64_t *)c.ptr;
+    const double *hv = (const double *)v.ptr;
+    std::vector<int64_t> all((size_t)ncol);
+    for (int64_t i = 0; i < ncol; ++i) all[(size_t)i] = i;
+    std::vector<double> ones((size_t)ncol, 1.0);
+    CsrSub hA = _extract_csr(rp, ci, hv, ncol, all, all, ones);
+    std::vector<int64_t> bp, bi;
+    _block_pattern_from_csr(hA, bs, bp, bi);
+    const int64_t nblk = hA.rows / bs;
+    {
+        std::vector<std::vector<int64_t>> rows((size_t)nblk);
+        for (int64_t i = 0; i < nblk; ++i)
+            for (int64_t p = bp[(size_t)i]; p < bp[(size_t)i + 1]; ++p)
+                rows[(size_t)i].push_back(bi[(size_t)p]);
+        for (int64_t i = 0; i < ia.size; ++i) {
+            const int64_t bi0 = ((const int64_t *)ia.ptr)[i] / bs;
+            for (int64_t j = 0; j < ia.size; ++j)
+                rows[(size_t)bi0].push_back(((const int64_t *)ia.ptr)[j] / bs);
+        }
+        bp.assign((size_t)nblk + 1, 0); bi.clear();
+        for (int64_t i = 0; i < nblk; ++i) {
+            auto &vv = rows[(size_t)i]; vv.push_back(i);
+            std::sort(vv.begin(), vv.end());
+            vv.erase(std::unique(vv.begin(), vv.end()), vv.end());
+            bp[(size_t)i + 1] = bp[(size_t)i] + (int64_t)vv.size();
+            for (int64_t j : vv) bi.push_back(j);
+        }
+    }
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto ps_t = torch::full({nblk}, bs, optsI);
+    auto bp_t = torch::from_blob(bp.data(), {(int64_t)bp.size()}, optsI).clone();
+    auto bi_t = torch::from_blob(bi.data(), {(int64_t)bi.size()}, optsI).clone();
+    std::vector<int64_t> last;
+    for (int64_t i = 0; i < ia.size; ++i) {
+        int64_t id = ((const int64_t *)ia.ptr)[i];
+        if (id < 0 || id >= nblk)
+            throw std::runtime_error("partial_interior_solve: id 越界");
+        last.push_back(id);
+    }
+    bool cache_hit = false;
+    auto sym = _partial_symbolic(ps_t, bp_t, bi_t, last, bp, bi, last,
+                                 nblk, bs, cache_hit);
+    auto nd = sym->createNumericDecomposition(1);
+    auto rp_t = torch::from_blob(hA.rp.data(), {(int64_t)hA.rp.size()}, optsI)
+                    .clone().to(dev);
+    auto ci_t = torch::from_blob(hA.ci.data(), {(int64_t)hA.ci.size()}, optsI)
+                    .clone().to(dev);
+    auto v_t = torch::from_blob(hA.v.data(), {(int64_t)hA.v.size()}, optsD)
+                   .clone().to(dev);
+    nd.add_M(v_t.reshape({1, v_t.numel()}), rp_t, ci_t);
+    auto ids_t = torch::from_blob(ia.ptr, {(int64_t)ia.size}, optsI).clone();
+    int64_t span = nd.span_boundary(ids_t);
+    nd.factor_upto(span);
+    auto xt = torch::from_blob((void *)ra.ptr, {1, (int64_t)ncol}, optsD)
+                  .clone().to(dev);
+    const int64_t nids = (int64_t)ia.size;
+    const int64_t nfirst = nids / 2;
+    const int64_t q1 = nfirst * bs;
+    const int64_t first_off = ((const int64_t *)ia.ptr)[0] * bs;
+    const int64_t last_off = ((const int64_t *)ia.ptr)[nfirst] * bs;
+    nd.solveL_upto_gpu(xt, span);
+    xt[0].slice(0, first_off, first_off + q1).zero_();
+    xt[0].slice(0, last_off, last_off + (nids - nfirst) * bs).zero_();
+    nd.solveLt_upto_gpu(xt, span);
+    xt[0].slice(0, first_off, first_off + q1).zero_();
+    xt[0].slice(0, last_off, last_off + (nids - nfirst) * bs).zero_();
+    auto xc = xt[0].to(torch::kCPU).contiguous();
+    py::array_t<double> out({(py::ssize_t)ncol});
+    std::memcpy(out.mutable_data(), xc.data_ptr<double>(),
+                sizeof(double) * (size_t)ncol);
+    return out;
+}
+
+// ---- BaSpaCho factorUpTo 探针：接口块留最后，提取 trailing Schur ----
+static py::dict baspacho_partial_probe(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> ids_arr,
+        int64_t bs, int64_t do_factor_from) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto ia = ids_arr.request();
+    if (r.size != ncol + 1 || c.size != v.size || ia.ndim != 1 || ia.size <= 0)
+        throw std::runtime_error("baspacho_partial_probe: 参数维数不符");
+    if (bs <= 0 || ncol % bs != 0)
+        throw std::runtime_error("baspacho_partial_probe: ncol 需被 bs 整除");
+    const int64_t *rp = (const int64_t *)r.ptr;
+    const int64_t *ci = (const int64_t *)c.ptr;
+    const double *hv = (const double *)v.ptr;
+    std::vector<int64_t> all((size_t)ncol);
+    for (int64_t i = 0; i < ncol; ++i) all[(size_t)i] = i;
+    std::vector<double> ones((size_t)ncol, 1.0);
+    auto t0 = std::chrono::steady_clock::now();
+    CsrSub hA = _extract_csr(rp, ci, hv, ncol, all, all, ones);
+    std::vector<int64_t> bp, bi;
+    _block_pattern_from_csr(hA, bs, bp, bi);
+    const int64_t nblk = hA.rows / bs;
+    {
+        std::vector<std::vector<int64_t>> rows((size_t)nblk);
+        for (int64_t i = 0; i < nblk; ++i)
+            for (int64_t p = bp[(size_t)i]; p < bp[(size_t)i + 1]; ++p)
+                rows[(size_t)i].push_back(bi[(size_t)p]);
+        for (int64_t i = 0; i < ia.size; ++i) {
+            const int64_t bi0 = ((const int64_t *)ia.ptr)[i] / bs;
+            for (int64_t j = 0; j < ia.size; ++j)
+                rows[(size_t)bi0].push_back(((const int64_t *)ia.ptr)[j] / bs);
+        }
+        bp.assign((size_t)nblk + 1, 0); bi.clear();
+        for (int64_t i = 0; i < nblk; ++i) {
+            auto &vv = rows[(size_t)i]; vv.push_back(i);
+            std::sort(vv.begin(), vv.end());
+            vv.erase(std::unique(vv.begin(), vv.end()), vv.end());
+            bp[(size_t)i + 1] = bp[(size_t)i] + (int64_t)vv.size();
+            for (int64_t j : vv) bi.push_back(j);
+        }
+    }
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto ps_t = torch::full({nblk}, bs, optsI);
+    auto bp_t = torch::from_blob(bp.data(), {(int64_t)bp.size()}, optsI).clone();
+    auto bi_t = torch::from_blob(bi.data(), {(int64_t)bi.size()}, optsI).clone();
+    std::vector<int64_t> last;
+    for (int64_t i = 0; i < ia.size; ++i) {
+        int64_t id = ((const int64_t *)ia.ptr)[i];
+        if (id < 0 || id >= nblk)
+            throw std::runtime_error("baspacho_partial_probe: id 越界");
+        last.push_back(id);
+    }
+    auto sym = SymbolicDecomposition(ps_t, bp_t, bi_t, "cuda", {}, last,
+                                     /*AddFillComplete=*/0, /*find=*/true);
+    auto nd = sym.createNumericDecomposition(1);
+    auto rp_t = torch::from_blob(hA.rp.data(), {(int64_t)hA.rp.size()}, optsI)
+                    .clone().to(dev);
+    auto ci_t = torch::from_blob(hA.ci.data(), {(int64_t)hA.ci.size()}, optsI)
+                    .clone().to(dev);
+    auto v_t = torch::from_blob(hA.v.data(), {(int64_t)hA.v.size()}, optsD)
+                   .clone().to(dev);
+    nd.add_M(v_t.reshape({1, v_t.numel()}), rp_t, ci_t);
+    cudaDeviceSynchronize();
+        auto t1 = std::chrono::steady_clock::now();
+    auto ids_t = torch::from_blob(ia.ptr, {(int64_t)ia.size}, optsI).clone();
+    int64_t span = nd.span_boundary(ids_t);
+        fflush(stderr);
+    nd.factor_upto(span);
+    cudaDeviceSynchronize();
+        auto t2 = std::chrono::steady_clock::now();
+    auto S = nd.trailing_block_dev(ids_t, bs).cpu();
+    cudaDeviceSynchronize();
+        auto t3 = std::chrono::steady_clock::now();
+    if (do_factor_from) nd.factor_from(span);
+    cudaDeviceSynchronize();
+        auto t4 = std::chrono::steady_clock::now();
+    auto sec = [](auto a, auto b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+        bool finite = bool(torch::isfinite(S).all().item<bool>());
+        py::dict out;
+    {
+        auto Sc = S.contiguous();
+        py::array_t<double> Sa({(py::ssize_t)Sc.size(0), (py::ssize_t)Sc.size(1)});
+        std::memcpy(Sa.mutable_data(), Sc.data_ptr<double>(),
+                    sizeof(double) * (size_t)Sc.numel());
+        out["S"] = Sa;
+    }
+    out["span"] = span;
+    out["nblk"] = nblk;
+    out["nnz"] = (int64_t)hA.ci.size();
+    out["setup_s"] = sec(t0, t1);
+    out["factor_upto_s"] = sec(t1, t2);
+    out["block_s"] = sec(t2, t3);
+    out["factor_from_s"] = sec(t3, t4);
+    out["S_shape"] = py::make_tuple(S.size(0), S.size(1));
+    out["finite"] = finite;
+        return out;
+}
+
+// ---- BaSpaCho 端口因子窗口求解：接口块最后，factorUpTo/factorFrom ----
+static uint64_t _partial_hash(const std::vector<int64_t> &a, uint64_t h) {
+    for (int64_t x : a) { h ^= (uint64_t)x; h *= 1099511628211ull; }
+    return h;
+}
+
+// 故意泄漏：静态 map 若在 CUDA driver 关闭后再析构，会在解释器退出时
+// 触发 "driver shutting down"。缓存只随进程结束，不参与静态析构。
+static auto *g_partial_cache =
+    new std::unordered_map<std::string, std::shared_ptr<SymbolicDecomposition>>();
+
+static std::shared_ptr<SymbolicDecomposition> _partial_symbolic(
+        const torch::Tensor &ps_t, const torch::Tensor &bp_t,
+        const torch::Tensor &bi_t, const std::vector<int64_t> &last,
+        const std::vector<int64_t> &bp, const std::vector<int64_t> &bi,
+        const std::vector<int64_t> &ids, int64_t nblk, int64_t bs,
+        bool &hit) {
+    uint64_t h = 1469598103934665603ull;
+    h = _partial_hash(bp, h);
+    h = _partial_hash(bi, h);
+    h = _partial_hash(ids, h);
+    std::string key = std::to_string(nblk) + "_" + std::to_string(bs) + "_" +
+                      std::to_string(h);
+    auto it = g_partial_cache->find(key);
+    if (it != g_partial_cache->end()) { hit = true; return it->second; }
+    hit = false;
+    auto sym = std::make_shared<SymbolicDecomposition>(
+        ps_t, bp_t, bi_t, "cuda", std::vector<int64_t>{}, last,
+        /*AddFillComplete=*/0, /*find=*/true);
+    (*g_partial_cache)[key] = sym;
+    return sym;
+}
+
+static py::dict baspacho_partial_solve(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> ids_arr,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g_arr,
+        int64_t bs) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto ia = ids_arr.request(); auto ga = g_arr.request();
+    if (r.size != ncol + 1 || c.size != v.size || ia.ndim != 1 ||
+        ia.size <= 0 || ia.size % 2 != 0 || ga.size != ncol)
+        throw std::runtime_error("baspacho_partial_solve: 参数维数不符");
+    const int64_t *rp = (const int64_t *)r.ptr;
+    const int64_t *ci = (const int64_t *)c.ptr;
+    const double *hv = (const double *)v.ptr;
+    std::vector<int64_t> all((size_t)ncol);
+    for (int64_t i = 0; i < ncol; ++i) all[(size_t)i] = i;
+    std::vector<double> ones((size_t)ncol, 1.0);
+    auto t0 = std::chrono::steady_clock::now();
+    CsrSub hA = _extract_csr(rp, ci, hv, ncol, all, all, ones);
+    std::vector<int64_t> bp, bi;
+    _block_pattern_from_csr(hA, bs, bp, bi);
+    const int64_t nblk = hA.rows / bs;
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto ps_t = torch::full({nblk}, bs, optsI);
+    auto bp_t = torch::from_blob(bp.data(), {(int64_t)bp.size()}, optsI).clone();
+    auto bi_t = torch::from_blob(bi.data(), {(int64_t)bi.size()}, optsI).clone();
+    std::vector<int64_t> last;
+    for (int64_t i = 0; i < ia.size; ++i) {
+        int64_t id = ((const int64_t *)ia.ptr)[i];
+        if (id < 0 || id >= nblk)
+            throw std::runtime_error("baspacho_partial_solve: id 越界");
+        last.push_back(id);
+    }
+    bool cache_hit = false;
+    auto sym = _partial_symbolic(ps_t, bp_t, bi_t, last, bp, bi, last,
+                                 nblk, bs, cache_hit);
+    auto nd = sym->createNumericDecomposition(1);
+    auto rp_t = torch::from_blob(hA.rp.data(), {(int64_t)hA.rp.size()}, optsI)
+                    .clone().to(dev);
+    auto ci_t = torch::from_blob(hA.ci.data(), {(int64_t)hA.ci.size()}, optsI)
+                    .clone().to(dev);
+    auto v_t = torch::from_blob(hA.v.data(), {(int64_t)hA.v.size()}, optsD)
+                   .clone().to(dev);
+    nd.add_M(v_t.reshape({1, v_t.numel()}), rp_t, ci_t);
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::steady_clock::now();
+    auto ids_t = torch::from_blob(ia.ptr, {(int64_t)ia.size}, optsI).clone();
+    int64_t span = nd.span_boundary(ids_t);
+    nd.factor_upto(span);
+    cudaDeviceSynchronize();
+    auto t2 = std::chrono::steady_clock::now();
+    auto S = nd.trailing_block_dev(ids_t, bs);
+    cudaDeviceSynchronize();
+    auto t3 = std::chrono::steady_clock::now();
+    const int64_t nids = (int64_t)ia.size;
+    const int64_t nfirst = nids / 2;
+    const int64_t q1 = nfirst * bs;
+    const int64_t q2 = (nids - nfirst) * bs;
+    auto Sg = S.to(dev);
+    auto S11 = Sg.slice(0, 0, q1).slice(1, 0, q1);
+    auto S12 = Sg.slice(0, 0, q1).slice(1, q1, q1 + q2);
+    auto S22 = Sg.slice(0, q1, q1 + q2).slice(1, q1, q1 + q2);
+    auto S11j = S11.clone();
+    {
+        auto dg = torch::diagonal(S11j);
+        auto jit = 1e-12 * dg.abs().max().clamp_min(1e-30);
+        S11j += jit * torch::eye(q1, optsD.device(dev));
+    }
+    auto Lc = torch::linalg_cholesky(S11j);
+    auto Xc = torch::linalg_solve_triangular(Lc, S12, /*upper=*/false);
+    auto Yc = torch::linalg_solve_triangular(Lc.transpose(0, 1), Xc, /*upper=*/true);
+    auto Pnext = S22 - S12.transpose(0, 1).matmul(Yc);
+    Pnext = 0.5 * (Pnext + Pnext.transpose(0, 1));
+    auto S22j = S22.clone();
+    {
+        auto dg = torch::diagonal(S22j);
+        auto jit = 1e-12 * dg.abs().max().clamp_min(1e-30);
+        S22j += jit * torch::eye(q2, optsD.device(dev));
+    }
+    auto L2 = torch::linalg_cholesky(S22j);
+    auto X2 = torch::linalg_solve_triangular(L2, S12.transpose(0, 1), false);
+    auto Y2 = torch::linalg_solve_triangular(L2.transpose(0, 1), X2, true);
+    auto Pfirst = S11 - S12.matmul(Y2);
+    Pfirst = 0.5 * (Pfirst + Pfirst.transpose(0, 1));
+    auto t4 = std::chrono::steady_clock::now();
+    nd.factor_from(span);
+    cudaDeviceSynchronize();
+    auto t5 = std::chrono::steady_clock::now();
+    auto gt = torch::from_blob((void *)ga.ptr, {1, (int64_t)ncol}, optsD)
+                  .clone().to(dev);
+    nd.solve(gt);
+    cudaDeviceSynchronize();
+    auto t6 = std::chrono::steady_clock::now();
+    auto xc = gt[0].to(torch::kCPU).contiguous();
+    auto Pc = Pnext.to(torch::kCPU).contiguous();
+    auto center = xc.narrow(0, ncol - q2, q2).contiguous();
+    py::array_t<double> xo({(py::ssize_t)ncol});
+    py::array_t<double> Po({(py::ssize_t)q2, (py::ssize_t)q2});
+    py::array_t<double> co({(py::ssize_t)q2});
+    std::memcpy(xo.mutable_data(), xc.data_ptr<double>(), sizeof(double) * (size_t)ncol);
+    std::memcpy(Po.mutable_data(), Pc.data_ptr<double>(), sizeof(double) * (size_t)q2 * q2);
+    std::memcpy(co.mutable_data(), center.data_ptr<double>(), sizeof(double) * (size_t)q2);
+    py::dict out;
+    out["x"] = xo; out["Pnext"] = Po; out["center"] = co;
+    auto sec = [](auto a, auto b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    out["span"] = span;
+    out["cache_hit"] = cache_hit;
+    out["setup_s"] = sec(t0, t1);
+    out["factor_upto_s"] = sec(t1, t2);
+    out["block_s"] = sec(t2, t3);
+    out["marginal_s"] = sec(t3, t4);
+    out["factor_from_s"] = sec(t4, t5);
+    out["solve_s"] = sec(t5, t6);
+    out["finite"] = bool(torch::isfinite(gt).all().item<bool>() &&
+                         torch::isfinite(Pnext).all().item<bool>() &&
+                         torch::isfinite(Pfirst).all().item<bool>());
+    return out;
+}
+
+// ---- 端口因子 + 独立 prior 块：避免 Python 端 49M nnz CSR 加法 ----
+static py::dict baspacho_partial_solve_prior(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> ids_arr,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g_arr,
+        int64_t bs,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> P_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> P_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> P_val,
+        int64_t prior_off,
+        py::object scale_obj,
+        py::object P2_rp_obj, py::object P2_ci_obj, py::object P2_val_obj,
+        int64_t prior2_off, int64_t do_cov, int64_t need_pfirst,
+        int64_t port_ldl, int64_t do_gain) {
+    auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
+    auto ia = ids_arr.request(); auto ga = g_arr.request();
+    auto pr = P_rp.request(); auto pc = P_ci.request(); auto pv = P_val.request();
+    const int64_t qp = (int64_t)pr.size - 1;
+    if (r.size != ncol + 1 || c.size != v.size || ia.ndim != 1 ||
+        ia.size <= 0 || ia.size % 2 != 0 || ga.size != ncol ||
+        pr.size <= 1 || pc.size != pv.size || prior_off < 0 ||
+        prior_off + qp > ncol)
+        throw std::runtime_error("baspacho_partial_solve_prior: 参数维数不符");
+    const int64_t *rp = (const int64_t *)r.ptr;
+    const int64_t *ci = (const int64_t *)c.ptr;
+    const double *hv = (const double *)v.ptr;
+    const int64_t *prp = (const int64_t *)pr.ptr;
+    const int64_t *pci = (const int64_t *)pc.ptr;
+    const double *pval = (const double *)pv.ptr;
+    const bool has2 = !P2_rp_obj.is_none();
+    py::array_t<int64_t, py::array::c_style | py::array::forcecast> P2_rp_a, P2_ci_a;
+    py::array_t<double, py::array::c_style | py::array::forcecast> P2_val_a;
+    const int64_t *p2rp = nullptr; const int64_t *p2ci = nullptr;
+    const double *p2val = nullptr; int64_t qp2 = 0;
+    if (has2) {
+        P2_rp_a = P2_rp_obj.cast<py::array_t<int64_t, py::array::c_style | py::array::forcecast>>();
+        P2_ci_a = P2_ci_obj.cast<py::array_t<int64_t, py::array::c_style | py::array::forcecast>>();
+        P2_val_a = P2_val_obj.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        auto r2 = P2_rp_a.request(); auto c2 = P2_ci_a.request(); auto v2 = P2_val_a.request();
+        qp2 = (int64_t)r2.size - 1;
+        if (r2.size <= 1 || c2.size != v2.size || prior2_off < 0 ||
+            prior2_off + qp2 > ncol || qp2 != qp)
+            throw std::runtime_error("baspacho_partial_solve_prior: 第二 prior 维数不符");
+        p2rp = (const int64_t *)r2.ptr; p2ci = (const int64_t *)c2.ptr;
+        p2val = (const double *)v2.ptr;
+    }
+    std::vector<double> d((size_t)ncol, 1.0);
+    if (!scale_obj.is_none()) {
+        auto sc = scale_obj.cast<
+            py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        auto sa = sc.request();
+        if (sa.size != ncol)
+            throw std::runtime_error("baspacho_partial_solve_prior: scale 长度 != ncol");
+        std::memcpy(d.data(), sa.ptr, sizeof(double) * (size_t)ncol);
+    }
+    std::vector<int64_t> all((size_t)ncol);
+    for (int64_t i = 0; i < ncol; ++i) all[(size_t)i] = i;
+    std::vector<double> ones((size_t)ncol, 1.0);
+    auto t0 = std::chrono::steady_clock::now();
+    CsrSub hA = _extract_csr(rp, ci, hv, ncol, all, all, ones);
+    std::vector<int64_t> bp, bi;
+    _block_pattern_from_csr(hA, bs, bp, bi);
+    const int64_t nblk = hA.rows / bs;
+    // 把 prior 块的实际 6×6 块对并入符号图案（prior 可能是块对角或稠密）。
+    {
+        std::vector<std::vector<int64_t>> rows((size_t)nblk);
+        for (int64_t i = 0; i < nblk; ++i) {
+            for (int64_t p = bp[(size_t)i]; p < bp[(size_t)i + 1]; ++p)
+                rows[(size_t)i].push_back(bi[(size_t)p]);
+        }
+        // 固定把 prior 节点当作稠密块图：prior 值可能是块对角或稠密，
+        // 但符号图案必须跨窗稳定，否则每次 Pnext 的零元素变化都会击穿缓存。
+        auto _add_dense_node = [&](int64_t off, int64_t qq) {
+            const int64_t pb0 = off / bs;
+            const int64_t pnb = qq / bs;
+            for (int64_t i = 0; i < pnb; ++i)
+                for (int64_t j = 0; j < pnb; ++j)
+                    rows[(size_t)(pb0 + i)].push_back(pb0 + j);
+        };
+        _add_dense_node(prior_off, qp);
+        if (has2) _add_dense_node(prior2_off, qp2);
+        // 两个端口之间的 fill 也必须预先存在；否则 factorUpTo 没有位置写
+        // Schur 的 cross 块，trailing_block 会读回错误的 S。
+        for (int64_t i = 0; i < ia.size; ++i) {
+            const int64_t bi0 = ((const int64_t *)ia.ptr)[i] / bs;
+            for (int64_t j = 0; j < ia.size; ++j) {
+                const int64_t bj0 = ((const int64_t *)ia.ptr)[j] / bs;
+                rows[(size_t)bi0].push_back(bj0);
+            }
+        }
+        bp.assign((size_t)nblk + 1, 0);
+        bi.clear();
+        for (int64_t i = 0; i < nblk; ++i) {
+            auto &vv = rows[(size_t)i];
+            vv.push_back(i);
+            std::sort(vv.begin(), vv.end());
+            vv.erase(std::unique(vv.begin(), vv.end()), vv.end());
+            bp[(size_t)i + 1] = bp[(size_t)i] + (int64_t)vv.size();
+            for (int64_t j : vv) bi.push_back(j);
+        }
+    }
+    auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+    auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+    auto dev = torch::kCUDA;
+    auto ps_t = torch::full({nblk}, bs, optsI);
+    auto bp_t = torch::from_blob(bp.data(), {(int64_t)bp.size()}, optsI).clone();
+    auto bi_t = torch::from_blob(bi.data(), {(int64_t)bi.size()}, optsI).clone();
+    std::vector<int64_t> last;
+    for (int64_t i = 0; i < ia.size; ++i) {
+        int64_t id = ((const int64_t *)ia.ptr)[i];
+        if (id < 0 || id >= nblk)
+            throw std::runtime_error("baspacho_partial_solve_prior: id 越界");
+        last.push_back(id);
+    }
+    bool cache_hit = false;
+    auto sym = _partial_symbolic(ps_t, bp_t, bi_t, last, bp, bi, last,
+                                 nblk, bs, cache_hit);
+    auto nd = sym->createNumericDecomposition(1);
+    auto rp_t = torch::from_blob(hA.rp.data(), {(int64_t)hA.rp.size()}, optsI)
+                    .clone().to(dev);
+    auto ci_t = torch::from_blob(hA.ci.data(), {(int64_t)hA.ci.size()}, optsI)
+                    .clone().to(dev);
+    auto v_t = torch::from_blob(hA.v.data(), {(int64_t)hA.v.size()}, optsD)
+                   .clone().to(dev);
+    nd.add_M(v_t.reshape({1, v_t.numel()}), rp_t, ci_t);
+    // prior 嵌入 ncol CSR：局部 (r,c) -> (off+r, off+c)，并做 D_p M D_p。
+    std::vector<int64_t> xrp((size_t)ncol + 1, 0);
+    std::vector<int64_t> xci;
+    std::vector<double> xval;
+    xci.reserve((size_t)pc.size);
+    xval.reserve((size_t)pc.size);
+    for (int64_t i = 0; i < ncol; ++i) {
+        int64_t cnt = 0;
+        if (i >= prior_off && i < prior_off + qp) {
+            const int64_t lr = i - prior_off;
+            cnt = prp[lr + 1] - prp[lr];
+            for (int64_t p = prp[lr]; p < prp[lr + 1]; ++p) {
+                const int64_t lc = pci[p];
+                xci.push_back(prior_off + lc);
+                xval.push_back(pval[p] * d[(size_t)i] * d[(size_t)(prior_off + lc)]);
+            }
+        }
+        xrp[(size_t)i + 1] = xrp[(size_t)i] + cnt;
+    }
+    auto xrp_t = torch::from_blob(xrp.data(), {(int64_t)xrp.size()}, optsI)
+                     .clone().to(dev);
+    auto xci_t = torch::from_blob(xci.data(), {(int64_t)xci.size()}, optsI)
+                     .clone().to(dev);
+    auto xv_t = torch::from_blob(xval.data(), {(int64_t)xval.size()}, optsD)
+                    .clone().to(dev);
+    if (xci.size()) nd.add_M(xv_t.reshape({1, xv_t.numel()}), xrp_t, xci_t);
+    if (has2) {
+        std::vector<int64_t> rp2((size_t)ncol + 1, 0);
+        std::vector<int64_t> ci2;
+        std::vector<double> v2;
+        ci2.reserve((size_t)P2_ci_a.size());
+        v2.reserve((size_t)P2_val_a.size());
+        for (int64_t i = 0; i < ncol; ++i) {
+            int64_t cnt = 0;
+            if (i >= prior2_off && i < prior2_off + qp2) {
+                const int64_t lr = i - prior2_off;
+                cnt = p2rp[lr + 1] - p2rp[lr];
+                for (int64_t p = p2rp[lr]; p < p2rp[lr + 1]; ++p) {
+                    const int64_t lc = p2ci[p];
+                    ci2.push_back(prior2_off + lc);
+                    v2.push_back(p2val[p] * d[(size_t)i] *
+                                 d[(size_t)(prior2_off + lc)]);
+                }
+            }
+            rp2[(size_t)i + 1] = rp2[(size_t)i] + cnt;
+        }
+        auto rp2_t = torch::from_blob(rp2.data(), {(int64_t)rp2.size()}, optsI)
+                         .clone().to(dev);
+        auto ci2_t = torch::from_blob(ci2.data(), {(int64_t)ci2.size()}, optsI)
+                         .clone().to(dev);
+        auto v2_t = torch::from_blob(v2.data(), {(int64_t)v2.size()}, optsD)
+                        .clone().to(dev);
+        if (ci2.size()) nd.add_M(v2_t.reshape({1, v2_t.numel()}), rp2_t, ci2_t);
+    }
+    nd.damp(torch::zeros(1, optsD.device(dev)),
+            torch::full({1}, 1e-9, optsD.device(dev)));
+    cudaDeviceSynchronize();
+    auto t1 = std::chrono::steady_clock::now();
+    auto ids_t = torch::from_blob(ia.ptr, {(int64_t)ia.size}, optsI).clone();
+    int64_t span = nd.span_boundary(ids_t);
+    nd.factor_upto(span);
+    cudaDeviceSynchronize();
+    auto t2 = std::chrono::steady_clock::now();
+    auto S = nd.trailing_block_dev(ids_t, bs);
+    cudaDeviceSynchronize();
+    auto t3 = std::chrono::steady_clock::now();
+    const int64_t nids = (int64_t)ia.size;
+    const int64_t nfirst = nids / 2;
+    const int64_t q1 = nfirst * bs;
+    const int64_t q2 = (nids - nfirst) * bs;
+    auto Sg = S.to(dev);
+    auto S11 = Sg.slice(0, 0, q1).slice(1, 0, q1);
+    auto S12 = Sg.slice(0, 0, q1).slice(1, q1, q1 + q2);
+    auto S22 = Sg.slice(0, q1, q1 + q2).slice(1, q1, q1 + q2);
+    auto S11j = S11.clone();
+    {
+        auto dg = torch::diagonal(S11j);
+        auto jit = 1e-12 * dg.abs().max().clamp_min(1e-30);
+        S11j += jit * torch::eye(q1, optsD.device(dev));
+    }
+    auto Lc = torch::linalg_cholesky(S11j);
+    auto Xc = torch::linalg_solve_triangular(Lc, S12, /*upper=*/false);
+    auto Yc = torch::linalg_solve_triangular(Lc.transpose(0, 1), Xc, /*upper=*/true);
+    auto Pnext = S22 - S12.transpose(0, 1).matmul(Yc);
+    Pnext = 0.5 * (Pnext + Pnext.transpose(0, 1));
+    torch::Tensor Pfirst;
+    if (need_pfirst) {
+        auto S22j = S22.clone();
+        {
+            auto dg = torch::diagonal(S22j);
+            auto jit = 1e-12 * dg.abs().max().clamp_min(1e-30);
+            S22j += jit * torch::eye(q2, optsD.device(dev));
+        }
+        auto L2 = torch::linalg_cholesky(S22j);
+        auto X2 = torch::linalg_solve_triangular(L2, S12.transpose(0, 1), false);
+        auto Y2 = torch::linalg_solve_triangular(L2.transpose(0, 1), X2, true);
+        Pfirst = S11 - S12.matmul(Y2);
+        Pfirst = 0.5 * (Pfirst + Pfirst.transpose(0, 1));
+    } else {
+        Pfirst = torch::zeros({1, 1}, optsD);
+    }
+    auto t4 = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t5, t6;
+    auto gt = torch::from_blob((void *)ga.ptr, {1, (int64_t)ncol}, optsD)
+                  .clone().to(dev);
+    torch::Tensor xc_t;
+    if (port_ldl) {
+        // 端口参数 -> S 块位置（首端口 0..q1，末端口 q1..q1+q2）
+        const int64_t *idp = (const int64_t *)ia.ptr;
+        std::vector<int64_t> ppos((size_t)ncol, -1);
+        for (int64_t j = 0; j < nfirst; ++j)
+            for (int64_t a = 0; a < bs; ++a)
+                ppos[(size_t)(idp[j] * bs + a)] = j * bs + a;
+        for (int64_t j = 0; j < nids - nfirst; ++j)
+            for (int64_t a = 0; a < bs; ++a)
+                ppos[(size_t)(idp[nfirst + j] * bs + a)] = q1 + j * bs + a;
+        // 1) 内部零端口解 x_I0 = A_II^{-1} g_I（复用 factorUpTo 的内部因子）
+        auto xt = gt.clone();
+        nd.solveL_upto_gpu(xt, span);
+        for (int64_t p = 0; p < ncol; ++p)
+            if (ppos[(size_t)p] >= 0) xt[0][p] = 0.0;
+        nd.solveLt_upto_gpu(xt, span);
+        for (int64_t p = 0; p < ncol; ++p)
+            if (ppos[(size_t)p] >= 0) xt[0][p] = 0.0;
+        auto xI0 = xt[0].to(torch::kCPU).contiguous();
+        auto xI0p = xI0.data_ptr<double>();
+        // 2) 端口右端 rhs_B = g_B - H_BI x_I0；H 的 prior 只落在端口，故 H_BI = AtA_BI
+        const double *gvp = (const double *)ga.ptr;
+        std::vector<double> rb((size_t)(q1 + q2), 0.0);
+        for (int64_t p = 0; p < ncol; ++p)
+            if (ppos[(size_t)p] >= 0) rb[(size_t)ppos[(size_t)p]] = gvp[p];
+        for (int64_t i = 0; i < ncol; ++i) {
+            if (ppos[(size_t)i] >= 0) continue;
+            double xi = xI0p[i];
+            if (xi == 0.0) continue;
+            for (int64_t p = hA.rp[(size_t)i]; p < hA.rp[(size_t)i + 1]; ++p) {
+                int64_t j = hA.ci[(size_t)p];
+                int64_t pj = ppos[(size_t)j];
+                if (pj >= 0) rb[(size_t)pj] -= hA.v[(size_t)p] * xi;
+            }
+        }
+        // 3) 块 LDL：S = [[S11,S12],[S12ᵀ,S22]]，复用 Lc 与 Pnext
+        auto rbt = torch::from_blob(rb.data(), {1, q1 + q2}, optsD).clone().to(dev);
+        auto z1 = torch::linalg_solve_triangular(
+            Lc, rbt[0].narrow(0, 0, q1).unsqueeze(1), /*upper=*/false);
+        z1 = torch::linalg_solve_triangular(
+            Lc.transpose(0, 1), z1, /*upper=*/true);
+        auto r2p = rbt[0].narrow(0, q1, q2).unsqueeze(1) -
+                   torch::matmul(S12.transpose(0, 1), z1);
+        auto Pnj = Pnext.clone();
+        {
+            auto dg = torch::diagonal(Pnj);
+            auto jit = 1e-12 * dg.abs().max().clamp_min(1e-30);
+            Pnj += jit * torch::eye(q2, optsD.device(dev));
+        }
+        auto L2b = torch::linalg_cholesky(Pnj);
+        auto y2 = torch::linalg_solve_triangular(L2b, r2p, false);
+        y2 = torch::linalg_solve_triangular(L2b.transpose(0, 1), y2, true);
+        auto y1 = z1 - torch::matmul(Yc, y2);
+        auto yt = torch::cat({y1.squeeze(1), y2.squeeze(1)});
+        auto yc = yt.to(torch::kCPU).contiguous();
+        auto ycp = yc.data_ptr<double>();
+        t5 = std::chrono::steady_clock::now();
+        // 4) 内部条件 A_II x_I = g_I - H_IB y_B，复用同一内部因子
+        std::vector<double> ri((size_t)ncol, 0.0);
+        for (int64_t i = 0; i < ncol; ++i) {
+            if (ppos[(size_t)i] >= 0) continue;
+            double s = gvp[i];
+            for (int64_t p = hA.rp[(size_t)i]; p < hA.rp[(size_t)i + 1]; ++p) {
+                int64_t j = hA.ci[(size_t)p];
+                int64_t pj = ppos[(size_t)j];
+                if (pj >= 0) s -= hA.v[(size_t)p] * ycp[pj];
+            }
+            ri[(size_t)i] = s;
+        }
+        auto xt2 = torch::from_blob(ri.data(), {1, ncol}, optsD).clone().to(dev);
+        nd.solveL_upto_gpu(xt2, span);
+        for (int64_t p = 0; p < ncol; ++p)
+            if (ppos[(size_t)p] >= 0) xt2[0][p] = 0.0;
+        nd.solveLt_upto_gpu(xt2, span);
+        for (int64_t p = 0; p < ncol; ++p)
+            if (ppos[(size_t)p] >= 0) xt2[0][p] = 0.0;
+        auto xIc = xt2[0].to(torch::kCPU).contiguous();
+        auto xIcp = xIc.data_ptr<double>();
+        std::vector<double> xv((size_t)ncol);
+        for (int64_t p = 0; p < ncol; ++p)
+            xv[(size_t)p] = (ppos[(size_t)p] >= 0) ? ycp[ppos[(size_t)p]]
+                                                   : xIcp[p];
+        xc_t = torch::from_blob(xv.data(), {ncol}, optsD).clone();
+        cudaDeviceSynchronize();
+        t6 = std::chrono::steady_clock::now();
+    } else {
+        nd.factor_from(span);
+        cudaDeviceSynchronize();
+        t5 = std::chrono::steady_clock::now();
+        nd.solve(gt);
+        cudaDeviceSynchronize();
+        t6 = std::chrono::steady_clock::now();
+        xc_t = gt[0];
+    }
+    auto xc = xc_t.to(torch::kCPU).contiguous();
+    auto Pc = Pnext.to(torch::kCPU).contiguous();
+    const int64_t first_off = ((const int64_t *)ia.ptr)[0] * bs;
+    const int64_t last_off = ((const int64_t *)ia.ptr)[nfirst] * bs;
+    auto center = xc.narrow(0, last_off, q2).contiguous();
+    auto center_first = xc.narrow(0, first_off, q1).contiguous();
+    auto dt = torch::from_blob(d.data(), {(int64_t)ncol}, optsD).clone();
+    auto xorig = xc * dt;
+    auto dl = dt.narrow(0, last_off, q2);
+    auto df = dt.narrow(0, first_off, q1);
+    auto Porig = Pc / (dl.unsqueeze(1) * dl.unsqueeze(0));
+    torch::Tensor Pf_orig;
+    if (need_pfirst) {
+        auto Pfc = Pfirst.to(torch::kCPU).contiguous();
+        Pf_orig = Pfc / (df.unsqueeze(1) * df.unsqueeze(0));
+    } else {
+        Pf_orig = torch::zeros({q1, q1}, optsD);
+    }
+    auto corig = center * dl;
+    auto cf_orig = center_first * df;
+    py::array_t<double> xo({(py::ssize_t)ncol});
+    py::array_t<double> Po({(py::ssize_t)q2, (py::ssize_t)q2});
+    py::array_t<double> Pfo({(py::ssize_t)q1, (py::ssize_t)q1});
+    py::array_t<double> co({(py::ssize_t)q2});
+    py::array_t<double> cfo({(py::ssize_t)q1});
+    std::memcpy(xo.mutable_data(), xorig.data_ptr<double>(), sizeof(double) * (size_t)ncol);
+    std::memcpy(Po.mutable_data(), Porig.data_ptr<double>(), sizeof(double) * (size_t)q2 * q2);
+    std::memcpy(Pfo.mutable_data(), Pf_orig.data_ptr<double>(), sizeof(double) * (size_t)q1 * q1);
+    std::memcpy(co.mutable_data(), corig.data_ptr<double>(), sizeof(double) * (size_t)q2);
+    std::memcpy(cfo.mutable_data(), cf_orig.data_ptr<double>(), sizeof(double) * (size_t)q1);
+    py::dict out;
+    out["x"] = xo; out["Pnext"] = Po; out["center"] = co;
+    out["Pfirst"] = Pfo; out["center_first"] = cfo;
+    if (do_gain) {
+        // RTS 增益 G = (A_data+P)^{-1} C_data = Yc（scaled）；
+        // 前向已经算过，T3 直接复用，省掉每窗 probe + 稠密 solve。
+        auto Gc = Yc.to(torch::kCPU).contiguous();
+        py::array_t<double> gg({(py::ssize_t)q1, (py::ssize_t)q2});
+        std::memcpy(gg.mutable_data(), Gc.data_ptr<double>(),
+                    sizeof(double) * (size_t)q1 * q2);
+        out["gain"] = gg;
+    }
+    auto sec = [](auto a, auto b) {
+        return std::chrono::duration<double>(b - a).count();
+    };
+    out["span"] = span; out["cache_hit"] = cache_hit;
+    out["setup_s"] = sec(t0, t1);
+    out["factor_upto_s"] = sec(t1, t2);
+    out["block_s"] = sec(t2, t3);
+    out["marginal_s"] = sec(t3, t4);
+    out["factor_from_s"] = sec(t4, t5);
+    out["solve_s"] = sec(t5, t6);
+    out["factor_mb"] = (double)nd.data_size() * 8.0 / 1e6;
+    if (do_cov) {
+        // 全因子必须完整；port_ldl 路径没有调用 factor_from，这里补一次。
+        if (port_ldl) { nd.factor_from(span); cudaDeviceSynchronize(); }
+        // 全因子已由 factor_from 完成；Takahashi 取逐 6×6 逆对角块。
+        // factor 是 H'=D H D，故 P=D P' D；raw 为 span 序，用 param_to_span 还原。
+        auto perm = nd.param_to_span().to(torch::kCPU).contiguous();
+        auto raw = nd.compute_diag_blocks(bs).to(torch::kCPU).contiguous();
+        const int64_t nb = ncol / bs;
+        auto pv = perm.data_ptr<int64_t>();
+        auto rv = raw.data_ptr<double>();
+        py::array_t<double> dp({(py::ssize_t)nb, (py::ssize_t)bs,
+                                (py::ssize_t)bs});
+        auto dv = dp.mutable_data();
+        auto dtc = dt.to(torch::kCPU).contiguous();
+        auto dvv = dtc.data_ptr<double>();
+        for (int64_t i = 0; i < nb; ++i) {
+            int64_t s = pv[i];
+            for (int64_t a = 0; a < bs; ++a)
+                for (int64_t b = 0; b < bs; ++b)
+                    dv[(i * bs + a) * bs + b] =
+                        rv[(s * bs + a) * bs + b] * dvv[i * bs + a] *
+                        dvv[i * bs + b];
+        }
+        out["diagP"] = dp;
+    }
+    out["finite"] = bool(torch::isfinite(gt).all().item<bool>() &&
+                         torch::isfinite(Pnext).all().item<bool>() &&
+                         torch::isfinite(Pfirst).all().item<bool>());
+    return out;
+}
+
+// ---- 精确接口 Schur 算子（矩阵自由，不 materialize 2q×2q）----
+static CsrSub _extract_csr(
+        const int64_t *rp, const int64_t *ci, const double *hv, int64_t ncol,
+        const std::vector<int64_t> &rows, const std::vector<int64_t> &cols,
+        const std::vector<double> &d) {
+    CsrSub out;
+    out.rows = (int64_t)rows.size();
+    out.cols = (int64_t)cols.size();
+    std::vector<int64_t> cmap((size_t)ncol, -1);
+    for (int64_t j = 0; j < out.cols; ++j) cmap[(size_t)cols[j]] = j;
+    out.rp.assign((size_t)out.rows + 1, 0);
+    for (int64_t i = 0; i < out.rows; ++i) {
+        int64_t r = rows[i];
+        for (int64_t p = rp[r]; p < rp[r + 1]; ++p) {
+            int64_t cj = cmap[(size_t)ci[p]];
+            if (cj >= 0) {
+                out.ci.push_back(cj);
+                out.v.push_back(hv[p] * d[(size_t)r] * d[(size_t)ci[p]]);
+            }
+        }
+        out.rp[i + 1] = (int64_t)out.ci.size();
+    }
+    return out;
+}
+
+static void _csr_mm(const CsrSub &A, const double *X, int64_t xr,
+                    int64_t r, std::vector<double> &Y, bool subtract=false) {
+    for (int64_t i = 0; i < A.rows; ++i)
+        for (int64_t p = A.rp[i]; p < A.rp[i + 1]; ++p) {
+            int64_t c = A.ci[p];
+            double a = A.v[p];
+            for (int64_t b = 0; b < r; ++b) {
+                double &dst = Y[(size_t)i * r + b];
+                if (subtract) dst -= a * X[(size_t)c * r + b];
+                else dst += a * X[(size_t)c * r + b];
+            }
+        }
+}
+
+class InterfaceSchur {
+   public:
+    InterfaceSchur(
+            py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+            py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+            py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+            int64_t ncol, int64_t off, int64_t q, py::object scale_obj) {
+        auto rp_a = H_rp.request(); auto ci_a = H_ci.request();
+        auto val_a = H_val.request();
+        if (rp_a.size != ncol + 1 || ci_a.size != val_a.size)
+            throw std::runtime_error("InterfaceSchur: H CSR 形状不符");
+        if (q <= 0 || off <= q || off + q > ncol)
+            throw std::runtime_error("InterfaceSchur: off/q 越界");
+        ncol_ = ncol; off_ = off; q_ = q;
+        const int64_t *rp = (const int64_t *)rp_a.ptr;
+        const int64_t *ci = (const int64_t *)ci_a.ptr;
+        const double *hv = (const double *)val_a.ptr;
+        std::vector<double> d((size_t)ncol, 1.0);
+        if (!scale_obj.is_none()) {
+            auto sc = scale_obj.cast<
+                py::array_t<double, py::array::c_style | py::array::forcecast>>();
+            auto sa = sc.request();
+            if (sa.size != ncol)
+                throw std::runtime_error("InterfaceSchur: scale 长度 != ncol");
+            std::memcpy(d.data(), sa.ptr, sizeof(double) * (size_t)ncol);
+        }
+        // E = 首节点 + 末节点，I = 中间节点。
+        std::vector<int64_t> E, I, L, R;
+        for (int64_t i = 0; i < q; ++i) { E.push_back(i); L.push_back(i); }
+        for (int64_t i = q; i < off; ++i) I.push_back(i);
+        for (int64_t i = off; i < off + q; ++i) { E.push_back(i); R.push_back(i); }
+        nI_ = (int64_t)I.size();
+        if (nI_ <= 0) throw std::runtime_error("InterfaceSchur: 内部维数为 0");
+        hEE_ = _extract_csr(rp, ci, hv, ncol, E, E, d);
+        hEI_ = _extract_csr(rp, ci, hv, ncol, E, I, d);
+        hIE_ = _extract_csr(rp, ci, hv, ncol, I, E, d);
+        CsrSub hII = _extract_csr(rp, ci, hv, ncol, I, I, d);
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        auto optsI = torch::TensorOptions().dtype(torch::kInt64);
+        auto dev = torch::kCUDA;
+        auto rp_t = torch::from_blob(hII.rp.data(), {(int64_t)hII.rp.size()}, optsI)
+                        .clone().to(torch::kInt32).to(dev);
+        auto ci_t = torch::from_blob(hII.ci.data(), {(int64_t)hII.ci.size()}, optsI)
+                        .clone().to(torch::kInt32).to(dev);
+        auto v_t = torch::from_blob(hII.v.data(), {(int64_t)hII.v.size()}, optsD)
+                       .clone().to(dev);
+        lu_ = std::make_unique<CusolverLUSolver>(1, nI_, rp_t, ci_t, AMD);
+        auto sing = lu_->factor(v_t.reshape({1, v_t.numel()}));
+        if (!sing.empty() && sing[0] >= 0)
+            throw std::runtime_error("InterfaceSchur: H_II 奇异 at " +
+                                     std::to_string(sing[0]));
+    }
+
+    py::array_t<double> apply(
+            py::array_t<double, py::array::c_style | py::array::forcecast> X) {
+        auto xa = X.request();
+        if (xa.ndim != 2 || xa.shape[0] != 2 * q_)
+            throw std::runtime_error("InterfaceSchur.apply: X 需 (2q,r)");
+        const int64_t r = (int64_t)xa.shape[1];
+        const double *xp = (const double *)xa.ptr;
+        // W = H_IE X
+        std::vector<double> W((size_t)nI_ * r, 0.0);
+        _csr_mm(hIE_, xp, 2 * q_, r, W, false);
+        auto optsD = torch::TensorOptions().dtype(torch::kFloat64);
+        auto B = torch::zeros({1, r * nI_}, optsD);
+        {
+            auto ba = B.accessor<double, 2>();
+            for (int64_t b = 0; b < r; ++b)
+                for (int64_t i = 0; i < nI_; ++i)
+                    ba[0][b * nI_ + i] = W[(size_t)i * r + b];
+        }
+        B = B.to(torch::kCUDA);
+        lu_->solve_multi(B, r);
+        auto Y = B[0].view({r, nI_}).transpose(0, 1).contiguous()
+                     .to(torch::kCPU).contiguous();
+        const double *yp = Y.data_ptr<double>();
+        std::vector<double> Z((size_t)2 * q_ * r, 0.0);
+        _csr_mm(hEE_, xp, 2 * q_, r, Z, false);
+        _csr_mm(hEI_, yp, nI_, r, Z, true);
+        py::array_t<double> out({(py::ssize_t)(2 * q_), (py::ssize_t)r});
+        std::memcpy(out.mutable_data(), Z.data(),
+                    sizeof(double) * (size_t)2 * q_ * r);
+        return out;
+    }
+
+    py::tuple dims() const { return py::make_tuple(q_, nI_, 2 * q_); }
+
+   private:
+    int64_t ncol_ = 0, off_ = 0, q_ = 0, nI_ = 0;
+    CsrSub hEE_, hEI_, hIE_;
+    std::unique_ptr<CusolverLUSolver> lu_;
+};
+
 PYBIND11_MODULE(qoefls, m) {
     m.doc() = "FLS 固定滞后平滑 C++ 核心（factor/滑窗/Schur 边缘化）";
     m.def("set_pole", [](double x, double y, double z){ setPole(x, y, z); kep3::setPole(x, y, z); },
           py::arg("x"), py::arg("y"), py::arg("z"),
           "设置当日真极（ICRF 单位向量），覆盖本模块 CPU/CUDA 的 zonal 力模型");
     m.def("fls_probe", &fls_probe, py::arg("n"), "torch+BaSpaCho 链接探针");
+    m.def("boundary_info_csr", &boundary_info_csr,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"),
+          py::arg("ncol"), py::arg("off"), py::arg("q"),
+          "对 H CSR 的指定节点做多右端 solve_multi，返回边界信息 Λ_b (q,q)（CUDA）");
+    m.def("boundary_probe_csr", &boundary_probe_csr,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("Omega"),
+          py::arg("ncol"), py::arg("off"), py::arg("q"),
+          "对 H CSR 的指定节点做 r 个右端的 solve_multi，返回 P_b·Omega (q,r)（CUDA）");
+    m.def("boundary_lowrank_csr", &boundary_lowrank_csr,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("D"),
+          py::arg("Omega"), py::arg("ncol"), py::arg("off"), py::arg("q"),
+          py::arg("cap_rel") = 1e6, py::arg("rank_out") = 0,
+          "P2 边界：CUDA Schur probe + 逐星 D^{-1} + 低秩 C（含尺度门禁），"
+          "rank_out>0 时在同一 Hss 分解上构造 gauge-Krylov 基；"
+          "返回 dict(DLa,U,C,info,alpha,raw_max,cap,n_capped,gmax)");
+    m.def("baspacho_partial_solve", &baspacho_partial_solve,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("ncol"),
+          py::arg("ids"), py::arg("g"), py::arg("bs") = 6,
+          "端口因子窗口求解：H 已含 prior，ids=首/末节点块；返回 x, Pnext, center");
+    m.def("baspacho_partial_solve_prior", &baspacho_partial_solve_prior,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("ncol"),
+          py::arg("ids"), py::arg("g"), py::arg("bs"),
+          py::arg("P_rp"), py::arg("P_ci"), py::arg("P_val"),
+          py::arg("prior_off"), py::arg("scale") = py::none(),
+          py::arg("P2_rp") = py::none(), py::arg("P2_ci") = py::none(),
+          py::arg("P2_val") = py::none(), py::arg("prior2_off") = 0,
+          py::arg("do_cov") = 0, py::arg("need_pfirst") = 0,
+          py::arg("port_ldl") = 1, py::arg("do_gain") = 0,
+          "端口因子求解：H 与 prior 块分开传入，C++ 内嵌 prior 并缩放；"
+          "port_ldl=1 用端口块 LDL + 内部因子回代替代 factorFrom；"
+          "need_pfirst=1 才计算首端口边际；do_cov 返回逐 6×6 后验对角块");
+    m.def("partial_interior_solve", &partial_interior_solve,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("ncol"),
+          py::arg("ids"), py::arg("rhs"), py::arg("bs") = 6,
+          "内部条件解：factorUpTo + GPU solveL/Lt_upto，返回全向量");
+    m.def("partial_tri_probe", &partial_tri_probe,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"),
+          py::arg("ncol"), py::arg("span"), py::arg("bs") = 6,
+          "GPU solveL/Lt_upto vs CPU 对拍");
+    m.def("baspacho_partial_probe", &baspacho_partial_probe,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("ncol"),
+          py::arg("ids"), py::arg("bs") = 6, py::arg("factor_from") = 1,
+          "factorUpTo + trailing Schur 探针：ids 为留最后的原始参数块 id；"
+          "factor_from=0 只取数据侧 S，不做端口分解");
+    m.def("boundary_info_baspacho", &boundary_info_baspacho,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"),
+          py::arg("ncol"), py::arg("off"), py::arg("q"),
+          py::arg("scale") = py::none(), py::arg("jitter_rel") = 0.0,
+          "精确边界信息：Baspacho 分解 H_mm，解 H_mm X=H_mb，"
+          "返回 (Λ_b=H_bb-H_bm X, stats)；scale=D 时在 DHD 坐标计算并还原");
+    m.def("solve_csr_csr", &solve_csr_csr,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("B"),
+          "对稀疏 H 做多右端求解 H X=B，返回 X (n,r)（CUDA）");
+    py::class_<InterfaceSchur>(m, "InterfaceSchur",
+                               "精确接口 Schur 算子：Lambda_EE=H_EE-H_EI H_II^{-1} H_IE，"
+                               "矩阵自由，不 materialize 2q×2q")
+        .def(py::init<py::array_t<int64_t, py::array::c_style | py::array::forcecast>,
+                      py::array_t<int64_t, py::array::c_style | py::array::forcecast>,
+                      py::array_t<double, py::array::c_style | py::array::forcecast>,
+                      int64_t, int64_t, int64_t, py::object>(),
+             py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"),
+             py::arg("ncol"), py::arg("off"), py::arg("q"),
+             py::arg("scale") = py::none())
+        .def("apply", &InterfaceSchur::apply, py::arg("X"),
+             "X (2q,r) -> Lambda_EE X (2q,r)")
+        .def("dims", &InterfaceSchur::dims, "(q, nI, 2q)");
+    m.def("woodbury_solve_csr", &woodbury_solve_csr,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"),
+          py::arg("U"), py::arg("C"), py::arg("g"), py::arg("off"), py::arg("q"),
+          "solve 级 Woodbury：H0+U C Uᵀ，返回 (delta, Y, Sinv)（cuSOLVER RF）");
+    m.def("woodbury_solve_baspacho", &woodbury_solve_baspacho,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"),
+          py::arg("param_size"), py::arg("block_ptr"), py::arg("block_ind"),
+          py::arg("U"), py::arg("C"), py::arg("g"), py::arg("off"), py::arg("q"),
+          "solve 级 Woodbury：Baspacho CUDA 并行多右端，返回 (delta, Y, Sinv)");
     m.def("fls_baspacho_probe", &fls_baspacho_probe,
           "BaSpaCho C++ 全链探针（add_MtM/factor/solve/compute_diag_blocks vs 稠密）");
     m.def("fls_build_struct", &fls_build_struct, py::arg("n"), py::arg("L"),
           py::arg("edges_i"), py::arg("edges_j"), py::arg("gts"), py::arg("damp"),
-          py::arg("prior_node") = -1,
-          "FLS 滑窗装配结构（CSR + 块图案），等价 py _lift_struct(prior=True)/_lift_block_struct");
+          py::arg("prior_node") = -1, py::arg("r_cross") = 1,
+          "FLS 滑窗装配结构（CSR + 块图案），等价 py _lift_struct(prior=True)/_lift_block_struct；"
+          "r_cross>=2 时块图案加入同历元 ISL 的 r 跳邻域");
     m.def("fls_gauge_basis_window", &fls_gauge_basis_window_cpp,
           py::arg("X"), py::arg("n"), py::arg("L"), py::arg("orth") = true,
           "生产逐节点 gauge 基/Q-R（C++ 6×6 J 逆 + 整窗 QR）");
@@ -7321,7 +9823,7 @@ PYBIND11_MODULE(qoefls, m) {
                          py::array_t<int, py::array::c_style | py::array::forcecast> ej,
                          py::array_t<int, py::array::c_style | py::array::forcecast> gts,
                          py::array_t<double, py::array::c_style | py::array::forcecast> Q,
-                         double damp, bool prior, int prior_node, int dyn_sub) {
+                         double damp, bool prior, int prior_node, int dyn_sub, int r_cross) {
             auto ri = ei.request(); auto rj = ej.request();
             auto rg = gts.request(); auto rq = Q.request();
             return new FlsWindow(n, L, E, G, dt, s1, s2,
@@ -7329,12 +9831,12 @@ PYBIND11_MODULE(qoefls, m) {
                                  std::vector<int>((int *)rj.ptr, (int *)rj.ptr + rj.size),
                                  std::vector<int>((int *)rg.ptr, (int *)rg.ptr + rg.size),
                                  std::vector<double>((double *)rq.ptr, (double *)rq.ptr + rq.size),
-                                 damp, prior, prior_node, dyn_sub);
+                                 damp, prior, prior_node, dyn_sub, r_cross);
         }), py::return_value_policy::take_ownership,
             py::arg("n"), py::arg("L"), py::arg("E"), py::arg("G"), py::arg("dt"),
             py::arg("sigma_isl"), py::arg("sigma_gts"), py::arg("isl_i"), py::arg("isl_j"),
             py::arg("gts"), py::arg("Q"), py::arg("damp") = 1e-6, py::arg("prior") = true,
-            py::arg("prior_node") = -1, py::arg("dyn_sub") = 1)
+            py::arg("prior_node") = -1, py::arg("dyn_sub") = 1, py::arg("r_cross") = 1)
         .def("set_obs", &FlsWindow::set_obs, py::arg("D_isl"), py::arg("W_isl"),
              py::arg("D_gts"), py::arg("W_gts"), py::arg("Q_gts"), py::arg("ctr"))
         .def("set_X", &FlsWindow::set_X, py::arg("X"))
@@ -7454,6 +9956,38 @@ PYBIND11_MODULE(qoefls, m) {
              "指定节点的每星 6×6 selected-inverse 后验（物理 QOE）")
         .def("solve_rhs", &FlsWindow::solve_rhs, py::arg("U"),
              "解 H X = U（物理 QOE，U=(ncol,k)）→ X=(ncol,k)")
+        .def("joint_node_info", &FlsWindow::joint_node_info, py::arg("node"),
+             py::arg("eps") = 0.0,
+             "精确节点联合信息 Λ=(Σ_node)^-1（Σ_node=H^-1 的节点块；稠密 6N×6N）。"
+             "用 solve_multi 全右端，不用 selected inverse；eps>0 为物理对角正则。")
+        .def("info_predict", &FlsWindow::info_predict,
+             py::arg("Lam"), py::arg("Phi"), py::arg("Q"),
+             "含过程噪声的精确信息预测 Λ⁺=(ΦΣΦᵀ+Q)^-1（Σ=Λ^-1；稠密 6N×6N）")
+        .def("local_cross_info", &FlsWindow::local_cross_info,
+             py::arg("node"), py::arg("center"), py::arg("r") = 1,
+             py::arg("eps") = 0.0,
+             "r 跳 ISL 邻域的局部联合信息 Λ_S=Σ_S^-1，返回 (center,j) 跨块 "
+             "(val(B,6,6), bi(B,), bj(B,))，供 set_prior_cross")
+        .def("local_cross_info_global", &FlsWindow::local_cross_info_global,
+             py::arg("node"), py::arg("r") = 1, py::arg("eps") = 0.0,
+             py::arg("global_shrink") = 0,
+             "多中心组装：较小端点拥有每个无序对，一次分解逐中心求 Λ_S；"
+             "返回 (val(B,6,6), bi(B,), bj(B,), s_g, diag(n,6,6))；diag 与跨块同源，"
+             "global_shrink=1 时乘 s_g 保证对角占优。")
+        .def("local_cross_info_partition", &FlsWindow::local_cross_info_partition,
+             py::arg("node"), py::arg("r") = 1, py::arg("eps") = 0.0,
+             "不相交 r 跳簇：一次多右端取整节点协方差，簇内求逆并 PSD 投影；"
+             "返回 (val(B,6,6), bi(B,), bj(B,), diag(n,6,6), cluster_id(n,))，"
+             "簇间跨块为零，组装矩阵天然块对角 PSD。")
+        .def("augmented_solve", &FlsWindow::augmented_solve,
+             py::arg("H_new"), py::arg("H_prev"), py::arg("Phi"), py::arg("Q"),
+             py::arg("g"),
+             "含 Q 的增广系统 [H_new+Q^-1,B;B^T,-M][δ;y]=[g;0] 的 LU 解（小 N 稠密模式）")
+        .def("augmented_solve_sparse", &FlsWindow::augmented_solve_sparse,
+             py::arg("Hn_rp"), py::arg("Hn_ci"), py::arg("Hn_val"),
+             py::arg("Hp_rp"), py::arg("Hp_ci"), py::arg("Hp_val"),
+             py::arg("Phi"), py::arg("Q"), py::arg("g"),
+             "含 Q 的增广系统（H_new/H_prev 为 CSR）：支持 N=1152 的块稀疏组装 + LU")
         .def("T_host", &FlsWindow::T_host, "L=1 复合转移 T' (n,6,6)；关键帧处为区间快照 T_{a→b}")
         .def("phi_host", &FlsWindow::phi_host, "最近一次 step 的单步 STM Φ (n,6,6)")
         .def("P_prev_host", &FlsWindow::P_prev_host, "EKF 区间 P_prev (n,6,6)")

@@ -105,18 +105,20 @@ set(BS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../theseus/baspacho")
 set(TH_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../theseus/theseus")
 pybind11_add_module(qoefls src/fls_win.cpp src/dastate.cpp src/kepler.cpp src/elements.cpp src/integrater.cpp
   "${TH_ROOT}/extlib/baspacho_solver.cpp"
-  "${TH_ROOT}/extlib/baspacho_solver_cuda.cu")
+  "${TH_ROOT}/extlib/baspacho_solver_cuda.cu"
+  "${TH_ROOT}/extlib/cusolver_lu_solver.cpp"
+  "${TH_ROOT}/extlib/cusolver_sp_defs.cpp")
 target_link_directories(qoefls PRIVATE "/home/msy/miniconda3/envs/rover_slam/lib")
 target_link_libraries(qoefls PRIVATE qoe_core dace::dace torch
   "/home/msy/miniconda3/envs/rover_slam/lib/python3.10/site-packages/torch/lib/libtorch_python.so"
   "${BS_ROOT}/build/baspacho/baspacho/libBaSpaCho.a"
   "${BS_ROOT}/build/_deps/dispenso-build/dispenso/libdispenso.a"
   "-l:libopenblas.so.0"
-  OpenMP::OpenMP_CXX CUDA::cudart CUDA::cusolver CUDA::cublas)
+  OpenMP::OpenMP_CXX CUDA::cudart CUDA::cusolver CUDA::cusparse CUDA::cublas)
 set_target_properties(qoefls PROPERTIES BUILD_RPATH "$ORIGIN;${BS_ROOT}/build/baspacho/baspacho;${BS_ROOT}/build/_deps/dispenso-build/dispenso;/home/msy/miniconda3/envs/rover_slam/lib;${DACE_LIBDIR}")
-target_include_directories(qoefls PRIVATE ${PROJECT_SOURCE_DIR}/include ${TH_ROOT} ${BS_ROOT}
-  "${BS_ROOT}/build/_deps/dispenso-src")
-target_compile_definitions(qoefls PRIVATE THESEUS_HAVE_CUDA)
+target_include_directories(qoefls PRIVATE ${PROJECT_SOURCE_DIR}/include ${TH_ROOT}
+  "${TH_ROOT}/extlib" ${BS_ROOT} "${BS_ROOT}/build/_deps/dispenso-src")
+target_compile_definitions(qoefls PRIVATE THESEUS_HAVE_CUDA CUSOLVER_LU_NO_PYBIND)
 # 设置编译目标
 # add_executable(da src/dastate.cpp)
 # target_link_libraries(da dace)
