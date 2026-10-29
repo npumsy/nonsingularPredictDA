@@ -8,7 +8,7 @@
 //   - 每次 assemble：给 X(n,6) 与 rv0/A0（由 qoe 的扁平入口算好，避免 qoejopt 依赖 DACE），
 //     核内完成 GVE 多帧 + 两体 STM 折叠 + 装配，A_val/b 直接写进 Python 提供的 torch cuda 缓冲
 //     （data_ptr，int），得到 res2；P/A 中间量只驻显存，**不落 host**。
-// Python 保留 thin LM 循环 + Theseus Baspacho（外环 θ 学习沿用 BaspachoSolveFunction 原语链式）。
+// Python 保留 thin LM 循环 + Theseus Baspacho（外环 θ 学习沿用 BaspachoSolveFunction 原型链式）。
 //
 // 实现见 src/gve_step.cu（复用同 TU 的 device 助手，无需 -rdc）与 src/qoejopt.cpp（pybind）。
 

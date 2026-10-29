@@ -3555,6 +3555,11 @@ static void winPrepareDynGaugeCorr(WinCtx &c) {
 // Jacobian 块 = qingt·[-Φ, I]（12 非零：节点 k 的 -Φ，节点 k+1 的 I）。行序 = (k,i,a)，与 _lift_struct 一致。
 // gcorr 非空时（固定 EKF 路径）：e ← e − corr_{k,i}，corr=Gb·C·(Gaᵀ(X_k−x_ref)) 已由
 // winDynGaugeCorrKernel 对整段 6N 归约；等价于 e = x_b − x_pred − (T+Gb C Gaᵀ)(x_a−x_ref)。
+// 2π 周期角的最短差；QOE 的 u、Ω 周期，i 不周期（0..π），不能一起 wrap。
+__device__ __forceinline__ double wrap_pi_dev(double x) {
+    return x - 2.0 * PI * round(x / (2.0 * PI));
+}
+
 __global__ void winDynAsmKernel(const double *d_X, const double *d_end, const double *d_phi,
                                 const double *qingt, int n, int L, int off_dyn, int base_b,
                                 int q_perstar, const double *gcorr, double *A_val, double *b) {
@@ -3585,6 +3590,9 @@ __global__ void winDynAsmKernel(const double *d_X, const double *d_end, const do
 #pragma unroll
         for (int c = 0; c < 6; ++c) e[c] = xnext[c] - xe[c];
     }
+    // 残差取最短角；wrap 在切点外导数为 1，下面的 Jacobian 仍是单位差，不改。
+    e[1] = wrap_pi_dev(e[1]);   // u
+    e[5] = wrap_pi_dev(e[5]);   // Ω
     for (int a = 0; a < 6; ++a) {
         const size_t row = (size_t)idx * 6 + a;
         double *av = A_val + off_dyn + row * 12;

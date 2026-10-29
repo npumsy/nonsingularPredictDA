@@ -4,7 +4,7 @@
  * (value, node, tape)，重载算术与初等函数。把既有 `template<typename T>`
  * RHS（如 TBPfull）直接以 T=Scalar 实例化即自动记录整条积分计算图；
  * 反向为对偶标量的标准反向模式（乘法伴随即乘法）。参数梯度代价 ~ 图上算子数，
- * 与 m 无关；不重写 DA、不新增 DACE 内核原语。
+ * 与 m 无关；不重写 DA、不新增 DACE 内核原型。
  *
  * 依赖：DACE 的 PromotionTrait（使 AlgebraicVector<Scalar> 的元素级运算正确提升）。
  */

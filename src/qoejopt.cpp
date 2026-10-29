@@ -2,7 +2,7 @@
 //
 // 只暴露"结构/观测一次 setup + 每次 assemble 写 A_val/b（Python 提供 torch cuda 缓冲 data_ptr）"，
 // 中间量 P/A 只驻显存；重活（GVE/STM 折叠/装配/res2）全部在本模块 CUDA 核内完成，见 src/gve_step.cu。
-// Python 侧保留 thin LM 循环与 Theseus Baspacho（外环 θ 学习沿用 BaspachoSolveFunction 原语链式）。
+// Python 侧保留 thin LM 循环与 Theseus Baspacho（外环 θ 学习沿用 BaspachoSolveFunction 原型链式）。
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cuda_runtime.h>

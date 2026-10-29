@@ -7987,6 +7987,9 @@ static py::dict fls_nees_directional(
     py::array_t<double> o_nees({m, n}), o_nees_p({m, n}), o_nees_v({m, n}), o_nees_q({m, n});
     py::array_t<double> o_err_rtn({m, n, (py::ssize_t)6}), o_sig_rtn({m, n, (py::ssize_t)6}),
             o_z_rtn({m, n, (py::ssize_t)6});
+    // QOE→RV→RTN 的完整协方差与 RV 位置/速度，供协方差诊断复用同一条 C++ 路径。
+    py::array_t<double> o_P_rtn({m, n, (py::ssize_t)6, (py::ssize_t)6});
+    py::array_t<double> o_rv_out({m, n, (py::ssize_t)6});
     py::array_t<double> o_err_q({m, n, (py::ssize_t)6}), o_sig_q({m, n, (py::ssize_t)6}),
             o_z_q({m, n, (py::ssize_t)6});
     double *pn = o_nees.mutable_data(), *pnp = o_nees_p.mutable_data();
@@ -7994,6 +7997,7 @@ static py::dict fls_nees_directional(
     double *perr = o_err_rtn.mutable_data(), *psr = o_sig_rtn.mutable_data();
     double *pzr = o_z_rtn.mutable_data(), *peq = o_err_q.mutable_data();
     double *psq = o_sig_q.mutable_data(), *pzq = o_z_q.mutable_data();
+    double *pprtn = o_P_rtn.mutable_data(), *prv_out = o_rv_out.mutable_data();
 
     const int nt = std::max(1, nthreads);
 #ifdef _OPENMP
@@ -8080,6 +8084,9 @@ static py::dict fls_nees_directional(
             peq[o * 6 + a] = e_q(a);
             psq[o * 6 + a] = sig_q(a);
             pzq[o * 6 + a] = z_q(a);
+            prv_out[o * 6 + a] = RV[o * 6 + a];
+            for (int b = 0; b < 6; ++b)
+                pprtn[(o * 6 + a) * 6 + b] = P_rtn(a, b);
         }
     }
     py::dict out;
@@ -8093,6 +8100,8 @@ static py::dict fls_nees_directional(
     out["err_q"] = o_err_q;
     out["sig_q"] = o_sig_q;
     out["z_q"] = o_z_q;
+    out["P_rtn"] = o_P_rtn;
+    out["rv"] = o_rv_out;
     return out;
 }
 
@@ -9175,7 +9184,7 @@ static py::dict baspacho_partial_solve(
 }
 
 // ---- 端口因子 + 独立 prior 块：避免 Python 端 49M nnz CSR 加法 ----
-static py::dict baspacho_partial_solve_prior(
+static py::dict _partial_solve_impl(
         py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
         py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
         py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
@@ -9190,7 +9199,11 @@ static py::dict baspacho_partial_solve_prior(
         py::object scale_obj,
         py::object P2_rp_obj, py::object P2_ci_obj, py::object P2_val_obj,
         int64_t prior2_off, int64_t do_cov, int64_t need_pfirst,
-        int64_t port_ldl, int64_t do_gain) {
+        int64_t port_ldl, int64_t do_gain, py::object cov_nodes_obj,
+        py::object rts_phi_obj, py::object rts_q_obj,
+        py::object rts_delta_obj, py::object rts_cf_obj,
+        py::object rts_cl_obj, py::object rts_xs_obj,
+        int64_t rts_gain) {
     auto r = H_rp.request(); auto c = H_ci.request(); auto v = H_val.request();
     auto ia = ids_arr.request(); auto ga = g_arr.request();
     auto pr = P_rp.request(); auto pc = P_ci.request(); auto pv = P_val.request();
@@ -9207,6 +9220,18 @@ static py::dict baspacho_partial_solve_prior(
     const int64_t *pci = (const int64_t *)pc.ptr;
     const double *pval = (const double *)pv.ptr;
     const bool has2 = !P2_rp_obj.is_none();
+    py::array_t<int64_t, py::array::c_style | py::array::forcecast> cov_nodes_a;
+    const int64_t *cov_nodes = nullptr;
+    int64_t n_cov_nodes = 0;
+    if (!cov_nodes_obj.is_none()) {
+        cov_nodes_a = cov_nodes_obj.cast<
+            py::array_t<int64_t, py::array::c_style | py::array::forcecast>>();
+        auto cn = cov_nodes_a.request();
+        if (cn.ndim != 1)
+            throw std::runtime_error("baspacho_partial_solve_prior: cov_nodes 需 1D");
+        n_cov_nodes = (int64_t)cn.size;
+        cov_nodes = (const int64_t *)cn.ptr;
+    }
     py::array_t<int64_t, py::array::c_style | py::array::forcecast> P2_rp_a, P2_ci_a;
     py::array_t<double, py::array::c_style | py::array::forcecast> P2_val_a;
     const int64_t *p2rp = nullptr; const int64_t *p2ci = nullptr;
@@ -9408,6 +9433,7 @@ static py::dict baspacho_partial_solve_prior(
     auto gt = torch::from_blob((void *)ga.ptr, {1, (int64_t)ncol}, optsD)
                   .clone().to(dev);
     torch::Tensor xc_t;
+    bool full_factored = false;
     if (port_ldl) {
         // 端口参数 -> S 块位置（首端口 0..q1，末端口 q1..q1+q2）
         const int64_t *idp = (const int64_t *)ia.ptr;
@@ -9496,6 +9522,7 @@ static py::dict baspacho_partial_solve_prior(
     } else {
         nd.factor_from(span);
         cudaDeviceSynchronize();
+        full_factored = true;
         t5 = std::chrono::steady_clock::now();
         nd.solve(gt);
         cudaDeviceSynchronize();
@@ -9522,6 +9549,171 @@ static py::dict baspacho_partial_solve_prior(
     }
     auto corig = center * dl;
     auto cf_orig = center_first * df;
+    // ---- T3 后向 RTS：全部在端口因子 S11/S12/Pnext 与内部因子上完成 ----
+    // 生产接口的相邻窗并不共享自由节点：窗 w 的末自由节点 l 经 GVE+Q 预测
+    // 到端点 e（即下一窗首节点）。给定过滤分布 (f,l) 与 e=Phi l + w，
+    // 缩放坐标：u_e=Phi_s u_l+w_s，Phi_s=dl^{-1}Phi_Q dl, Q_s=dl^{-1}Q dl^{-1};
+    //   K_l=Pnext_s^{-1}Phi_s^T(Phi_s Pnext_s^{-1}Phi_s^T+Q_s)^{-1},
+    //   u_l=K_l(delta/dl), u_f=-Yc u_l,
+    // 平滑均值 ys_f=cf+df*u_f, ys_l=cl+dl*u_l；内部节点用同一 factorUpTo
+    // 因子解条件方程。
+    torch::Tensor rts_kf_t, rts_kl_t;
+    py::array_t<double> rts_xo, rts_dfo, rts_dlo;
+    const bool rts_apply = (rts_gain >= 0 && !rts_phi_obj.is_none() &&
+                            !rts_q_obj.is_none() && !rts_delta_obj.is_none() &&
+                            !rts_cf_obj.is_none() && !rts_cl_obj.is_none() &&
+                            !rts_xs_obj.is_none());
+    if (rts_apply) {
+        if (!port_ldl)
+            throw std::runtime_error("rts: 需要 port_ldl=1 的内部因子");
+        auto _arr = [](py::object o) {
+            return o.cast<py::array_t<double,
+                py::array::c_style | py::array::forcecast>>();
+        };
+        auto pa = _arr(rts_phi_obj); auto qa = _arr(rts_q_obj);
+        auto da = _arr(rts_delta_obj); auto cfa = _arr(rts_cf_obj);
+        auto cla = _arr(rts_cl_obj); auto xsa = _arr(rts_xs_obj);
+        if (pa.size() != nfirst * bs * bs || qa.size() != pa.size() ||
+            da.size() != q2 || cfa.size() != q1 || cla.size() != q2 ||
+            xsa.size() != ncol)
+            throw std::runtime_error("rts: 参数维数不符");
+        auto opts_dev = torch::TensorOptions().dtype(torch::kFloat64)
+                            .device(dev);
+        auto phi_t = torch::from_blob(pa.mutable_data(),
+                        {nfirst, bs, bs}, optsD).clone().to(dev);
+        auto q_t = torch::from_blob(qa.mutable_data(),
+                        {nfirst, bs, bs}, optsD).clone().to(dev);
+        auto delta_t = torch::from_blob(da.mutable_data(), {q2}, optsD)
+                           .clone().to(dev);
+        // **在缩放坐标做 RTS**：Pnext_scaled 与 Yc 都是 well-conditioned，
+        // 避免了原始 QOE 信息阵 ~1e15 动态范围下的 inv 与抵消。
+        //   u_e = Phi_s u_l + w_s,  Phi_s = dl^{-1} Phi_Q dl,
+        //   Q_s = dl^{-1} Q dl^{-1},  delta_s = delta/dl,
+        //   K_l = Pnext_s^{-1} Phi_s^T (Phi_s Pnext_s^{-1} Phi_s^T + Q_s)^{-1},
+        //   u_l = K_l delta_s,  u_f = -Yc u_l.
+        auto dl_g = dt.narrow(0, last_off, q2).to(opts_dev);
+        auto df_g = dt.narrow(0, first_off, q1).to(opts_dev);
+        auto dl6 = dl_g.reshape({nfirst, bs});
+        auto phi_s = phi_t * dl6.unsqueeze(1) / dl6.unsqueeze(2);
+        auto q_s = q_t / (dl6.unsqueeze(2) * dl6.unsqueeze(1));
+        auto Pn = Pnext.to(opts_dev).clone();
+        {
+            auto dg = torch::diagonal(Pn);
+            auto jit = 1e-12 * dg.abs().max().clamp_min(1e-30);
+            Pn += jit * torch::eye(q2, opts_dev);
+        }
+        auto Lp = torch::linalg_cholesky(Pn);
+        auto RHS = torch::zeros({q2, q2}, opts_dev);
+        auto phiTs = phi_s.transpose(1, 2).contiguous();
+        for (int64_t i = 0; i < nfirst; ++i)
+            RHS.slice(0, i * bs, (i + 1) * bs)
+               .slice(1, i * bs, (i + 1) * bs).copy_(phiTs[i]);
+        auto M = torch::linalg_solve_triangular(Lp, RHS, /*upper=*/false);
+        M = torch::linalg_solve_triangular(Lp.transpose(0, 1), M, true);
+        auto Mv = M.reshape({nfirst, bs, q2});
+        auto Se = torch::matmul(phi_s, Mv).reshape({q2, q2}).clone();
+        for (int64_t i = 0; i < nfirst; ++i)
+            Se.slice(0, i * bs, (i + 1) * bs)
+              .slice(1, i * bs, (i + 1) * bs) += q_s[i];
+        Se = 0.5 * (Se + Se.transpose(0, 1));
+        auto Lse = torch::linalg_cholesky(Se);
+        auto ds = delta_t / dl_g;
+        auto yv = torch::linalg_solve_triangular(
+            Lse, ds.reshape({q2, 1}), /*upper=*/false);
+        yv = torch::linalg_solve_triangular(
+            Lse.transpose(0, 1), yv, /*upper=*/true);
+        auto ul = M.matmul(yv).reshape({q2});
+        auto uf = -(Yc.matmul(ul));
+        auto Dl = dl_g * ul;
+        auto Df = df_g * uf;
+        if (rts_gain) {
+            auto Klt = torch::linalg_solve_triangular(
+                Lse, M.transpose(0, 1), /*upper=*/false);
+            Klt = torch::linalg_solve_triangular(
+                Lse.transpose(0, 1), Klt, /*upper=*/true);
+            auto Kl = Klt.transpose(0, 1);
+            auto Kf = -(df_g.unsqueeze(1) *
+                        (Yc.matmul(Kl) / dl_g.unsqueeze(0)));
+            // K_l 原始坐标 = dl K_l_s dl^{-1}；K_f 已按上式吸收同一尺度。
+            auto Kl_orig = dl_g.unsqueeze(1) * Kl / dl_g.unsqueeze(0);
+            rts_kl_t = Kl_orig.to(torch::kCPU).contiguous();
+            rts_kf_t = Kf.to(torch::kCPU).contiguous();
+        }
+        auto Dfc = Df.to(torch::kCPU).contiguous();
+        auto Dlc = Dl.to(torch::kCPU).contiguous();
+        const double *dfp = Dfc.data_ptr<double>();
+        const double *dlp = Dlc.data_ptr<double>();
+        const double *cfp = (const double *)cfa.request().ptr;
+        const double *clp = (const double *)cla.request().ptr;
+        const double *xsp = (const double *)xsa.request().ptr;
+        const int64_t *idp = (const int64_t *)ia.ptr;
+        auto wrap_pi = [](double v) {
+            v = std::fmod(v + M_PI, 2.0 * M_PI);
+            if (v < 0.0) v += 2.0 * M_PI;
+            return v - M_PI;
+        };
+        // 端口 scal ed 增量 u_B = (y_smooth - xs_lin) / d（角度先 wrap）。
+        std::vector<double> ub((size_t)(q1 + q2), 0.0);
+        for (int64_t i = 0; i < q1; ++i) {
+            double v = cfp[i] + dfp[i] - xsp[first_off + i];
+            if ((i % bs) == 1 || (i % bs) == 5) v = wrap_pi(v);
+            ub[(size_t)i] = v / d[(size_t)(first_off + i)];
+        }
+        for (int64_t i = 0; i < q2; ++i) {
+            double v = clp[i] + dlp[i] - xsp[last_off + i];
+            if ((i % bs) == 1 || (i % bs) == 5) v = wrap_pi(v);
+            ub[(size_t)(q1 + i)] = v / d[(size_t)(last_off + i)];
+        }
+        std::vector<int64_t> ppos((size_t)ncol, -1);
+        for (int64_t j = 0; j < nfirst; ++j)
+            for (int64_t a = 0; a < bs; ++a)
+                ppos[(size_t)(idp[j] * bs + a)] = j * bs + a;
+        for (int64_t j = 0; j < nids - nfirst; ++j)
+            for (int64_t a = 0; a < bs; ++a)
+                ppos[(size_t)(idp[nfirst + j] * bs + a)] = q1 + j * bs + a;
+        const double *gvp = (const double *)ga.ptr;
+        std::vector<double> rhs((size_t)ncol, 0.0);
+        for (int64_t i = 0; i < ncol; ++i) {
+            if (ppos[(size_t)i] >= 0) continue;
+            double s = gvp[i];
+            for (int64_t p = hA.rp[(size_t)i]; p < hA.rp[(size_t)i + 1]; ++p) {
+                const int64_t j = hA.ci[(size_t)p];
+                const int64_t pj = ppos[(size_t)j];
+                if (pj >= 0) s -= hA.v[(size_t)p] * ub[(size_t)pj];
+            }
+            rhs[(size_t)i] = s;
+        }
+        auto xt = torch::from_blob(rhs.data(), {1, ncol}, optsD)
+                      .clone().to(dev);
+        nd.solveL_upto_gpu(xt, span);
+        for (int64_t p = 0; p < ncol; ++p)
+            if (ppos[(size_t)p] >= 0) xt[0][p] = 0.0;
+        nd.solveLt_upto_gpu(xt, span);
+        for (int64_t p = 0; p < ncol; ++p)
+            if (ppos[(size_t)p] >= 0) xt[0][p] = 0.0;
+        auto uic = xt[0].to(torch::kCPU).contiguous();
+        const double *uip = uic.data_ptr<double>();
+        std::vector<double> ufull((size_t)ncol, 0.0);
+        for (int64_t p = 0; p < ncol; ++p)
+            ufull[(size_t)p] = (ppos[(size_t)p] >= 0)
+                                   ? ub[(size_t)ppos[(size_t)p]] : uip[p];
+        std::vector<double> xsm((size_t)ncol, 0.0);
+        for (int64_t p = 0; p < ncol; ++p) {
+            double v = xsp[p] + d[(size_t)p] * ufull[(size_t)p];
+            if ((p % bs) == 1 || (p % bs) == 5) {
+                v = std::fmod(v, 2.0 * M_PI);
+                if (v < 0.0) v += 2.0 * M_PI;
+            }
+            xsm[(size_t)p] = v;
+        }
+        rts_xo = py::array_t<double>({(py::ssize_t)ncol});
+        std::memcpy(rts_xo.mutable_data(), xsm.data(),
+                    sizeof(double) * (size_t)ncol);
+        rts_dfo = py::array_t<double>({(py::ssize_t)q1});
+        rts_dlo = py::array_t<double>({(py::ssize_t)q2});
+        std::memcpy(rts_dfo.mutable_data(), dfp, sizeof(double) * (size_t)q1);
+        std::memcpy(rts_dlo.mutable_data(), dlp, sizeof(double) * (size_t)q2);
+    }
     py::array_t<double> xo({(py::ssize_t)ncol});
     py::array_t<double> Po({(py::ssize_t)q2, (py::ssize_t)q2});
     py::array_t<double> Pfo({(py::ssize_t)q1, (py::ssize_t)q1});
@@ -9535,6 +9727,22 @@ static py::dict baspacho_partial_solve_prior(
     py::dict out;
     out["x"] = xo; out["Pnext"] = Po; out["center"] = co;
     out["Pfirst"] = Pfo; out["center_first"] = cfo;
+    if (rts_apply) {
+        out["rts_x"] = rts_xo;
+        out["rts_df"] = rts_dfo;
+        out["rts_dl"] = rts_dlo;
+        if (rts_gain) {
+            auto kfc = rts_kf_t.contiguous();
+            auto klc = rts_kl_t.contiguous();
+            py::array_t<double> kfo({(py::ssize_t)q1, (py::ssize_t)q2});
+            py::array_t<double> klo({(py::ssize_t)q1, (py::ssize_t)q2});
+            std::memcpy(kfo.mutable_data(), kfc.data_ptr<double>(),
+                        sizeof(double) * (size_t)q1 * q2);
+            std::memcpy(klo.mutable_data(), klc.data_ptr<double>(),
+                        sizeof(double) * (size_t)q1 * q2);
+            out["rts_kf"] = kfo; out["rts_kl"] = klo;
+        }
+    }
     if (do_gain) {
         // RTS 增益 G = (A_data+P)^{-1} C_data = Yc（scaled）；
         // 前向已经算过，T3 直接复用，省掉每窗 probe + 稠密 solve。
@@ -9558,6 +9766,7 @@ static py::dict baspacho_partial_solve_prior(
     if (do_cov) {
         // 全因子必须完整；port_ldl 路径没有调用 factor_from，这里补一次。
         if (port_ldl) { nd.factor_from(span); cudaDeviceSynchronize(); }
+        full_factored = true;
         // 全因子已由 factor_from 完成；Takahashi 取逐 6×6 逆对角块。
         // factor 是 H'=D H D，故 P=D P' D；raw 为 span 序，用 param_to_span 还原。
         auto perm = nd.param_to_span().to(torch::kCPU).contiguous();
@@ -9580,13 +9789,263 @@ static py::dict baspacho_partial_solve_prior(
         }
         out["diagP"] = dp;
     }
+    // 指定节点的每星 6×6 后验。内部节点用精确 Schur 公式
+    //   P_II = H_II^{-1} + (H_II^{-1} H_IP) S^{-1} (H_II^{-1} H_IP)^T,
+    // S 为端口 Schur。H_II 无稠密 prior，内部分解和多 RHS 解都只在
+    // sparse interior 上做；稠密端口部分只做 S^{-1} 与小规模 GEMM。
+    // 这避免了对稠密端口列做 O(N^3) 的全因子 block Takahashi。
+    // 坐标：factor 是 H'=D H D，最后 P = D P' D。
+    // 指定节点的每星 6×6 后验。H 在节点维上是块三对角；直接对 q×q
+    // 节点块做前向 Schur + 后向 selected-inverse，避免 2q 个右端的
+    // 稀疏回代（实测在大窗口上过慢）和稠密端口 block Takahashi。
+    //   S_0=H_00, S_k=H_kk-H_{k,k-1} S_{k-1}^{-1} H_{k-1,k};
+    //   P_{W-1}=S_{W-1}^{-1},
+    //   P_k=S_k^{-1}+S_k^{-1} H_{k,k+1} P_{k+1} H_{k+1,k} S_k^{-1}.
+    // 坐标：factor/H 是 D·H·D，最后 P = D P' D。
+    if (n_cov_nodes > 0) {
+        auto tc0 = std::chrono::steady_clock::now();
+        const bool cov_dbg = std::getenv("FLS_COV_DBG") != nullptr;
+        auto _el = [&](const char *tag, double t) {
+            if (cov_dbg) fprintf(stderr, "[cov_nodes] %s %.3fs\n", tag, t);
+        };
+        const int64_t qn = nfirst * bs;                  // 每个节点的变量数 6N
+        const int64_t nb = nfirst;                       // 每个节点的 6×6 块数 N
+        const int64_t nnode = ncol / qn;                 // 窗内节点数 W
+        TORCH_CHECK(qn * nnode == ncol, "cov_nodes: 节点块维数不符");
+        auto dt_cpu = dt.to(torch::kCPU).contiguous();
+        const double *dvv = dt_cpu.data_ptr<double>();
+        auto out_t = torch::zeros({n_cov_nodes, nb, bs, bs}, optsD);
+        double *outp = out_t.data_ptr<double>();
+        // 先判断跨节点块是否逐星块对角（GVE dyn 耦合是逐星的）。
+        bool bdiag = true;
+        for (int64_t k = 0; k + 1 < nnode && bdiag; ++k) {
+            const int64_t b0 = k * qn, b1 = (k + 1) * qn;
+            for (int64_t i = 0; i < qn && bdiag; ++i) {
+                for (int64_t pp = hA.rp[(size_t)(b0 + i)];
+                     pp < hA.rp[(size_t)(b0 + i + 1)]; ++pp) {
+                    const int64_t j = hA.ci[(size_t)pp];
+                    if (j >= b1 && j < b1 + qn && (i / bs) != ((j - b1) / bs))
+                        bdiag = false;
+                }
+            }
+        }
+        std::vector<torch::Tensor> Hd((size_t)nnode);
+        std::vector<torch::Tensor> Hob, Ho;
+        if (bdiag) {
+            Hob.resize((size_t)std::max<int64_t>(0, nnode - 1));
+            for (int64_t k = 0; k + 1 < nnode; ++k)
+                Hob[(size_t)k] = torch::zeros({nb, bs, bs}, optsD);
+        } else {
+            Ho.resize((size_t)std::max<int64_t>(0, nnode - 1));
+            for (int64_t k = 0; k + 1 < nnode; ++k)
+                Ho[(size_t)k] = torch::zeros({qn, qn}, optsD);
+        }
+        for (int64_t k = 0; k < nnode; ++k)
+            Hd[(size_t)k] = torch::zeros({qn, qn}, optsD);
+        for (int64_t k = 0; k < nnode; ++k) {
+            auto &Dk = Hd[(size_t)k];
+            double *pd = Dk.data_ptr<double>();
+            const int64_t base = k * qn;
+            for (int64_t i = 0; i < qn; ++i) {
+                for (int64_t pp = hA.rp[(size_t)(base + i)];
+                     pp < hA.rp[(size_t)(base + i + 1)]; ++pp) {
+                    const int64_t j = hA.ci[(size_t)pp] - base;
+                    if (j >= 0 && j < qn) pd[i * qn + j] += hA.v[(size_t)pp];
+                }
+            }
+            if (k + 1 < nnode) {
+                const int64_t base1 = (k + 1) * qn;
+                if (bdiag) {
+                    auto &Uk = Hob[(size_t)k];
+                    double *pu = Uk.data_ptr<double>();
+                    const int64_t qb = nb * bs * bs;
+                    for (int64_t i = 0; i < qn; ++i) {
+                        const int64_t s = i / bs, a = i % bs;
+                        for (int64_t pp = hA.rp[(size_t)(base + i)];
+                             pp < hA.rp[(size_t)(base + i + 1)]; ++pp) {
+                            const int64_t j = hA.ci[(size_t)pp] - base1;
+                            if (j >= 0 && j < qn)
+                                pu[s * bs * bs + a * bs + (j % bs)] +=
+                                    hA.v[(size_t)pp];
+                        }
+                    }
+                } else {
+                    auto &Uk = Ho[(size_t)k];
+                    double *pu = Uk.data_ptr<double>();
+                    for (int64_t i = 0; i < qn; ++i) {
+                        for (int64_t pp = hA.rp[(size_t)(base + i)];
+                             pp < hA.rp[(size_t)(base + i + 1)]; ++pp) {
+                            const int64_t j = hA.ci[(size_t)pp] - base1;
+                            if (j >= 0 && j < qn) pu[i * qn + j] += hA.v[(size_t)pp];
+                        }
+                    }
+                }
+            }
+        }
+        {
+            TORCH_CHECK(qp == qn, "cov_nodes: prior 块与节点块不同维");
+            double *pd = Hd[0].data_ptr<double>();
+            for (int64_t i = 0; i < qp; ++i)
+                for (int64_t pp = prp[i]; pp < prp[i + 1]; ++pp)
+                    pd[i * qn + pci[pp]] += pval[pp] * dvv[i] * dvv[pci[pp]];
+            Hd[0] = 0.5 * (Hd[0] + Hd[0].transpose(0, 1));
+        }
+        std::vector<torch::Tensor> Hdg((size_t)nnode);
+        for (int64_t k = 0; k < nnode; ++k) Hdg[(size_t)k] = Hd[(size_t)k].to(dev);
+        Hd.clear();
+        if (bdiag) {
+            for (auto &t : Hob) t = t.to(dev);
+        } else {
+            for (auto &t : Ho) t = t.to(dev);
+        }
+        cudaDeviceSynchronize();
+        _el("blocks", std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tc0).count());
+        auto _chol_inv = [&](const torch::Tensor &S) {
+            auto Sj = S.clone();
+            auto dg = torch::diagonal(Sj);
+            auto jit = 1e-10 * dg.abs().max().clamp_min(1e-30);
+            Sj += jit * torch::eye(qn, optsD.device(dev));
+            auto L = torch::linalg_cholesky(Sj);
+            auto Pi = torch::cholesky_inverse(L);
+            return 0.5 * (Pi + Pi.transpose(0, 1));
+        };
+        std::vector<torch::Tensor> Sinv((size_t)nnode), Pm((size_t)nnode);
+        Sinv[0] = _chol_inv(Hdg[0]);
+        for (int64_t k = 1; k < nnode; ++k) {
+            torch::Tensor S;
+            if (bdiag) {
+                auto A = torch::matmul(Hob[(size_t)(k - 1)].transpose(1, 2),
+                                       Sinv[(size_t)(k - 1)].view({nb, bs, qn}));
+                auto Av = A.reshape({qn, qn});
+                auto B = torch::matmul(
+                    Av.view({qn, nb, bs}).permute({1, 0, 2}),
+                    Hob[(size_t)(k - 1)]).permute({1, 0, 2}).reshape({qn, qn});
+                S = Hdg[(size_t)k] - B;
+            } else {
+                S = Hdg[(size_t)k]
+                    - torch::matmul(torch::matmul(Ho[(size_t)(k - 1)].transpose(0, 1),
+                                                  Sinv[(size_t)(k - 1)]),
+                                    Ho[(size_t)(k - 1)]);
+            }
+            S = 0.5 * (S + S.transpose(0, 1));
+            Sinv[(size_t)k] = _chol_inv(S);
+        }
+        cudaDeviceSynchronize();
+        _el("forward", std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tc0).count());
+        Pm[(size_t)(nnode - 1)] = Sinv[(size_t)(nnode - 1)];
+        const auto _idx = torch::arange(nb, optsI.device(dev));
+        for (int64_t k = nnode - 2; k >= 0; --k) {
+            torch::Tensor T;
+            if (bdiag) {
+                // C = H P Hᵀ 仍是稠密 q×q（P 稠密、跨星耦合）；用逐星
+                // 块对角的 H 把 H P 与 (H P) Hᵀ 分别降到 O(q N b²)。
+                auto A = torch::matmul(Hob[(size_t)k],
+                                       Pm[(size_t)(k + 1)].view({nb, bs, qn}));
+                auto Av = A.reshape({qn, qn});
+                auto C = torch::matmul(
+                    Av.view({qn, nb, bs}).permute({1, 0, 2}),
+                    Hob[(size_t)k].transpose(1, 2))
+                             .permute({1, 0, 2}).reshape({qn, qn});
+                T = torch::matmul(torch::matmul(Sinv[(size_t)k], C),
+                                  Sinv[(size_t)k]);
+            } else {
+                auto A = torch::matmul(torch::matmul(Sinv[(size_t)k],
+                                                     Ho[(size_t)k]),
+                                       Pm[(size_t)(k + 1)]);
+                T = torch::matmul(torch::matmul(A, Ho[(size_t)k].transpose(0, 1)),
+                                  Sinv[(size_t)k]);
+            }
+            auto Pk = Sinv[(size_t)k] + T;
+            Pm[(size_t)k] = 0.5 * (Pk + Pk.transpose(0, 1));
+        }
+        cudaDeviceSynchronize();
+        _el("backward", std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tc0).count());
+        for (int64_t ci = 0; ci < n_cov_nodes; ++ci) {
+            const int64_t node = cov_nodes[ci];
+            if (node < 0 || node >= nnode)
+                throw std::runtime_error(
+                    "baspacho_partial_solve_prior: cov_nodes 越界");
+            const int64_t off = node * qn;
+            auto Pmc = Pm[(size_t)node].to(torch::kCPU).contiguous();
+            const double *pb = Pmc.data_ptr<double>();
+            for (int64_t s = 0; s < nb; ++s) {
+                Eigen::Matrix<double, 6, 6> P = Eigen::Matrix<double, 6, 6>::Zero();
+                for (int a = 0; a < bs; ++a)
+                    for (int b = 0; b < bs; ++b)
+                        P(a, b) = pb[(s * bs + a) * qn + (s * bs + b)] *
+                                  dvv[off + s * bs + a] *
+                                  dvv[off + s * bs + b];
+                P = 0.5 * (P + P.transpose());
+                for (int a = 0; a < bs; ++a)
+                    for (int b = 0; b < bs; ++b)
+                        outp[((ci * nb + s) * bs + a) * bs + b] = P(a, b);
+            }
+        }
+        py::array_t<double> ncv({(py::ssize_t)n_cov_nodes, (py::ssize_t)nb,
+                                 (py::ssize_t)bs, (py::ssize_t)bs});
+        std::memcpy(ncv.mutable_data(), out_t.data_ptr<double>(),
+                    sizeof(double) * (size_t)out_t.numel());
+        out["node_cov"] = ncv;
+        auto tc1 = std::chrono::steady_clock::now();
+        out["cov_nodes_s"] = std::chrono::duration<double>(tc1 - tc0).count();
+    }
     out["finite"] = bool(torch::isfinite(gt).all().item<bool>() &&
                          torch::isfinite(Pnext).all().item<bool>() &&
                          torch::isfinite(Pfirst).all().item<bool>());
     return out;
 }
 
-// ---- 精确接口 Schur 算子（矩阵自由，不 materialize 2q×2q）----
+// ----
+// 前向端口求解（默认路径，不带 RTS）
+static py::dict baspacho_partial_solve_prior(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> ids_arr,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g_arr,
+        int64_t bs,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> P_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> P_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> P_val,
+        int64_t prior_off,
+        py::object scale_obj,
+        py::object P2_rp_obj, py::object P2_ci_obj, py::object P2_val_obj,
+        int64_t prior2_off, int64_t do_cov, int64_t need_pfirst,
+        int64_t port_ldl, int64_t do_gain, py::object cov_nodes_obj) {
+    return _partial_solve_impl(H_rp, H_ci, H_val, ncol, ids_arr, g_arr, bs, P_rp, P_ci, P_val, prior_off, scale_obj, P2_rp_obj, P2_ci_obj, P2_val_obj, prior2_off, do_cov, need_pfirst, port_ldl, do_gain, cov_nodes_obj, py::none(), py::none(), py::none(),
+                              py::none(), py::none(), py::none(), 0);
+}
+
+// 端口求解 + RTS 后向平滑（仅 Python 显式调用，--kf9-backward 1）
+static py::dict baspacho_partial_solve_rts(
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> H_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> H_val,
+        int64_t ncol,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> ids_arr,
+        py::array_t<double, py::array::c_style | py::array::forcecast> g_arr,
+        int64_t bs,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> P_rp,
+        py::array_t<int64_t, py::array::c_style | py::array::forcecast> P_ci,
+        py::array_t<double, py::array::c_style | py::array::forcecast> P_val,
+        int64_t prior_off,
+        py::object scale_obj,
+        py::object P2_rp_obj, py::object P2_ci_obj, py::object P2_val_obj,
+        int64_t prior2_off, int64_t do_cov, int64_t need_pfirst,
+        int64_t port_ldl, int64_t do_gain, py::object cov_nodes_obj,
+        py::object rts_phi_obj, py::object rts_q_obj,
+        py::object rts_delta_obj, py::object rts_cf_obj,
+        py::object rts_cl_obj, py::object rts_xs_obj,
+        int64_t rts_gain) {
+    return _partial_solve_impl(H_rp, H_ci, H_val, ncol, ids_arr, g_arr, bs, P_rp, P_ci, P_val, prior_off, scale_obj, P2_rp_obj, P2_ci_obj, P2_val_obj, prior2_off, do_cov, need_pfirst, port_ldl, do_gain, cov_nodes_obj, rts_phi_obj, rts_q_obj,
+                              rts_delta_obj, rts_cf_obj, rts_cl_obj,
+                              rts_xs_obj, rts_gain);
+}
+// 精确接口 Schur 算子（矩阵自由，不 materialize 2q×2q）----
 static CsrSub _extract_csr(
         const int64_t *rp, const int64_t *ci, const double *hv, int64_t ncol,
         const std::vector<int64_t> &rows, const std::vector<int64_t> &cols,
@@ -9752,10 +10211,26 @@ PYBIND11_MODULE(qoefls, m) {
           py::arg("P2_val") = py::none(), py::arg("prior2_off") = 0,
           py::arg("do_cov") = 0, py::arg("need_pfirst") = 0,
           py::arg("port_ldl") = 1, py::arg("do_gain") = 0,
+          py::arg("cov_nodes") = py::none(),
           "端口因子求解：H 与 prior 块分开传入，C++ 内嵌 prior 并缩放；"
           "port_ldl=1 用端口块 LDL + 内部因子回代替代 factorFrom；"
-          "need_pfirst=1 才计算首端口边际；do_cov 返回逐 6×6 后验对角块");
-    m.def("partial_interior_solve", &partial_interior_solve,
+          "need_pfirst=1 才计算首端口边际；do_cov 返回逐 6×6 后验对角块；"
+          "cov_nodes=[node,...] 用块三对角 selected inverse 返回这些节点的逐星 6×6 后验");
+        m.def("baspacho_partial_solve_rts", &baspacho_partial_solve_rts,
+          py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("ncol"),
+          py::arg("ids"), py::arg("g"), py::arg("bs"),
+          py::arg("P_rp"), py::arg("P_ci"), py::arg("P_val"),
+          py::arg("prior_off"), py::arg("scale") = py::none(),
+          py::arg("P2_rp") = py::none(), py::arg("P2_ci") = py::none(),
+          py::arg("P2_val") = py::none(), py::arg("prior2_off") = 0,
+          py::arg("do_cov") = 0, py::arg("need_pfirst") = 0,
+          py::arg("port_ldl") = 1, py::arg("do_gain") = 0,
+          py::arg("cov_nodes") = py::none(),
+          py::arg("rts_phi"), py::arg("rts_q"), py::arg("rts_delta"),
+          py::arg("rts_cf"), py::arg("rts_cl"), py::arg("rts_xs"),
+          py::arg("rts_gain") = 0,
+          "端口求解 + RTS 后向平滑：仅显式调用时启用，默认路径用 prior 入口");
+m.def("partial_interior_solve", &partial_interior_solve,
           py::arg("H_rp"), py::arg("H_ci"), py::arg("H_val"), py::arg("ncol"),
           py::arg("ids"), py::arg("rhs"), py::arg("bs") = 6,
           "内部条件解：factorUpTo + GPU solveL/Lt_upto，返回全向量");
