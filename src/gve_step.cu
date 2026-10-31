@@ -25,13 +25,168 @@
 #define J3C (-2.532435345754e-6)
 #define J4C (-1.619331205072e-6)
 #define OMEGA_EARTH 7.2921159e-5
-#define RHO_CDA_M 1.42812824e-12       // TBPfull 默认
+#define RHO_CDA_M 1.42812824e-12       // TBPfull 默认（TBPfull 公式里的 C_dA/m * rho0，km^-1）
 #define H0_KM 530.0                    // TBPfull 默认
 #define H1_KM 65.18534                 // TBPfull 默认
+// ---- 可学习阻力模型：高度分段常数密度表（1 km 分箱）+ 逐星 beta ----
+// beta 沿用现有口径（无量纲阻力倍率，额定 C_dA/m = 4.4e-3 m²/kg）。
+// 表存物理密度 kg/m³；在 km/s 单位下的阻力系数为 0.5*beta*4.4*rho_SI [km^-1]。
+#define CDA_NOM_SI 4.4e-3              // 额定 C_dA/m，m²/kg
+#define RHO_TAB_MAX 128
+__constant__ int    c_drag_mode = 0;   // 0=指数大气（默认），1=分段常数表
+__constant__ int    c_rho_n = 0;       // 分箱数
+__constant__ double c_rho_lo_km = 0.0; // 最低高度（km）
+__constant__ double c_rho_dh_km = 1.0; // 分箱宽度（km）
+__constant__ double c_rho_tab[RHO_TAB_MAX]; // 密度 kg/m³
+
+// ---- 可学习密度场（ECF 低阶谐波 + 高度 + 慢时间）----
+// rho(x,t) = rho_tab(h) * exp(g),  g = Σ_j θ_j S_j(x_ecf) φ_a(h) F_k(t).
+// S_j 为实球谐（L<=3），φ_a 为高度多项式，F_k 为日周期谐波。输入全部归一化：
+// x_ecf 用单位方向余弦（无经度回绕），h 用 (h-h_ref)/dh，t 用绝对秒（以蒸发历起点为 0）。
+// θ 的列序 j = ((ilm*NA + a)*NT + k)，ilm 由 setDragField 生成的 (l,m,cos/sin) 表决定。
+// 场基阶数上限：L<=12（(L+1)^2=169 个 ilm），参数上限 4096。
+// 低阶（L<=3）与旧版逐项硬编码等价到每个 (l,m) 的常数因子；L>=4 用标准
+// 未归一化实球谐递推（与脚本 _sh_terms_gen 同式），因子被 θ 吸收。
+#define FIELD_LMAX_MAX 12
+#define FIELD_LM_MAX ((FIELD_LMAX_MAX+1)*(FIELD_LMAX_MAX+1))
+#define FIELD_MAXP 4096
+#define FIELD_NA_MAX 3
+#define FIELD_NT_MAX 5
+#define FIELD_NSUB 4
+__constant__ int    c_fld_on = 0;
+__constant__ int    c_fld_n = 0;       // 参数个数
+__constant__ int    c_fld_nlm = 0;
+__constant__ int    c_fld_lmax = 0;
+__constant__ int    c_fld_na = 1;
+__constant__ int    c_fld_nt = 1;
+__constant__ double c_fld_href_km = 555.0;
+__constant__ double c_fld_dh_km = 50.0;
+__constant__ double c_fld_tref_s = 0.0;
+__constant__ double c_fld_thref = 0.0; // t_ref 时的格林尼治角（rad）
+__constant__ int    c_fld_l[FIELD_LM_MAX];
+__constant__ int    c_fld_m[FIELD_LM_MAX];
+__constant__ int    c_fld_cs[FIELD_LM_MAX];   // 0=cos(m lon), 1=sin(m lon)
+__constant__ double c_fld_nrm[FIELD_LM_MAX];  // 实球谐正交归一化因子
+__constant__ double c_fld_theta[FIELD_MAXP];
+__constant__ double c_fld_omega = 7.292115e-5;
+__constant__ double c_fld_tday = 86400.0;
 
 // 当日真极在 ICRF 的单位向量 + 真极框架->ICRF 旋转 Q（列 e1,e2,p，行主序）；默认 I。
 __device__ double c_pole[3] = {0.0, 0.0, 1.0};
 __device__ double c_pole_Q[9] = {1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0};
+
+// ---- 日/月三体 + 太阳光压（拟合场链路径）----
+// t 为自 t_isl0 的绝对秒；mjd = c_mjd0 + t/86400（c_mjd0 由 setPropEpochCuda 写入）。
+__constant__ int    c_use3b_dev = 0;
+__constant__ int    c_use_srp_dev = 0;
+__constant__ double c_mjd0_dev = 0.0;                 // MJD at t=0
+__constant__ double c_srp_cr = 1.5;                   // Cr
+__constant__ double c_srp_am = 0.01;                  // A/m, m^2/kg
+__constant__ double c_srp_p0 = 4.56e-6;               // N/m^2
+__constant__ double c_au_km = 1.495978707e8;          // AU, km
+#define MU_SUN_KM3 1.32712440018e11                   // km^3/s^2
+#define MU_MOON_KM3 4.9028e3                          // km^3/s^2
+// 宿主星历表（km ECI）：线性插值，区间外钳位。
+__constant__ int    c_ephem_on = 0;
+__constant__ int    c_ephem_n = 0;
+__constant__ double c_ephem_t0 = 0.0;
+__constant__ double c_ephem_dt = 600.0;
+__device__ double *g_rsun_tab = nullptr;
+__device__ double *g_rmoon_tab = nullptr;
+
+// 低精度解析星历（仅当未装宿主表时使用；与 dastate.cpp 同式，单位 km ECI）。
+__device__ __forceinline__ void sunMoonAnalyticDev(double mjd, double rs[3], double rm[3]){
+    const double D2R = PI / 180.0;
+    const double n = mjd - 2451545.0;
+    {
+        double L = fmod(280.460 + 0.9856474 * n, 360.0);
+        double g = fmod(357.528 + 0.9856003 * n, 360.0) * D2R;
+        double lam = (L + 1.915 * sin(g) + 0.020 * sin(2.0 * g)) * D2R;
+        double eps = (23.439 - 4.0e-7 * n) * D2R;
+        double R = (1.00014 - 0.01671 * cos(g) - 0.00014 * cos(2.0 * g)) * c_au_km;
+        rs[0] = R * cos(lam); rs[1] = R * cos(eps) * sin(lam); rs[2] = R * sin(eps) * sin(lam);
+    }
+    {
+        double Lp = fmod(218.316 + 13.176396 * n, 360.0) * D2R;
+        double M  = fmod(134.963 + 13.064993 * n, 360.0) * D2R;
+        double F  = fmod(93.272 + 13.229350 * n, 360.0) * D2R;
+        double lam = Lp + 6.289 * D2R * sin(M);
+        double beta = 5.128 * D2R * sin(F);
+        double Delta = 385001.0 - 20905.0 * cos(M);
+        double eps = 23.439 * D2R;
+        rm[0] = Delta * cos(beta) * cos(lam);
+        rm[1] = Delta * (cos(eps) * cos(beta) * sin(lam) - sin(eps) * sin(beta));
+        rm[2] = Delta * (sin(eps) * cos(beta) * sin(lam) + cos(eps) * sin(beta));
+    }
+}
+
+__device__ __forceinline__ void ephemerisDev(double t, double rs[3], double rm[3]){
+    if(c_ephem_on && c_ephem_n > 1 && g_rsun_tab && g_rmoon_tab){
+        double x = (t - c_ephem_t0) / c_ephem_dt;
+        int i = (int)floor(x);
+        if(i < 0) i = 0;
+        if(i > c_ephem_n - 2) i = c_ephem_n - 2;
+        double f = x - (double)i;
+        if(f < 0.0) f = 0.0;
+        if(f > 1.0) f = 1.0;
+        const int j = i + 1;
+        #pragma unroll
+        for(int k = 0; k < 3; ++k){
+            rs[k] = (1.0 - f) * g_rsun_tab[3*i + k] + f * g_rsun_tab[3*j + k];
+            rm[k] = (1.0 - f) * g_rmoon_tab[3*i + k] + f * g_rmoon_tab[3*j + k];
+        }
+        return;
+    }
+    sunMoonAnalyticDev(c_mjd0_dev + t / 86400.0, rs, rm);
+}
+
+// 三体加速度（km/s^2），加到 res[0..2]。
+__device__ __forceinline__ void thirdBodyAccelKmDev(const double *xk, const double rs[3],
+                                                    const double rm[3], double res[3]){
+    #pragma unroll
+    for(int which = 0; which < 2; ++which){
+        const double *r3 = (which == 0) ? rs : rm;
+        const double mu = (which == 0) ? MU_SUN_KM3 : MU_MOON_KM3;
+        const double dx = r3[0] - xk[0], dy = r3[1] - xk[1], dz = r3[2] - xk[2];
+        const double d3 = (dx*dx + dy*dy + dz*dz) * sqrt(dx*dx + dy*dy + dz*dz);
+        const double r3n = sqrt(r3[0]*r3[0] + r3[1]*r3[1] + r3[2]*r3[2]);
+        const double r33 = r3n*r3n*r3n;
+        if(d3 > 0.0){
+            res[0] += mu * (dx / d3 - r3[0] / r33);
+            res[1] += mu * (dy / d3 - r3[1] / r33);
+            res[2] += mu * (dz / d3 - r3[2] / r33);
+        }
+    }
+}
+
+// SRP（km/s^2）：a = -Cr*(A/m)*P0*(AU/|rs|)^2 * u_sun, u_sun=(rs-r)/|rs-r|。
+// 柱形硬阴影：r·u_sun<0（背阳侧）且到日地轴垂距 < Re 时置零；不做半影平滑。
+__device__ __forceinline__ void srpAccelKmDev(const double *xk, const double rs[3],
+                                              double res[3]){
+    const double dx = rs[0] - xk[0], dy = rs[1] - xk[1], dz = rs[2] - xk[2];
+    const double d = sqrt(dx*dx + dy*dy + dz*dz);
+    const double r3n = sqrt(rs[0]*rs[0] + rs[1]*rs[1] + rs[2]*rs[2]);
+    if(d <= 0.0 || r3n <= 0.0) return;
+    const double ux = dx / d, uy = dy / d, uz = dz / d;
+    const double proj = xk[0]*ux + xk[1]*uy + xk[2]*uz;
+    if(proj < 0.0){
+        const double px = xk[0] - proj*ux, py = xk[1] - proj*uy, pz = xk[2] - proj*uz;
+        if(px*px + py*py + pz*pz < RE_KM*RE_KM) return;   // umbra
+    }
+    // P0 * (AU/r)^2 为 N/m^2 = kg/(m s^2)；×1e-3 → km/s^2。
+    const double c = c_srp_cr * c_srp_am * c_srp_p0 * (c_au_km / r3n) * (c_au_km / r3n) * 1e-3;
+    res[0] -= c * ux;
+    res[1] -= c * uy;
+    res[2] -= c * uz;
+}
+
+__device__ __forceinline__ void add3bSrpKmDev(const double *xk, double t, double res[3]){
+    if(c_use3b_dev == 0 && c_use_srp_dev == 0) return;
+    double rs[3], rm[3];
+    ephemerisDev(t, rs, rm);
+    if(c_use3b_dev) thirdBodyAccelKmDev(xk, rs, rm, res);
+    if(c_use_srp_dev) srpAccelKmDev(xk, rs, res);
+}
 
 // Newton 解 Kepler 方程 M->E（同 KepEqtnET<double>：初值 M±e，60 次，1e-13）。
 __device__ __forceinline__ double kepE_dev(double M, double e){
@@ -136,6 +291,148 @@ __device__ __forceinline__ void fieldAccelKmDev(const double *r_km, double *a3){
     // else if(c_field_kind == FIELD_KIND_SH) shAccelKmDev(r_km, a3);       // 预留
 }
 
+// 大气密度（kg/m³）：指数默认或高度分段常数表。参数 r_km 为地心距。
+__device__ __forceinline__ double dragRhoDev(double r_km){
+    if(c_drag_mode == 1 && c_rho_n > 0){
+        double bi = (r_km - RE_KM - c_rho_lo_km) / c_rho_dh_km;
+        int k = (int)floor(bi);
+        if(k < 0) k = 0;
+        if(k >= c_rho_n) k = c_rho_n - 1;
+        return c_rho_tab[k];
+    }
+    return exp(-(r_km - RE_KM - H0_KM) / H1_KM);
+}
+
+// 阻力加速度（km/s²）：a = -0.5*beta*(C_dA/m)_nom*rho*|v_rel|*v_rel，rho 见 dragRhoDev。
+__device__ __forceinline__ void dragAccelDev(const double* xk, double beta, double* a3){
+    const double wx = OMEGA_EARTH*c_pole[0];
+    const double wy = OMEGA_EARTH*c_pole[1];
+    const double wz = OMEGA_EARTH*c_pole[2];
+    const double rvx = xk[3] - (wy*xk[2] - wz*xk[1]);
+    const double rvy = xk[4] - (wz*xk[0] - wx*xk[2]);
+    const double rvz = xk[5] - (wx*xk[1] - wy*xk[0]);
+    const double v = sqrt(rvx*rvx + rvy*rvy + rvz*rvz);
+    const double rn = sqrt(xk[0]*xk[0] + xk[1]*xk[1] + xk[2]*xk[2]);
+    const double rho = dragRhoDev(rn);
+    const double dc = (c_drag_mode == 1 && c_rho_n > 0)
+        ? -0.5*beta*CDA_NOM_SI*rho*1e3*v            // 表：m²/kg * kg/m³ * 1e3 = km^-1
+        : -0.5*RHO_CDA_M*beta*rho*v;                // 指数：rho 无量纲
+    a3[0] = dc*rvx; a3[1] = dc*rvy; a3[2] = dc*rvz;
+}
+
+// ---- 密度场：ECF 方向余弦 + 高度 + 时间的实球谐 ----
+// 标准未归一化实球谐（无 Condon-Shortley 相位），x,y,z 为 ECF 单位方向余弦。
+// 顺序 (l=0..L, m=0..l, cs=0 且 m>0 再 cs=1)，与 Python _sh_terms_gen 同式：
+//   P_mm=(2m-1)ρP_{m-1,m-1}, P_{m+1,m}=(2m+1)zP_mm,
+//   P_lm=[(2l-1)zP_{l-1,m}-(l+m-1)P_{l-2,m}]/(l-m),
+//   S_lm = P_lm * cos(mφ)（cs=0）或 P_lm * sin(mφ)（cs=1）。
+__device__ __forceinline__ void shValuesDev(int lmax, double x, double y, double z,
+                                            double* shv){
+    const int LM = FIELD_LMAX_MAX;
+    double rho = sqrt(x*x + y*y);
+    double c = 1.0, s = 0.0;
+    if(rho > 1e-12){ c = x/rho; s = y/rho; }
+    double cm[FIELD_LMAX_MAX+1], sm[FIELD_LMAX_MAX+1];
+    cm[0] = 1.0; sm[0] = 0.0;
+    for(int m = 1; m <= lmax; ++m){
+        cm[m] = cm[m-1]*c - sm[m-1]*s;
+        sm[m] = sm[m-1]*c + cm[m-1]*s;
+    }
+    double P[FIELD_LMAX_MAX+1][FIELD_LMAX_MAX+1];
+    P[0][0] = 1.0;
+    if(lmax >= 1) P[1][0] = z;
+    for(int m = 1; m <= lmax; ++m){
+        P[m][m] = (2.0*m-1.0)*rho*P[m-1][m-1];
+        if(m+1 <= lmax) P[m+1][m] = (2.0*m+1.0)*z*P[m][m];
+    }
+    for(int m = 0; m <= lmax; ++m)
+        for(int l = m+2; l <= lmax; ++l)
+            P[l][m] = ((2.0*l-1.0)*z*P[l-1][m] - (l+m-1.0)*P[l-2][m])/(l-m);
+    int k = 0;
+    for(int l = 0; l <= lmax; ++l)
+        for(int m = 0; m <= l; ++m){
+            shv[k++] = P[l][m]*cm[m];
+            if(m > 0) shv[k++] = P[l][m]*sm[m];
+        }
+    (void)LM;
+}
+
+// 场基：g 的第 (ilm,a,k) 列值 = S_lm(x_ecf) * φ_a(h) * F_k(t)。
+// 直接对 ECF 单位方向求值，避免经纬度的极点/回绕不连续。
+__device__ __forceinline__ void fieldFactorsDev(const double* xk, double t, double* shv,
+                                                double* altv, double* timev){
+    // ECI -> 真极框架 -> ECF（绕极轴转 θ = θ_ref + ω(t-t_ref)）
+    const double Q0=c_pole_Q[0], Q1=c_pole_Q[1], Q2=c_pole_Q[2];
+    const double Q3=c_pole_Q[3], Q4=c_pole_Q[4], Q5=c_pole_Q[5];
+    const double Q6=c_pole_Q[6], Q7=c_pole_Q[7], Q8=c_pole_Q[8];
+    const double px = Q0*xk[0] + Q3*xk[1] + Q6*xk[2];
+    const double py = Q1*xk[0] + Q4*xk[1] + Q7*xk[2];
+    const double pz = Q2*xk[0] + Q5*xk[1] + Q8*xk[2];
+    const double ang = c_fld_thref + c_fld_omega*(t - c_fld_tref_s);
+    const double ca = cos(ang), sa = sin(ang);
+    const double xe =  ca*px + sa*py;
+    const double ye = -sa*px + ca*py;
+    const double ze =  pz;
+    const double rn = sqrt(xe*xe + ye*ye + ze*ze);
+    const double ir = (rn > 1e-12) ? 1.0/rn : 0.0;
+    const double x = xe*ir, y = ye*ir, z = ze*ir;
+    shValuesDev(c_fld_lmax, x, y, z, shv);
+    for(int j = 0; j < c_fld_nlm; ++j) shv[j] *= c_fld_nrm[j];
+    const double h = rn - RE_KM;
+    const double dh = (h - c_fld_href_km)/c_fld_dh_km;
+    altv[0] = 1.0; altv[1] = dh; altv[2] = dh*dh;
+    const double tt = (t - c_fld_tref_s)/c_fld_tday;
+    const double w = 2.0*PI;
+    timev[0] = 1.0;
+    timev[1] = cos(w*tt); timev[2] = sin(w*tt);
+    timev[3] = cos(2.0*w*tt); timev[4] = sin(2.0*w*tt);
+}
+
+__device__ __forceinline__ double fieldLogDev(const double* xk, double t){
+    if(c_fld_on == 0 || c_fld_n <= 0) return 0.0;
+    double shv[FIELD_LM_MAX], altv[FIELD_NA_MAX], timev[FIELD_NT_MAX];
+    fieldFactorsDev(xk, t, shv, altv, timev);
+    double g = 0.0;
+    int j = 0;
+    for(int ilm = 0; ilm < c_fld_nlm; ++ilm)
+        for(int a = 0; a < c_fld_na; ++a)
+            for(int k = 0; k < c_fld_nt; ++k, ++j)
+                g += c_fld_theta[j] * shv[ilm] * altv[a] * timev[k];
+    return g;
+}
+
+// 场对参数 j 的基值 B_j（∂g/∂θ_j）。
+__device__ __forceinline__ double fieldBasisLogDev(const double* xk, double t, int j){
+    if(c_fld_on == 0 || j < 0 || j >= c_fld_n) return 0.0;
+    double shv[FIELD_LM_MAX], altv[FIELD_NA_MAX], timev[FIELD_NT_MAX];
+    fieldFactorsDev(xk, t, shv, altv, timev);
+    const int k = j % c_fld_nt;
+    const int a = (j / c_fld_nt) % c_fld_na;
+    const int ilm = j / (c_fld_na * c_fld_nt);
+    return shv[ilm] * altv[a] * timev[k];
+}
+
+// 表密度 × exp(g)（kg/m³）；r_km 为地心距，t 为绝对秒。
+__device__ __forceinline__ double dragRhoFieldDev(double r_km, double t, const double* xk){
+    return dragRhoDev(r_km) * exp(fieldLogDev(xk, t));
+}
+
+// 含密度场的阻力加速度（km/s²）：与 dragAccelDev 同式，rho 换成 rho_tab*exp(g)。
+__device__ __forceinline__ void dragAccelFieldDev(const double* xk, double beta, double t, double* a3){
+    const double wx = OMEGA_EARTH*c_pole[0];
+    const double wy = OMEGA_EARTH*c_pole[1];
+    const double wz = OMEGA_EARTH*c_pole[2];
+    const double rvx = xk[3] - (wy*xk[2] - wz*xk[1]);
+    const double rvy = xk[4] - (wz*xk[0] - wx*xk[2]);
+    const double rvz = xk[5] - (wx*xk[1] - wy*xk[0]);
+    const double v = sqrt(rvx*rvx + rvy*rvy + rvz*rvz);
+    const double rn = sqrt(xk[0]*xk[0] + xk[1]*xk[1] + xk[2]*xk[2]);
+    const double rho = dragRhoFieldDev(rn, t, xk);
+    const double dc = (c_drag_mode == 1 && c_rho_n > 0)
+        ? -0.5*beta*CDA_NOM_SI*rho*1e3*v : -0.5*RHO_CDA_M*beta*rho*v;
+    a3[0] = dc*rvx; a3[1] = dc*rvy; a3[2] = dc*rvz;
+}
+
 // 二体 + J2/J3/J4 + 阻力（km, km/s，km/s^2）。zonal 绕当日真极 c_pole。
 __device__ __forceinline__ void tbp_dev(const double* xk, double beta, double* res){
     const double pos0 = xk[0], pos1 = xk[1], pos2 = xk[2];
@@ -166,16 +463,8 @@ __device__ __forceinline__ void tbp_dev(const double* xk, double beta, double* r
 
     res[0] = xk[3]; res[1] = xk[4]; res[2] = xk[5];
 
-    const double wx = OMEGA_EARTH*c_pole[0];
-    const double wy = OMEGA_EARTH*c_pole[1];
-    const double wz = OMEGA_EARTH*c_pole[2];
-    const double rvx = xk[3] - (wy*xk[2] - wz*xk[1]);
-    const double rvy = xk[4] - (wz*xk[0] - wx*xk[2]);
-    const double rvz = xk[5] - (wx*xk[1] - wy*xk[0]);
-    const double v = sqrt(rvx*rvx + rvy*rvy + rvz*rvz);
-    const double rho = exp(-(r - RE_KM - H0_KM) / H1_KM);
-    const double dc = -0.5*RHO_CDA_M*beta*rho*v;
-    res[3] += dc*rvx; res[4] += dc*rvy; res[5] += dc*rvz;
+    double ad[3]; dragAccelDev(xk, beta, ad);
+    res[3] += ad[0]; res[4] += ad[1]; res[5] += ad[2];
 
     // θ 残差力场（若 c_rbf_m>0）：km/s^2 加到加速度行（可插拔，见 fieldAccelKmDev）
     double ar[3]; fieldAccelKmDev(xk, ar);
@@ -284,6 +573,58 @@ __device__ __forceinline__ void gveGaussW_dev(const double* OE, double W[6][3]){
 __device__ __forceinline__ void gveRhs_dev(const double* OE, double beta, double* out){
     double rv[6]; oe2rv_dev(OE, rv);
     double ap[3]; pertAccel_dev(rv, beta, ap);
+    gveRhsFromAp_dev(OE, ap, out);
+}
+
+// 含密度场的同源版本（t 为绝对秒）：状态传播与 STM 正向用。
+__device__ __forceinline__ void tbpFieldDev(const double* xk, double beta, double t, double* res){
+    const double pos0 = xk[0], pos1 = xk[1], pos2 = xk[2];
+    const double Q0=c_pole_Q[0], Q1=c_pole_Q[1], Q2=c_pole_Q[2];
+    const double Q3=c_pole_Q[3], Q4=c_pole_Q[4], Q5=c_pole_Q[5];
+    const double Q6=c_pole_Q[6], Q7=c_pole_Q[7], Q8=c_pole_Q[8];
+    const double px = Q0*pos0 + Q3*pos1 + Q6*pos2;
+    const double py = Q1*pos0 + Q4*pos1 + Q7*pos2;
+    const double pz = Q2*pos0 + Q5*pos1 + Q8*pos2;
+    const double r = sqrt(pos0*pos0 + pos1*pos1 + pos2*pos2);
+    const double z_r = pz / r, z2 = z_r*z_r, z3 = z2*z_r, z4 = z3*z_r;
+    const double Re_r = RE_KM / r, Re2 = Re_r*Re_r, Re3 = Re2*Re_r, Re4 = Re3*Re_r;
+    const double cf = -MU_KM / (r*r*r);
+    double j2 = (3.0/2.0)*J2C*Re2*(1.0 - 5.0*z2);
+    double j3 = (5.0/2.0)*J3C*Re3*(3.0*z_r - 7.0*z3);
+    double j4 = (5.0/8.0)*J4C*Re4*(3.0 - 42.0*z2 + 63.0*z4);
+    const double gx = cf*px*(1.0 + j2 + j3 - j4);
+    const double gy = cf*py*(1.0 + j2 + j3 - j4);
+    j2 = (3.0/2.0)*J2C*Re2*(3.0 - 5.0*z2);
+    j3 = (5.0/2.0)*J3C*Re3*(6.0*z_r - 7.0*z3 - (3.0/5.0)*r/pz);
+    j4 = (5.0/8.0)*J4C*Re4*(15.0 - 70.0*z2 + 63.0*z4);
+    const double gz = cf*pz*(1.0 + j2 + j3 - j4);
+    res[3] = Q0*gx + Q1*gy + Q2*gz;
+    res[4] = Q3*gx + Q4*gy + Q5*gz;
+    res[5] = Q6*gx + Q7*gy + Q8*gz;
+    res[0] = xk[3]; res[1] = xk[4]; res[2] = xk[5];
+    double ad[3]; dragAccelFieldDev(xk, beta, t, ad);
+    res[3] += ad[0]; res[4] += ad[1]; res[5] += ad[2];
+    double ar[3]; fieldAccelKmDev(xk, ar);
+    res[3] += ar[0]; res[4] += ar[1]; res[5] += ar[2];
+    // 日/月三体 + SRP（开关默认关；t 为自 t_isl0 的绝对秒）
+    add3bSrpKmDev(xk, t, res + 3);
+}
+
+__device__ __forceinline__ void pertAccelFieldDev(const double* rv_m, double beta, double t, double* ap){
+    double xk[6];
+    #pragma unroll
+    for(int k = 0; k < 6; ++k) xk[k] = rv_m[k] * 1e-3;
+    double acc[6];
+    tbpFieldDev(xk, beta, t, acc);
+    const double rn = sqrt(xk[0]*xk[0] + xk[1]*xk[1] + xk[2]*xk[2]);
+    const double c = MU_KM / (rn*rn*rn);
+    #pragma unroll
+    for(int k = 0; k < 3; ++k) ap[k] = (acc[3 + k] + c*xk[k]) * 1e3;
+}
+
+__device__ __forceinline__ void gveRhsFieldDev(const double* OE, double beta, double t, double* out){
+    double rv[6]; oe2rv_dev(OE, rv);
+    double ap[3]; pertAccelFieldDev(rv, beta, t, ap);
     gveRhsFromAp_dev(OE, ap, out);
 }
 
@@ -455,8 +796,14 @@ __device__ __forceinline__ void tbp_d_dev(const Dual6* xk, double beta, Dual6* r
     Dual6 rvy = d6_sub(xk[4], d6_sub(d6_mul(d6_c(wz),xk[0]), d6_mul(d6_c(wx),xk[2])));
     Dual6 rvz = d6_sub(xk[5], d6_sub(d6_mul(d6_c(wx),xk[1]), d6_mul(d6_c(wy),xk[0])));
     Dual6 v = d6_sqrt(d6_add(d6_add(d6_mul(rvx,rvx), d6_mul(rvy,rvy)), d6_mul(rvz,rvz)));
-    Dual6 rho = d6_exp(d6_mul(d6_c(-1.0/H1_KM), d6_sub(r, d6_c(RE_KM+H0_KM))));
-    Dual6 dc = d6_mul(d6_mul(d6_c(-0.5*RHO_CDA_M*beta), rho), v);
+    Dual6 rho, dc;
+    if(c_drag_mode == 1 && c_rho_n > 0){
+        rho = d6_c(dragRhoDev(r.v));                              // 分段常数：对位置导数为 0
+        dc = d6_mul(d6_mul(d6_c(-0.5*beta*CDA_NOM_SI*1e3), rho), v);
+    } else {
+        rho = d6_exp(d6_mul(d6_c(-1.0/H1_KM), d6_sub(r, d6_c(RE_KM+H0_KM))));
+        dc = d6_mul(d6_mul(d6_c(-0.5*RHO_CDA_M*beta), rho), v);
+    }
     res[3]=d6_add(res[3], d6_mul(dc,rvx));
     res[4]=d6_add(res[4], d6_mul(dc,rvy));
     res[5]=d6_add(res[5], d6_mul(dc,rvz));
@@ -572,13 +919,46 @@ __device__ __noinline__ void gveRhsKappa_dev(const double* OE, const double* rv_
     double xk[6];
     #pragma unroll
     for(int k=0;k<6;k++) xk[k]=rv_m[k]*1e-3;
-    const double rvx=xk[3]+OMEGA_EARTH*xk[1], rvy=xk[4]-OMEGA_EARTH*xk[0], rvz=xk[5];
+    const double wx=OMEGA_EARTH*c_pole[0], wy=OMEGA_EARTH*c_pole[1], wz=OMEGA_EARTH*c_pole[2];
+    const double rvx=xk[3]-(wy*xk[2]-wz*xk[1]), rvy=xk[4]-(wz*xk[0]-wx*xk[2]), rvz=xk[5]-(wx*xk[1]-wy*xk[0]);
     const double v=sqrt(rvx*rvx+rvy*rvy+rvz*rvz);
     const double rn=sqrt(xk[0]*xk[0]+xk[1]*xk[1]+xk[2]*xk[2]);
-    const double rho=exp(-(rn-RE_KM-H0_KM)/H1_KM);
-    const double dc=-0.5*RHO_CDA_M*rho*v;
+    const double rho=dragRhoDev(rn);
+    // 表模式：dc = -0.5*CDA_NOM_SI*rho_SI*v（km^-1），×1e3 → m/s² 系数；指数模式用 RHO_CDA_M。
+    const double dc = (c_drag_mode==1 && c_rho_n>0)
+        ? -0.5*CDA_NOM_SI*rho*1e3*v : -0.5*RHO_CDA_M*rho*v;
     const double apb[3]={dc*rvx*1e3, dc*rvy*1e3, dc*rvz*1e3};
     gvePertRhsFromAp_dev(OE, apb, Fk);
+}
+
+// 解析 ∂f/∂rho_k（仅当当前高度落在第 k 箱时非零）与 ∂f/∂beta 一并给出。
+// dap_beta = -0.5*(C_dA/m)_nom*rho*|v|v（m/s²）；dap_rho = -0.5*beta*(C_dA/m)_nom*|v|v（m/s² per kg/m³）。
+__device__ __noinline__ void gveRhsDragParam_dev(const double* OE, const double* rv_m, double beta,
+                                                 int nb, const int* bins, double Fk[6], double Fr[][6]){
+    double xk[6];
+    #pragma unroll
+    for(int k=0;k<6;k++) xk[k]=rv_m[k]*1e-3;
+    const double wx=OMEGA_EARTH*c_pole[0], wy=OMEGA_EARTH*c_pole[1], wz=OMEGA_EARTH*c_pole[2];
+    const double rvx=xk[3]-(wy*xk[2]-wz*xk[1]), rvy=xk[4]-(wz*xk[0]-wx*xk[2]), rvz=xk[5]-(wx*xk[1]-wy*xk[0]);
+    const double v=sqrt(rvx*rvx+rvy*rvy+rvz*rvz);
+    const double rn=sqrt(xk[0]*xk[0]+xk[1]*xk[1]+xk[2]*xk[2]);
+    const double rho=dragRhoDev(rn);
+    const bool tab=(c_drag_mode==1 && c_rho_n>0);
+    // ∂a_m/∂beta = -0.5*(C_dA/m)_nom*rho_SI*|v_m|*v_m；换到 km/s：×1e6。
+    const double cb = tab ? -0.5*CDA_NOM_SI*rho*1e6 : -0.5*RHO_CDA_M*rho*1e3;
+    const double apb[3]={cb*v*rvx, cb*v*rvy, cb*v*rvz};
+    gvePertRhsFromAp_dev(OE, apb, Fk);
+    // 分箱参数只对表模式有意义；未命中箱的列为 0。
+    const double cr = -0.5*beta*CDA_NOM_SI*1e6*v;                          // ∂a_m/∂rho_SI
+    double bi = (rn - RE_KM - c_rho_lo_km) / c_rho_dh_km;
+    int hit = tab ? (int)floor(bi) : -1;
+    if(hit < 0) hit = 0;
+    if(hit >= c_rho_n) hit = c_rho_n - 1;
+    for(int j=0;j<nb;j++){
+        double ap[3]={0.0,0.0,0.0};
+        if(tab && bins[j]==hit){ ap[0]=cr*rvx; ap[1]=cr*rvy; ap[2]=cr*rvz; }
+        gvePertRhsFromAp_dev(OE, ap, Fr[j]);
+    }
 }
 
 // ---- 笛卡尔 ECI (x,y,z,vx,vy,vz) 全动力学 RHS（m, m/s）：dx=[v; a]，a=TBPfull(km)→m/s² ----
@@ -823,6 +1203,30 @@ __global__ void gveStepKernel(const double* oe0, int n, double dt, double beta, 
         out[c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
 }
 
+// 单步，逐星 beta（表模式下的 setDragTable 自动路径）。
+__global__ void gveStepBetaKernel(const double* oe0, const double* betas, int n, double dt, double* oef){
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    const double beta = betas[idx];
+    const double* y0 = oe0 + 6*idx;
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) y[c] = y0[c];
+    gveRhs_dev(y, beta, k1);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*k1[c]/3.0;
+    gveRhs_dev(tmp, beta, k2);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(-k1[c]/3.0 + k2[c]);
+    gveRhs_dev(tmp, beta, k3);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(k1[c] - k2[c] + k3[c]);
+    gveRhs_dev(tmp, beta, k4);
+    double* out = oef + 6*idx;
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) out[c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
+}
+
 // 整弧多帧：每星一个线程，链式 nfr-1 次单步 3/8-RK4，输出每帧 rv（m, m/s），布局 [f][i]。
 __global__ void gvePropagateKernel(const double* oe0, int n, int nfr, double dt, double beta, double* rv_all){
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -883,6 +1287,28 @@ __global__ void gvePropagateBetaKernel(const double* oe0, const double* betas, i
     }
 }
 
+// 笛卡尔单步，逐星 beta。
+__global__ void cartStepBetaKernel(const double* x0, const double* betas, int n, double dt, double* xf){
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    const double beta = betas[idx];
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) y[c] = x0[6*idx + c];
+    cartRhsDev(y, beta, k1);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*k1[c]/3.0;
+    cartRhsDev(tmp, beta, k2);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(-k1[c]/3.0 + k2[c]);
+    cartRhsDev(tmp, beta, k3);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(k1[c] - k2[c] + k3[c]);
+    cartRhsDev(tmp, beta, k4);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) xf[6*idx + c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
+}
+
 // 笛卡尔单步 3/8-RK4（全动力学）：x0 (n×6, m/m·s⁻¹) → xf。
 __global__ void cartStepKernel(const double* x0, int n, double dt, double beta, double* xf){
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -902,6 +1328,35 @@ __global__ void cartStepKernel(const double* x0, int n, double dt, double beta, 
     cartRhsDev(tmp, beta, k4);
     #pragma unroll
     for(int c = 0; c < 6; ++c) xf[6*idx + c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
+}
+
+// 笛卡尔整弧多帧，逐星 beta。
+__global__ void cartPropagateBetaKernel(const double* x0, const double* betas, int n, int nfr,
+                                        double dt, double* x_all){
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    const double beta = betas[idx];
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) y[c] = x0[6*idx + c];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) x_all[((size_t)0*n + idx)*6 + c] = y[c];
+    for(int f = 1; f < nfr; ++f){
+        cartRhsDev(y, beta, k1);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*k1[c]/3.0;
+        cartRhsDev(tmp, beta, k2);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(-k1[c]/3.0 + k2[c]);
+        cartRhsDev(tmp, beta, k3);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(k1[c] - k2[c] + k3[c]);
+        cartRhsDev(tmp, beta, k4);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) y[c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) x_all[((size_t)f*n + idx)*6 + c] = y[c];
+    }
 }
 
 // 笛卡尔整弧多帧：每星线程链式 nfr-1 次单步，输出每帧 x（平铺 nfr*n*6）。
@@ -1110,6 +1565,557 @@ __device__ __forceinline__ void gveStepSub_dev(double *y, double beta, double dt
         #pragma unroll
         for (int c = 0; c < 6; ++c) y[c] = y[c] + h * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
     }
+}
+
+// 含密度场的单步（nsub 个 dt/nsub 子步的 3/8-RK4，就地更新 y）。t 为段首绝对秒。
+__device__ __forceinline__ void gveStepSubField_dev(double *y, double beta, double t, double dt, int nsub) {
+    const int ns = (nsub > 1 ? nsub : 1);
+    const double h = dt / (double)ns;
+    double k1[6], k2[6], k3[6], k4[6], tmp[6];
+    for (int s = 0; s < ns; ++s) {
+        const double ts = t + h*(double)s;
+        gveRhsFieldDev(y, beta, ts, k1);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * k1[c] / 3.0;
+        gveRhsFieldDev(tmp, beta, ts, k2);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * (-k1[c] / 3.0 + k2[c]);
+        gveRhsFieldDev(tmp, beta, ts, k3);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) tmp[c] = y[c] + h * (k1[c] - k2[c] + k3[c]);
+        gveRhsFieldDev(tmp, beta, ts, k4);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) y[c] = y[c] + h * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    }
+}
+
+__device__ __noinline__ void gveRhsFieldJacVal_dev(const double* OE, double beta, double t,
+                                                   double A[6][6], double fval[6]);
+
+// 含密度场的单步状态 + STM：与 gveStmStep_dev 同架构（A 每阶段精确），
+// 状态 RHS 与 A 都用场版本（含密度场梯度、三体与 SRP）。
+__device__ __noinline__ void gveStmStepField_dev(double *y, double beta, double t,
+                                                 double dt, double Phi[6][6]) {
+    double k1[6], k2[6], k3[6], k4[6], tmp[6], yn[6];
+    double P[6][6], K1[6][6], K2[6][6], K3[6][6], K4[6][6], A[6][6], kd[6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) P[a][b] = (a == b) ? 1.0 : 0.0;
+    gveRhsFieldJacVal_dev(y, beta, t, A, kd);
+    gveRhsFieldDev(y, beta, t, k1);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * P[c][b]; K1[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * k1[c] / 3.0;
+    gveRhsFieldJacVal_dev(tmp, beta, t, A, kd);
+    gveRhsFieldDev(tmp, beta, t, k2);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * K1[c][b] / 3.0); K2[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
+    gveRhsFieldJacVal_dev(tmp, beta, t, A, kd);
+    gveRhsFieldDev(tmp, beta, t, k3);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (-K1[c][b] / 3.0 + K2[c][b])); K3[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
+    gveRhsFieldJacVal_dev(tmp, beta, t, A, kd);
+    gveRhsFieldDev(tmp, beta, t, k4);
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) { double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (K1[c][b] - K2[c][b] + K3[c][b])); K4[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) yn[c] = y[c] + dt * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Phi[a][b] = P[a][b] + dt * (K1[a][b] + 3.0 * K2[a][b] + 3.0 * K3[a][b] + K4[a][b]) / 8.0;
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = yn[c];
+}
+
+// 保留旧接口：按 nsub 个 dt/nsub 子步复合精确单步 STM。
+__device__ __forceinline__ void gveStmStepSubField_dev(double *y, double beta, double t,
+                                                        double dt, int nsub, double Phi[6][6]) {
+    const int ns = (nsub > 1 ? nsub : 1);
+    const double h = dt / (double)ns;
+    double Ptot[6][6];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Ptot[a][b] = (a == b) ? 1.0 : 0.0;
+    for (int s = 0; s < ns; ++s) {
+        double Ps[6][6];
+        gveStmStepField_dev(y, beta, t + h*s, h, Ps);
+        double Pn[6][6];
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b) { double q = 0.0;
+                for (int c = 0; c < 6; ++c) q += Ps[a][c]*Ptot[c][b]; Pn[a][b] = q; }
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) Ptot[a][b] = Pn[a][b];
+    }
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Phi[a][b] = Ptot[a][b];
+}
+
+// 整弧分块：每 stride 个 dt 帧输出一次 q 与 Φ（Φ 为块内 ∂q_{c+1}/∂q_c）。
+// 块内用 nsub=stride 的精确 3/8-RK4；A 在块首冻结（场随时间的日变化在 2 min 内可忽略）。
+// t0_sat 非空时逐星取起始历元（跨窗口批量：同一批里各卫星可来自不同窗口），
+// 为空时回退到标量 t0。
+__global__ void gveFieldChainKernel(const double *oe0, const double *betas, int n, int nchunk,
+                                    int stride, double dt, double t0, const double *t0_sat,
+                                    double *qall, double *phi_all) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = (betas != nullptr) ? betas[idx] : 1.0;
+    const double t0e = (t0_sat != nullptr) ? t0_sat[idx] : t0;
+    double y[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    for (int c = 0; c < nchunk; ++c) {
+        #pragma unroll
+        for (int k = 0; k < 6; ++k) qall[((size_t)idx*nchunk + c)*6 + k] = y[k];
+        if (c + 1 < nchunk) {
+            const int rem = stride;   // 末块也按 stride 推进；调用方保证总帧数匹配
+            const double tc = t0e + dt*(double)(c*stride);
+            double Ps[6][6];
+            if (phi_all) {
+                gveStmStepSubField_dev(y, beta, tc, dt*(double)rem, rem, Ps);
+                double *Po = phi_all + ((size_t)idx*(nchunk-1) + c)*36;
+                #pragma unroll
+                for (int a = 0; a < 36; ++a) Po[a] = ((const double*)Ps)[a];
+            } else {
+                gveStepSubField_dev(y, beta, tc, dt*(double)rem, rem);
+            }
+        }
+    }
+}
+
+// 场值 g 与阻力加速度（调试/对拍用）。
+__global__ void gveFieldLogKernel(const double *rv_m, const double *tv, int n, double *gout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double xk[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) xk[c] = rv_m[6*idx + c] * 1e-3;
+    gout[idx] = fieldLogDev(xk, tv[idx]);
+}
+__global__ void gveFieldAccelKernel(const double *rv_m, const double *tv, const double *betas,
+                                    int n, double *aout, double *rout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = (betas != nullptr) ? betas[idx] : 1.0;
+    double xk[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) xk[c] = rv_m[6*idx + c] * 1e-3;
+    double a3[3]; dragAccelFieldDev(xk, beta, tv[idx], a3);
+    aout[3*idx+0] = a3[0]*1e3; aout[3*idx+1] = a3[1]*1e3; aout[3*idx+2] = a3[2]*1e3;
+    const double rn = sqrt(xk[0]*xk[0] + xk[1]*xk[1] + xk[2]*xk[2]);
+    rout[idx] = dragRhoFieldDev(rn, tv[idx], xk);
+}
+
+// 三体 + SRP 加速度（m/s^2，ECI），逐星逐时刻；仅用于诊断/验证。
+__global__ void pert3bSrpKernel(const double *rv_m, const double *tv, int n, double *aout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double xk[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) xk[c] = rv_m[6*idx + c] * 1e-3;
+    double a[3] = {0.0, 0.0, 0.0};
+    add3bSrpKmDev(xk, tv[idx], a);
+    aout[3*idx+0] = a[0]*1e3; aout[3*idx+1] = a[1]*1e3; aout[3*idx+2] = a[2]*1e3;
+}
+
+// 场基 B_j=∂g/∂θ_j（n,npar），用于外部对拍与容量分析。一行一个状态。
+__global__ void gveFieldBasisKernel(const double *rv_m, const double *tv, int n, double *B) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double xk[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) xk[c] = rv_m[6*idx + c] * 1e-3;
+    double shv[FIELD_LM_MAX], altv[FIELD_NA_MAX], timev[FIELD_NT_MAX];
+    fieldFactorsDev(xk, tv[idx], shv, altv, timev);
+    const int na = c_fld_na, nt = c_fld_nt;
+    for (int j = 0; j < c_fld_n; ++j) {
+        const int k = j % nt;
+        const int a = (j / nt) % na;
+        const int ilm = j / (na * nt);
+        B[(size_t)idx*c_fld_n + j] = shv[ilm] * altv[a] * timev[k];
+    }
+}
+
+// 变分 forcing 的 6 向量 W·a 与场基因子（QOE y，绝对秒 t）。
+__device__ __forceinline__ void fieldForcingDev(const double* y, double beta, double t,
+                                                double Wa[6], double* shv,
+                                                double* altv, double* timev) {
+    double W[6][3];
+    gveGaussW_dev(y, W);
+    double rv_km[6];
+    oe2rv_dev(y, rv_km);
+    #pragma unroll
+    for (int k = 0; k < 6; ++k) rv_km[k] *= 1e-3;
+    double a3[3];
+    dragAccelFieldDev(rv_km, beta, t, a3);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i)
+        Wa[i] = W[i][0]*a3[0]*1e3 + W[i][1]*a3[1]*1e3 + W[i][2]*a3[2]*1e3;
+    fieldFactorsDev(rv_km, t, shv, altv, timev);
+}
+
+__device__ __forceinline__ void mat6_mul(const double A[6][6], const double B[6][6],
+                                         double C[6][6]) {
+    for (int i = 0; i < 6; ++i)
+        for (int j = 0; j < 6; ++j) {
+            double s = 0.0;
+            for (int k = 0; k < 6; ++k) s += A[i][k] * B[k][j];
+            C[i][j] = s;
+        }
+}
+
+// ---- 含密度场的解析 Jacobian：A=∂f/∂oe（含场阻力对 r,v 的偏导）----
+// 场只作用在阻力上：a = dc(r,v; e^g) v_rel，g=ΣθB(r,t) 只依赖位置。
+// 块级 STM 原先漏了 a_tab e^g ∂g/∂r 这一项；θ≈0 时为零，artifact θ 下可达 18%。
+// ∂g/∂r 用中心差分（步长 0.25 km，误差 ~1e-6），其余用对偶数精确传播。
+__device__ __forceinline__ void fieldLogDualDev(const double* xk, double t, Dual6* g){
+    g->v = fieldLogDev(xk, t);
+    #pragma unroll
+    for(int i = 0; i < 6; ++i) g->d[i] = 0.0;
+    const double hg = 0.25;
+    for(int i = 0; i < 3; ++i){
+        double xp[3] = {xk[0], xk[1], xk[2]};
+        double xm[3] = {xk[0], xk[1], xk[2]};
+        xp[i] += hg; xm[i] -= hg;
+        g->d[i] = (fieldLogDev(xp, t) - fieldLogDev(xm, t)) / (2.0*hg);
+    }
+}
+
+// 表阻力（无 e^g）的对偶版，逐式镜像 dragAccelDev。
+__device__ __forceinline__ void dragAccelDualDev(const Dual6* xk, double beta, Dual6* a3){
+    const double wx = OMEGA_EARTH*c_pole[0];
+    const double wy = OMEGA_EARTH*c_pole[1];
+    const double wz = OMEGA_EARTH*c_pole[2];
+    Dual6 rvx = d6_sub(xk[3], d6_sub(d6_mul(d6_c(wy),xk[2]), d6_mul(d6_c(wz),xk[1])));
+    Dual6 rvy = d6_sub(xk[4], d6_sub(d6_mul(d6_c(wz),xk[0]), d6_mul(d6_c(wx),xk[2])));
+    Dual6 rvz = d6_sub(xk[5], d6_sub(d6_mul(d6_c(wx),xk[1]), d6_mul(d6_c(wy),xk[0])));
+    Dual6 v = d6_sqrt(d6_add(d6_add(d6_mul(rvx,rvx), d6_mul(rvy,rvy)), d6_mul(rvz,rvz)));
+    Dual6 rn = d6_sqrt(d6_add(d6_add(d6_mul(xk[0],xk[0]), d6_mul(xk[1],xk[1])), d6_mul(xk[2],xk[2])));
+    Dual6 rho, dc;
+    if(c_drag_mode == 1 && c_rho_n > 0){
+        rho = d6_c(dragRhoDev(rn.v));
+        dc = d6_mul(d6_mul(d6_c(-0.5*beta*CDA_NOM_SI*1e3), rho), v);
+    } else {
+        rho = d6_exp(d6_mul(d6_c(-1.0/H1_KM), d6_sub(rn, d6_c(RE_KM+H0_KM))));
+        dc = d6_mul(d6_mul(d6_c(-0.5*RHO_CDA_M*beta), rho), v);
+    }
+    a3[0] = d6_mul(dc,rvx); a3[1] = d6_mul(dc,rvy); a3[2] = d6_mul(dc,rvz);
+}
+
+// 含场阻力（rho_tab*e^g）的对偶版，逐式镜像 dragAccelFieldDev。
+__device__ __forceinline__ void dragAccelFieldDualDev(const Dual6* xk, double beta, double t,
+                                                      Dual6* a3){
+    const double wx = OMEGA_EARTH*c_pole[0];
+    const double wy = OMEGA_EARTH*c_pole[1];
+    const double wz = OMEGA_EARTH*c_pole[2];
+    Dual6 rvx = d6_sub(xk[3], d6_sub(d6_mul(d6_c(wy),xk[2]), d6_mul(d6_c(wz),xk[1])));
+    Dual6 rvy = d6_sub(xk[4], d6_sub(d6_mul(d6_c(wz),xk[0]), d6_mul(d6_c(wx),xk[2])));
+    Dual6 rvz = d6_sub(xk[5], d6_sub(d6_mul(d6_c(wx),xk[1]), d6_mul(d6_c(wy),xk[0])));
+    Dual6 v = d6_sqrt(d6_add(d6_add(d6_mul(rvx,rvx), d6_mul(rvy,rvy)), d6_mul(rvz,rvz)));
+    Dual6 rn = d6_sqrt(d6_add(d6_add(d6_mul(xk[0],xk[0]), d6_mul(xk[1],xk[1])), d6_mul(xk[2],xk[2])));
+    double xv[3] = {xk[0].v, xk[1].v, xk[2].v};
+    Dual6 g; fieldLogDualDev(xv, t, &g);
+    Dual6 eg = d6_exp(g);
+    Dual6 rho, dc;
+    if(c_drag_mode == 1 && c_rho_n > 0){
+        rho = d6_mul(d6_c(dragRhoDev(rn.v)), eg);
+        dc = d6_mul(d6_mul(d6_c(-0.5*beta*CDA_NOM_SI*1e3), rho), v);
+    } else {
+        Dual6 rho0 = d6_exp(d6_mul(d6_c(-1.0/H1_KM), d6_sub(rn, d6_c(RE_KM+H0_KM))));
+        rho = d6_mul(rho0, eg);
+        dc = d6_mul(d6_mul(d6_c(-0.5*RHO_CDA_M*beta), rho), v);
+    }
+    a3[0] = d6_mul(dc,rvx); a3[1] = d6_mul(dc,rvy); a3[2] = d6_mul(dc,rvz);
+}
+
+// 日/月三体 + SRP 的对偶版（∂/∂r 只经卫星位置；星历在 t 处冻结）。
+__device__ __forceinline__ void add3bSrpDualDev(const Dual6* xk, double t, Dual6* res){
+    if(c_use3b_dev == 0 && c_use_srp_dev == 0) return;
+    double rs[3], rm[3];
+    ephemerisDev(t, rs, rm);
+    if(c_use3b_dev){
+        #pragma unroll
+        for(int which = 0; which < 2; ++which){
+            const double *r3 = (which == 0) ? rs : rm;
+            const double mu = (which == 0) ? MU_SUN_KM3 : MU_MOON_KM3;
+            Dual6 dx = d6_sub(d6_c(r3[0]), xk[0]);
+            Dual6 dy = d6_sub(d6_c(r3[1]), xk[1]);
+            Dual6 dz = d6_sub(d6_c(r3[2]), xk[2]);
+            Dual6 d2 = d6_add(d6_add(d6_mul(dx, dx), d6_mul(dy, dy)), d6_mul(dz, dz));
+            Dual6 d = d6_sqrt(d2);
+            Dual6 d3 = d6_mul(d2, d);
+            Dual6 inv = d6_div(d6_c(1.0), d3);
+            const double r3n = sqrt(r3[0]*r3[0] + r3[1]*r3[1] + r3[2]*r3[2]);
+            const double c0 = 1.0 / (r3n*r3n*r3n);
+            res[0] = d6_add(res[0], d6_mul(d6_c(mu), d6_sub(d6_mul(dx, inv), d6_c(r3[0]*c0))));
+            res[1] = d6_add(res[1], d6_mul(d6_c(mu), d6_sub(d6_mul(dy, inv), d6_c(r3[1]*c0))));
+            res[2] = d6_add(res[2], d6_mul(d6_c(mu), d6_sub(d6_mul(dz, inv), d6_c(r3[2]*c0))));
+        }
+    }
+    if(c_use_srp_dev){
+        const double rx = xk[0].v, ry = xk[1].v, rz = xk[2].v;
+        const double ddx = rs[0] - rx, ddy = rs[1] - ry, ddz = rs[2] - rz;
+        const double dd = sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+        const double r3n = sqrt(rs[0]*rs[0] + rs[1]*rs[1] + rs[2]*rs[2]);
+        bool shadow = false;
+        if(dd > 0.0 && r3n > 0.0){
+            const double ux = ddx/dd, uy = ddy/dd, uz = ddz/dd;
+            const double proj = rx*ux + ry*uy + rz*uz;
+            if(proj < 0.0){
+                const double px = rx - proj*ux, py = ry - proj*uy, pz = rz - proj*uz;
+                shadow = (px*px + py*py + pz*pz < RE_KM*RE_KM);
+            }
+        }
+        if(!shadow && dd > 0.0 && r3n > 0.0){
+            Dual6 dx = d6_sub(d6_c(rs[0]), xk[0]);
+            Dual6 dy = d6_sub(d6_c(rs[1]), xk[1]);
+            Dual6 dz = d6_sub(d6_c(rs[2]), xk[2]);
+            Dual6 d = d6_sqrt(d6_add(d6_add(d6_mul(dx, dx), d6_mul(dy, dy)), d6_mul(dz, dz)));
+            const double c = c_srp_cr * c_srp_am * c_srp_p0
+                           * (c_au_km/r3n) * (c_au_km/r3n) * 1e-3;
+            Dual6 cx = d6_mul(d6_c(c), d6_div(dx, d));
+            Dual6 cy = d6_mul(d6_c(c), d6_div(dy, d));
+            Dual6 cz = d6_mul(d6_c(c), d6_div(dz, d));
+            res[0] = d6_sub(res[0], cx);
+            res[1] = d6_sub(res[1], cy);
+            res[2] = d6_sub(res[2], cz);
+        }
+    }
+}
+
+// 二体+J234+场阻力+RBF 的对偶版 = tbp_d_dev + (场阻力 - 表阻力) 修正。
+__device__ __forceinline__ void tbpField_d_dev(const Dual6* xk, double beta, double t,
+                                               Dual6* res){
+    tbp_d_dev(xk, beta, res);
+    Dual6 at[3], af[3];
+    dragAccelDualDev(xk, beta, at);
+    dragAccelFieldDualDev(xk, beta, t, af);
+    #pragma unroll
+    for(int k = 0; k < 3; ++k)
+        res[3+k] = d6_add(res[3+k], d6_sub(af[k], at[k]));
+    add3bSrpDualDev(xk, t, res + 3);
+}
+
+// 去二体摄动加速度的对偶版（场版本）。
+__device__ __forceinline__ void pertAccelField_d_dev(const Dual6* rv_m, double beta, double t,
+                                                     Dual6* ap){
+    Dual6 xk[6];
+    #pragma unroll
+    for(int k = 0; k < 6; ++k) xk[k] = d6_mul(rv_m[k], d6_c(1e-3));
+    Dual6 acc[6]; tbpField_d_dev(xk, beta, t, acc);
+    Dual6 rn = d6_sqrt(d6_add(d6_add(d6_mul(xk[0],xk[0]), d6_mul(xk[1],xk[1])), d6_mul(xk[2],xk[2])));
+    Dual6 c = d6_div(d6_c(MU_KM), d6_mul(d6_mul(rn,rn),rn));
+    #pragma unroll
+    for(int k = 0; k < 3; ++k)
+        ap[k] = d6_mul(d6_add(acc[3+k], d6_mul(c,xk[k])), d6_c(1e3));
+}
+
+// 含场解析 Jacobian：A=∂f/∂oe 与 f 值一次给出。
+__device__ __noinline__ void gveRhsFieldJacVal_dev(const double* OE, double beta, double t,
+                                                   double A[6][6], double fval[6]){
+    Dual6 x[6], rv[6], ap[3], out[6];
+    #pragma unroll
+    for(int j = 0; j < 6; ++j) x[j] = d6_var(OE[j], j);
+    oe2rv_d_dev(x, rv);
+    pertAccelField_d_dev(rv, beta, t, ap);
+    gveRhsFromAp_d_dev(x, ap, out);
+    #pragma unroll
+    for(int i = 0; i < 6; ++i){
+        fval[i] = out[i].v;
+        #pragma unroll
+        for(int j = 0; j < 6; ++j) A[i][j] = out[i].d[j];
+    }
+}
+
+// 单步场 STM：状态 RK4 与 gveStmStepField_dev 相同；A 在步首求一次（含场导数），
+// 步长 5 s 内冻结算子，Φ=exp(dt·A) 用 Taylor 展开（|dt·A|~5e-3，4 阶足够）。
+__device__ __noinline__ void gveStmStepFieldJac_dev(double *y, double beta, double t,
+                                                    double dt, double Phi[6][6]){
+    double A[6][6], fv[6];
+    gveRhsFieldJacVal_dev(y, beta, t, A, fv);
+    double k1[6], k2[6], k3[6], k4[6], tmp[6], yn[6];
+    gveRhsFieldDev(y, beta, t, k1);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*k1[c]/3.0;
+    gveRhsFieldDev(tmp, beta, t, k2);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(-k1[c]/3.0 + k2[c]);
+    gveRhsFieldDev(tmp, beta, t, k3);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(k1[c] - k2[c] + k3[c]);
+    gveRhsFieldDev(tmp, beta, t, k4);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) yn[c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
+    double M[6][6], M2[6][6], M3[6][6], M4[6][6];
+    #pragma unroll
+    for(int i = 0; i < 6; ++i)
+        #pragma unroll
+        for(int j = 0; j < 6; ++j) M[i][j] = dt*A[i][j];
+    mat6_mul(M, M, M2);
+    mat6_mul(M2, M, M3);
+    mat6_mul(M2, M2, M4);
+    #pragma unroll
+    for(int i = 0; i < 6; ++i)
+        #pragma unroll
+        for(int j = 0; j < 6; ++j)
+            Phi[i][j] = (i == j ? 1.0 : 0.0) + M[i][j] + 0.5*M2[i][j]
+                      + (1.0/6.0)*M3[i][j] + (1.0/24.0)*M4[i][j];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) y[c] = yn[c];
+}
+
+// 整弧状态 + 变分敏度：S=∂q/∂θ 与 Φ=∂q_c/∂q_0 与状态在同一遍中推进。
+// 每 stride 帧为一个 chunk：chunk 内状态用 3/8-RK4 子步；S 按同一子步递推
+// S_{s+1}=P_s S_s + dt/2 (P_s Wa_s B_s + Wa_{s+1} B_{s+1})（F=W(a_drag⊗B)）。
+// 逐 10 s 子步更新 S 是精度要求：块级一次更新会把高阶空间项的 forcing 积分
+// 误差累积到 1e-2。状态与 STM 的子步序列与 gveFieldChainKernel 完全一致。
+__global__ void gveFieldSensKernel(const double *oe0, const double *betas, int n,
+                                   int nchunk, int stride, double dt, double t0,
+                                   const double *t0_sat,
+                                   const int *ep_chunk, int ne, int npar, int want_phi,
+                                   double *q_ep, double *S_ep, double *phi_ep,
+                                   double *q_all, double *Scur, double *Snew) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = (betas != nullptr) ? betas[idx] : 1.0;
+    const double t0e = (t0_sat != nullptr) ? t0_sat[idx] : t0;
+    double y[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6*idx + c];
+    const size_t soff = (size_t)idx * 6 * npar;
+    double *S = Scur + soff;
+    double *Sn = Snew + soff;
+    for (size_t i = 0; i < (size_t)6*npar; ++i) S[i] = 0.0;
+    double Phi[6][6];
+    #pragma unroll
+    for (int i = 0; i < 6; ++i)
+        #pragma unroll
+        for (int j = 0; j < 6; ++j) Phi[i][j] = (i == j) ? 1.0 : 0.0;
+    int e = 0;
+    for (int c = 0; c < nchunk; ++c) {
+        if (q_all) {
+            double *qa = q_all + ((size_t)idx*nchunk + c)*6;
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) qa[r] = y[r];
+        }
+        if (e < ne && ep_chunk[e] == c) {
+            double *qo = q_ep + ((size_t)idx*ne + e)*6;
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) qo[r] = y[r];
+            double *So = S_ep + (((size_t)idx*ne + e)*6)*npar;
+            for (size_t i = 0; i < (size_t)6*npar; ++i) So[i] = S[i];
+            if (want_phi && phi_ep) {
+                double *Po = phi_ep + ((size_t)idx*ne + e)*36;
+                #pragma unroll
+                for (int i = 0; i < 36; ++i) Po[i] = ((const double*)Phi)[i];
+            }
+            ++e;
+        }
+        if (c + 1 >= nchunk) break;
+        const double tc = t0e + dt * (double)(c*stride);
+        double Wa1[6];
+        double shv1[FIELD_LM_MAX], altv1[FIELD_NA_MAX], timev1[FIELD_NT_MAX];
+        fieldForcingDev(y, beta, tc, Wa1, shv1, altv1, timev1);
+        // 逐 dt 子步推进、S 每子步更新；子步内再分两个 dt/2 半步，用三点 Simpson
+        // 积分 forcing：S_{s+1}=Φ_s S_s + dt/6 (Φ_s F_s + 4 Φ_b F_mid + F_{s+1})。
+        // 块级一次更新或子步梯形都会让高阶空间项累积到 1e-2/4e-3；Simpson 可到 <1e-3。
+        const int na = c_fld_na, nt = c_fld_nt;
+        for (int s = 0; s < stride; ++s) {
+            const double ts = tc + dt * (double)s;
+            double Wa1[6];
+            double shv1[FIELD_LM_MAX], altv1[FIELD_NA_MAX], timev1[FIELD_NT_MAX];
+            fieldForcingDev(y, beta, ts, Wa1, shv1, altv1, timev1);
+            double Pa[6][6], Pb[6][6], Ps[6][6];
+            const double hh = 0.5 * dt;
+            // 中点状态与半块 STM 在副本上算；真实状态 y 必须与 chain 完全同轨迹。
+            double ym[6];
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) ym[c] = y[c];
+            gveStmStepFieldJac_dev(ym, beta, ts, hh, Pa);
+            double Wam[6];
+            double shvm[FIELD_LM_MAX], altvm[FIELD_NA_MAX], timevm[FIELD_NT_MAX];
+            fieldForcingDev(ym, beta, ts + hh, Wam, shvm, altvm, timevm);
+            double ytmp[6];
+            #pragma unroll
+            for (int c = 0; c < 6; ++c) ytmp[c] = ym[c];
+            gveStmStepFieldJac_dev(ytmp, beta, ts + hh, hh, Pb);
+            mat6_mul(Pb, Pa, Ps);
+            // 真实状态：与 gveFieldChainKernel 的每个 10 s 子步逐位一致。
+            gveStepSubField_dev(y, beta, ts, dt, 1);
+            double Wa2[6];
+            double shv2[FIELD_LM_MAX], altv2[FIELD_NA_MAX], timev2[FIELD_NT_MAX];
+            fieldForcingDev(y, beta, ts + dt, Wa2, shv2, altv2, timev2);
+            // 端点 0 用 Φ_s，中点用 Φ_b，端点 h 用 I。
+            double PWa1[6], PWam[6];
+            #pragma unroll
+            for (int r = 0; r < 6; ++r) {
+                double a1 = 0.0, am = 0.0;
+                for (int m = 0; m < 6; ++m) {
+                    a1 += Ps[r][m] * Wa1[m];
+                    // 与状态核一致：整个 dt 步内场基冻结在步首 ts（状态核
+                    // gveStepSubField_dev 的 4 个 RK 阶段都用 ts 的基）。
+                    am += Pb[r][m] * Wa1[m];
+                }
+                PWa1[r] = a1; PWam[r] = am;
+            }
+            for (int j = 0; j < npar; ++j) {
+                const int k = j % nt;
+                const int a = (j / nt) % na;
+                const int ilm = j / (na * nt);
+                const double B1 = shv1[ilm] * altv1[a] * timev1[k];
+                // 状态核在本 dt 步内用 ts 冻结的整组基（含时间/位置），故
+                // ∂f/∂θ 也必须是同一冻结基：F=Wa1*B1 常数，S'=ΦS+∫ΦF dt。
+                // 用中点 STM（Pb）对 ∫Φ 作二阶近似，取代此前与状态核不一致的
+                // Simpson（中点/端点基）积分。
+                for (int r = 0; r < 6; ++r) {
+                    double v = dt * PWam[r] * B1;
+                    for (int m = 0; m < 6; ++m) v += Ps[r][m] * S[m*npar + j];
+                    Sn[r*npar + j] = v;
+                }
+            }
+            double *tmp = S; S = Sn; Sn = tmp;
+            if (want_phi) {
+                double Pn[6][6];
+                mat6_mul(Ps, Phi, Pn);
+                #pragma unroll
+                for (int i = 0; i < 6; ++i)
+                    #pragma unroll
+                    for (int j2 = 0; j2 < 6; ++j2) Phi[i][j2] = Pn[i][j2];
+            }
+        }
+    }
+}
+
+// W = ∂f_QOE/∂a_p（6×3），批量；供 Python 侧变分 STM 的 forcing 装配。
+__global__ void gveGaussWKernel(const double *oe, int n, double *Wout) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    double W[6][3];
+    gveGaussW_dev(oe + 6*idx, W);
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 3; ++b) Wout[(idx*6 + a)*3 + b] = W[a][b];
+}
+
+__global__ void gveRhsFromApKernel(const double *oe, const double *ap, int n, double *out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    gveRhsFromAp_dev(oe + 6*idx, ap + 3*idx, out + 6*idx);
+}
+
+__global__ void gveRhsFieldKernel(const double *oe, const double *betas, const double *tv,
+                                  int n, double *out) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = (betas != nullptr) ? betas[idx] : 1.0;
+    gveRhsFieldDev(oe + 6*idx, beta, tv[idx], out + 6*idx);
 }
 
 // 从 QOE 算 rv(6) 与位置 Jacobian A18=∂p/∂oe(3×6)（设备端对偶）。
@@ -1330,7 +2336,24 @@ void gveStmLastBetaDevice(const double *d_oe, const double *d_beta, int n, int n
 
 }  // namespace qoejopt
 
-// Host 包装：对 n 个 QOE 各做一次 dt 单步（链式调用即得整弧）。t0 保留接口（RHS 自治，未用）。
+// 前向声明（全局 ::qoejopt，定义在文件后部的同名 kernel）。
+namespace qoejopt {
+__global__ void gveParamSensKernel(const double *oe0, const double *betas, int n, int nfr, double dt,
+                                   int nb, const int *bins, double *qend, double *Sb, double *Sr);
+__global__ void gveFieldChainKernel(const double*, const double*, int, int, int, double, double,
+                                    const double*, double*, double*);
+__global__ void gveFieldLogKernel(const double*, const double*, int, double*);
+__global__ void gveFieldAccelKernel(const double*, const double*, const double*, int,
+                                    double*, double*);
+__global__ void gveFieldBasisKernel(const double*, const double*, int, double*);
+__global__ void pert3bSrpKernel(const double*, const double*, int, double*);
+__global__ void gveFieldSensKernel(const double*, const double*, int, int, int, double, double,
+                                   const double*, const int*, int, int, int, double*, double*,
+                                   double*, double*, double*, double*);
+__global__ void gveGaussWKernel(const double*, int, double*);
+__global__ void gveRhsFromApKernel(const double*, const double*, int, double*);
+__global__ void gveRhsFieldKernel(const double*, const double*, const double*, int, double*);
+}
 namespace kep3 {
 // 全流程细粒度计时（秒）：pack=host 装/解包、h2d=输入拷贝、kernel=CUDA 计算、d2h=输出拷贝。
 // 全流程细粒度计时（秒）：pack=host 装/解包、h2d=输入拷贝、kernel=CUDA 计算、d2h=输出拷贝、
@@ -1367,6 +2390,455 @@ void setPole(double x, double y, double z){
     for(int i=0;i<9;i++) g_pole_Q[i] = Q[i];
     cudaMemcpyToSymbol(c_pole, p, 3*sizeof(double));
     cudaMemcpyToSymbol(c_pole_Q, Q, 9*sizeof(double));
+}
+
+// ---- 日/月三体 + SRP 的 host 接口（qoe_core 内）----
+void setThirdBodyCuda(bool on){
+    int v = on ? 1 : 0;
+    cudaMemcpyToSymbol(c_use3b_dev, &v, sizeof(int));
+}
+void setPropEpochCuda(double mjd0){
+    cudaMemcpyToSymbol(c_mjd0_dev, &mjd0, sizeof(double));
+}
+void setSrpCuda(bool on){
+    int v = on ? 1 : 0;
+    cudaMemcpyToSymbol(c_use_srp_dev, &v, sizeof(int));
+}
+void setSrpParamsCuda(double cr, double area_over_mass){
+    cudaMemcpyToSymbol(c_srp_cr, &cr, sizeof(double));
+    cudaMemcpyToSymbol(c_srp_am, &area_over_mass, sizeof(double));
+}
+static double *g_rsun_host_dev = nullptr, *g_rmoon_host_dev = nullptr;
+static std::size_t g_ephem_cap = 0;
+void setThirdBodyEphemCuda(const std::vector<double> &rsun, const std::vector<double> &rmoon,
+                           double t0, double dt){
+    const std::size_t n = rsun.size() / 3;
+    if(n < 2 || rmoon.size() / 3 != n)
+        throw std::runtime_error("setThirdBodyEphemCuda: need >=2 samples and matching sizes");
+    if(!(dt > 0.0)) throw std::runtime_error("setThirdBodyEphemCuda: dt <= 0");
+    const std::size_t bytes = n * 3 * sizeof(double);
+    if(bytes > g_ephem_cap){
+        if(g_rsun_host_dev) cudaFree(g_rsun_host_dev);
+        if(g_rmoon_host_dev) cudaFree(g_rmoon_host_dev);
+        g_rsun_host_dev = nullptr; g_rmoon_host_dev = nullptr; g_ephem_cap = 0;
+        cudaMalloc(&g_rsun_host_dev, bytes);
+        cudaMalloc(&g_rmoon_host_dev, bytes);
+        g_ephem_cap = bytes;
+    }
+    cudaMemcpy(g_rsun_host_dev, rsun.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(g_rmoon_host_dev, rmoon.data(), bytes, cudaMemcpyHostToDevice);
+    cudaMemcpyToSymbol(g_rsun_tab, &g_rsun_host_dev, sizeof(double*));
+    cudaMemcpyToSymbol(g_rmoon_tab, &g_rmoon_host_dev, sizeof(double*));
+    int ni = (int)n, on = 1;
+    cudaMemcpyToSymbol(c_ephem_n, &ni, sizeof(int));
+    cudaMemcpyToSymbol(c_ephem_t0, &t0, sizeof(double));
+    cudaMemcpyToSymbol(c_ephem_dt, &dt, sizeof(double));
+    cudaMemcpyToSymbol(c_ephem_on, &on, sizeof(int));
+}
+void clearThirdBodyEphemCuda(){
+    int on = 0, n = 0;
+    cudaMemcpyToSymbol(c_ephem_on, &on, sizeof(int));
+    cudaMemcpyToSymbol(c_ephem_n, &n, sizeof(int));
+}
+std::vector<double> getThirdBodyEphemInfoCuda(){
+    int on = 0, n = 0, use3b = 0, srp = 0;
+    double t0 = 0.0, dt = 0.0, mjd0 = 0.0, cr = 0.0, am = 0.0;
+    cudaMemcpyFromSymbol(&on, c_ephem_on, sizeof(int));
+    cudaMemcpyFromSymbol(&n, c_ephem_n, sizeof(int));
+    cudaMemcpyFromSymbol(&t0, c_ephem_t0, sizeof(double));
+    cudaMemcpyFromSymbol(&dt, c_ephem_dt, sizeof(double));
+    cudaMemcpyFromSymbol(&use3b, c_use3b_dev, sizeof(int));
+    cudaMemcpyFromSymbol(&srp, c_use_srp_dev, sizeof(int));
+    cudaMemcpyFromSymbol(&mjd0, c_mjd0_dev, sizeof(double));
+    cudaMemcpyFromSymbol(&cr, c_srp_cr, sizeof(double));
+    cudaMemcpyFromSymbol(&am, c_srp_am, sizeof(double));
+    return {double(on), double(n), t0, dt, double(use3b), double(srp), mjd0, cr, am};
+}
+
+// ---- 可学习阻力模型（CUDA）：高度分段常数密度表 + 逐星 beta ----
+// h_lo_m/h_hi_m：最低/最高地心高度（m）；rho：分箱密度（kg/m³，索引 0=最低箱）；
+// beta：逐星阻力倍率（长度 N；空或长度 1 → 广播）。表模式下 tbp_dev / cartRhsDev 同式使用。
+static int g_drag_mode_host = 0;
+static std::vector<double> g_drag_beta_host;
+void setDragTable(double h_lo_m, double h_hi_m, const std::vector<double> &rho,
+                  const std::vector<double> &beta){
+    if(rho.empty()) throw std::runtime_error("setDragTable: rho 为空");
+    if((int)rho.size() > RHO_TAB_MAX) throw std::runtime_error("setDragTable: n_bins > RHO_TAB_MAX");
+    const double lo = h_lo_m * 1e-3, hi = h_hi_m * 1e-3;    // m -> km
+    if(!(hi > lo)) throw std::runtime_error("setDragTable: h_hi_m <= h_lo_m");
+    const int n = (int)rho.size();
+    const double dh = (hi - lo) / (double)n;
+    std::vector<double> tab(RHO_TAB_MAX, 0.0);
+    for(int k = 0; k < n; ++k) tab[k] = rho[(std::size_t)k];
+    int mode = 1;
+    cudaMemcpyToSymbol(c_drag_mode, &mode, sizeof(int));
+    cudaMemcpyToSymbol(c_rho_n, &n, sizeof(int));
+    cudaMemcpyToSymbol(c_rho_lo_km, &lo, sizeof(double));
+    cudaMemcpyToSymbol(c_rho_dh_km, &dh, sizeof(double));
+    cudaMemcpyToSymbol(c_rho_tab, tab.data(), RHO_TAB_MAX * sizeof(double));
+    g_drag_mode_host = 1;
+    g_drag_beta_host = beta;
+}
+void clearDragTable(){
+    int mode = 0, n = 0;
+    cudaMemcpyToSymbol(c_drag_mode, &mode, sizeof(int));
+    cudaMemcpyToSymbol(c_rho_n, &n, sizeof(int));
+    g_drag_mode_host = 0;
+    g_drag_beta_host.clear();
+}
+int getDragMode(){ return g_drag_mode_host; }
+// 返回 (h_lo_m, h_hi_m, rho, beta, mode)
+std::tuple<double, double, std::vector<double>, std::vector<double>, int>
+getDragTable(){
+    if(g_drag_mode_host != 1) return std::make_tuple(0.0, 0.0, std::vector<double>{},
+                                                     std::vector<double>{}, 0);
+    int n = 0; double lo = 0.0, dh = 1.0;
+    cudaMemcpyFromSymbol(&n, c_rho_n, sizeof(int));
+    cudaMemcpyFromSymbol(&lo, c_rho_lo_km, sizeof(double));
+    cudaMemcpyFromSymbol(&dh, c_rho_dh_km, sizeof(double));
+    std::vector<double> tab(RHO_TAB_MAX, 0.0);
+    cudaMemcpyFromSymbol(tab.data(), c_rho_tab, RHO_TAB_MAX * sizeof(double));
+    tab.resize(std::max(0, n));
+    return std::make_tuple(lo * 1e3, (lo + dh * n) * 1e3, tab,
+                           g_drag_beta_host, 1);
+}
+// ---- 密度场 host 接口 ----
+// 列序：ilm 按 (l=0..L, m=0..l, cs=0 且 m>0 时再 cs=1) 展开；j=((ilm*na+a)*nt+k)。
+static int g_fld_l[FIELD_LM_MAX], g_fld_m[FIELD_LM_MAX], g_fld_cs[FIELD_LM_MAX];
+static double g_fld_nrm[FIELD_LM_MAX];
+static int g_fld_nlm = 0;
+static std::vector<double> g_fld_theta_host;
+
+void setDragField(int lmax, int na, int nt, double href_km, double dh_km,
+                  double tref_s, double thref, const std::vector<double> &theta){
+    if(lmax < 0 || lmax > FIELD_LMAX_MAX)
+        throw std::runtime_error("setDragField: lmax out of [0,12]");
+    if(na < 1 || na > FIELD_NA_MAX) throw std::runtime_error("setDragField: na out of range");
+    if(nt < 1 || nt > FIELD_NT_MAX) throw std::runtime_error("setDragField: nt out of range");
+    int nlm = 0;
+    for(int l = 0; l <= lmax; ++l){
+        for(int m = 0; m <= l; ++m){
+            // 实球谐正交归一化：N_lm=sqrt((2l+1)/(4π)*(l-m)!/(l+m)!*[2 if m>0])
+            const double lf = std::lgamma((double)(l-m+1)) - std::lgamma((double)(l+m+1));
+            const double nrm = std::sqrt((2.0*l+1.0)/(4.0*M_PI) * std::exp(lf) * (m > 0 ? 2.0 : 1.0));
+            g_fld_l[nlm] = l; g_fld_m[nlm] = m; g_fld_cs[nlm] = 0;
+            g_fld_nrm[nlm] = nrm; ++nlm;
+            if(m > 0){ g_fld_l[nlm] = l; g_fld_m[nlm] = m; g_fld_cs[nlm] = 1;
+                       g_fld_nrm[nlm] = nrm; ++nlm; }
+        }
+    }
+    const int npar = nlm * na * nt;
+    if(npar > FIELD_MAXP) throw std::runtime_error("setDragField: npar > FIELD_MAXP");
+    if((int)theta.size() != npar) throw std::runtime_error("setDragField: theta size != npar");
+    for(int i = 0; i < FIELD_LM_MAX; ++i){
+        if(i >= nlm){ g_fld_l[i] = 0; g_fld_m[i] = 0; g_fld_cs[i] = 0; }
+    }
+    g_fld_nlm = nlm;
+    g_fld_theta_host = theta;
+    int on = 1;
+    cudaMemcpyToSymbol(c_fld_on, &on, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_n, &npar, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_nlm, &nlm, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_lmax, &lmax, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_na, &na, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_nt, &nt, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_href_km, &href_km, sizeof(double));
+    cudaMemcpyToSymbol(c_fld_dh_km, &dh_km, sizeof(double));
+    cudaMemcpyToSymbol(c_fld_tref_s, &tref_s, sizeof(double));
+    cudaMemcpyToSymbol(c_fld_thref, &thref, sizeof(double));
+    cudaMemcpyToSymbol(c_fld_l, g_fld_l, nlm*sizeof(int));
+    cudaMemcpyToSymbol(c_fld_m, g_fld_m, nlm*sizeof(int));
+    cudaMemcpyToSymbol(c_fld_cs, g_fld_cs, nlm*sizeof(int));
+    cudaMemcpyToSymbol(c_fld_nrm, g_fld_nrm, nlm*sizeof(double));
+    cudaMemcpyToSymbol(c_fld_theta, theta.data(), npar*sizeof(double));
+}
+void clearDragField(){
+    int on = 0, n = 0, lm = 0;
+    cudaMemcpyToSymbol(c_fld_on, &on, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_n, &n, sizeof(int));
+    cudaMemcpyToSymbol(c_fld_lmax, &lm, sizeof(int));
+    g_fld_theta_host.clear();
+}
+int getDragFieldN(){ return (int)g_fld_theta_host.size(); }
+std::vector<double> getDragFieldTheta(){ return g_fld_theta_host; }
+
+void dragFieldLogBatch(const std::vector<Vector6d> &rv, const std::vector<double> &tv,
+                       std::vector<double> &gout){
+    const int n = (int)rv.size();
+    gout.assign((size_t)n, 0.0);
+    if(n == 0) return;
+    std::vector<double> hr((size_t)n*6), ht(tv.begin(), tv.begin()+n);
+    for(int i = 0; i < n; ++i) for(int c = 0; c < 6; ++c) hr[(size_t)i*6+c] = rv[i](c);
+    double *dr=nullptr, *dt=nullptr, *dg=nullptr;
+    cudaMalloc(&dr,(size_t)n*6*sizeof(double)); cudaMalloc(&dt,(size_t)n*sizeof(double));
+    cudaMalloc(&dg,(size_t)n*sizeof(double));
+    cudaMemcpy(dr,hr.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(dt,ht.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    qoejopt::gveFieldLogKernel<<<(n+63)/64,64>>>(dr,dt,n,dg);
+    cudaDeviceSynchronize();
+    cudaMemcpy(gout.data(),dg,(size_t)n*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(dr); cudaFree(dt); cudaFree(dg);
+}
+
+void pert3bSrpBatch(const std::vector<Vector6d> &rv, const std::vector<double> &tv,
+                    std::vector<double> &aout){
+    const int n = (int)rv.size();
+    aout.assign((size_t)n*3, 0.0);
+    if(n == 0) return;
+    std::vector<double> hr((size_t)n*6, 0.0);
+    for(int i = 0; i < n; ++i) for(int c = 0; c < 6; ++c) hr[(size_t)i*6+c] = rv[i](c);
+    double *dr=nullptr, *dt=nullptr, *da=nullptr;
+    cudaMalloc(&dr,(size_t)n*6*sizeof(double)); cudaMalloc(&dt,(size_t)n*sizeof(double));
+    cudaMalloc(&da,(size_t)n*3*sizeof(double));
+    cudaMemcpy(dr,hr.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(dt,tv.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    qoejopt::pert3bSrpKernel<<<(n+63)/64,64>>>(dr,dt,n,da);
+    cudaError_t err = cudaDeviceSynchronize();
+    if(err != cudaSuccess) fprintf(stderr,"[pert3bSrpBatch] %s\n",cudaGetErrorString(err));
+    cudaMemcpy(aout.data(),da,(size_t)n*3*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(dr); cudaFree(dt); cudaFree(da);
+}
+
+void dragFieldAccelBatch(const std::vector<Vector6d> &rv, const std::vector<double> &tv,
+                         const std::vector<double> &betas, std::vector<double> &aout,
+                         std::vector<double> &rout){
+    const int n = (int)rv.size();
+    aout.assign((size_t)n*3, 0.0); rout.assign((size_t)n, 0.0);
+    if(n == 0) return;
+    std::vector<double> hr((size_t)n*6), ht(tv.begin(), tv.begin()+n);
+    std::vector<double> hb((size_t)n, 1.0);
+    for(int i = 0; i < n; ++i){
+        for(int c = 0; c < 6; ++c) hr[(size_t)i*6+c] = rv[i](c);
+        if(!betas.empty()) hb[i] = (betas.size() == (size_t)n) ? betas[i] : betas[0];
+    }
+    double *dr=nullptr, *dt=nullptr, *db=nullptr, *da=nullptr, *drho=nullptr;
+    cudaMalloc(&dr,(size_t)n*6*sizeof(double)); cudaMalloc(&dt,(size_t)n*sizeof(double));
+    cudaMalloc(&db,(size_t)n*sizeof(double)); cudaMalloc(&da,(size_t)n*3*sizeof(double));
+    cudaMalloc(&drho,(size_t)n*sizeof(double));
+    cudaMemcpy(dr,hr.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(dt,ht.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(db,hb.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    qoejopt::gveFieldAccelKernel<<<(n+63)/64,64>>>(dr,dt,db,n,da,drho);
+    cudaDeviceSynchronize();
+    cudaMemcpy(aout.data(),da,(size_t)n*3*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaMemcpy(rout.data(),drho,(size_t)n*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(dr); cudaFree(dt); cudaFree(db); cudaFree(da); cudaFree(drho);
+}
+
+void dragFieldBasisBatch(const std::vector<Vector6d> &rv, const std::vector<double> &tv,
+                         std::vector<double> &Bout){
+    const int n = (int)rv.size();
+    const int npar = getDragFieldN();
+    Bout.assign((size_t)n*npar, 0.0);
+    if(n == 0 || npar == 0) return;
+    std::vector<double> hr((size_t)n*6), ht(tv.begin(), tv.begin()+n);
+    for(int i = 0; i < n; ++i) for(int c = 0; c < 6; ++c) hr[(size_t)i*6+c] = rv[i](c);
+    double *dr=nullptr, *dt=nullptr, *dB=nullptr;
+    cudaMalloc(&dr,(size_t)n*6*sizeof(double));
+    cudaMalloc(&dt,(size_t)n*sizeof(double));
+    cudaMalloc(&dB,(size_t)n*npar*sizeof(double));
+    cudaMemcpy(dr,hr.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(dt,ht.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    qoejopt::gveFieldBasisKernel<<<(n+63)/64,64>>>(dr,dt,n,dB);
+    cudaDeviceSynchronize();
+    cudaMemcpy(Bout.data(),dB,(size_t)n*npar*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(dr); cudaFree(dt); cudaFree(dB);
+}
+
+void gveFieldSensBatch(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                       int nfr, int stride, double dt, double t0,
+                       const std::vector<int> &epochs, bool want_phi,
+                       std::vector<double> &q_ep, std::vector<double> &S_ep,
+                       std::vector<double> &phi_ep, std::vector<double> *q_all,
+                       const std::vector<double> *t0_sat){
+    const int n = (int)oe0s.size();
+    const int npar = getDragFieldN();
+    if(stride < 1) throw std::runtime_error("gveFieldSensBatch: stride < 1");
+    if(nfr <= 0) throw std::runtime_error("gveFieldSensBatch: nfr <= 0");
+    const int nchunk = (nfr > 1) ? ((nfr-1)/stride + 1) : 1;
+    const int ne = (int)epochs.size();
+    q_ep.assign((size_t)n*ne*6, 0.0);
+    S_ep.assign((size_t)n*ne*6*npar, 0.0);
+    if(want_phi) phi_ep.assign((size_t)n*ne*36, 0.0); else phi_ep.clear();
+    if(q_all) q_all->assign((size_t)n*nchunk*6, 0.0);
+    if(n == 0 || ne == 0) return;
+    std::vector<int> ep_chunk(ne, 0);
+    for(int e = 0; e < ne; ++e){
+        if(epochs[e] % stride != 0)
+            throw std::runtime_error("gveFieldSensBatch: epoch not multiple of stride");
+        ep_chunk[e] = epochs[e] / stride;
+        if(ep_chunk[e] < 0 || ep_chunk[e] >= nchunk)
+            throw std::runtime_error("gveFieldSensBatch: epoch out of range");
+    }
+    std::vector<double> h0((size_t)n*6), hb((size_t)n, 1.0);
+    for(int i = 0; i < n; ++i){
+        for(int c = 0; c < 6; ++c) h0[(size_t)i*6+c] = oe0s[i](c);
+        if(!betas.empty()) hb[i] = (betas.size() == (size_t)n) ? betas[i] : betas[0];
+    }
+    const bool use_t0s = (t0_sat != nullptr) && !t0_sat->empty();
+    if(use_t0s && t0_sat->size() != (size_t)n)
+        throw std::runtime_error("gveFieldSensBatch: t0_sat size != n");
+    std::vector<double> ht0;
+    if(use_t0s) ht0.assign(t0_sat->begin(), t0_sat->end());
+    double *d0=nullptr, *db=nullptr, *dq=nullptr, *ds=nullptr, *dp=nullptr, *dqa=nullptr;
+    double *dScur=nullptr, *dSnew=nullptr, *dt0s=nullptr;
+    const size_t bq=(size_t)n*ne*6*sizeof(double);
+    const size_t bs=(size_t)n*ne*6*npar*sizeof(double);
+    const size_t bw=(size_t)n*6*npar*sizeof(double);
+    const size_t bqa=(size_t)n*nchunk*6*sizeof(double);
+    cudaMalloc(&d0,(size_t)n*6*sizeof(double));
+    cudaMalloc(&db,(size_t)n*sizeof(double));
+    cudaMalloc(&dq,bq); cudaMalloc(&ds,bs);
+    if(want_phi) cudaMalloc(&dp,(size_t)n*ne*36*sizeof(double)); else dp=nullptr;
+    if(q_all) cudaMalloc(&dqa,bqa); else dqa=nullptr;
+    cudaMalloc(&dScur,bw); cudaMalloc(&dSnew,bw);
+    int *dep=nullptr; cudaMalloc(&dep,(size_t)ne*sizeof(int));
+    cudaMemcpy(d0,h0.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(db,hb.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(dep,ep_chunk.data(),(size_t)ne*sizeof(int),cudaMemcpyHostToDevice);
+    if(use_t0s){
+        cudaMalloc(&dt0s,(size_t)n*sizeof(double));
+        cudaMemcpy(dt0s,ht0.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    }
+    qoejopt::gveFieldSensKernel<<<(n+63)/64,64>>>(d0,db,n,nchunk,stride,dt,t0,dt0s,dep,ne,npar,
+                                                  want_phi?1:0,dq,ds,dp,dqa,dScur,dSnew);
+    cudaError_t err = cudaDeviceSynchronize();
+    if(err != cudaSuccess) fprintf(stderr,"[gveFieldSensBatch] %s\n",cudaGetErrorString(err));
+    cudaMemcpy(q_ep.data(),dq,bq,cudaMemcpyDeviceToHost);
+    cudaMemcpy(S_ep.data(),ds,bs,cudaMemcpyDeviceToHost);
+    if(want_phi) cudaMemcpy(phi_ep.data(),dp,(size_t)n*ne*36*sizeof(double),cudaMemcpyDeviceToHost);
+    if(q_all) cudaMemcpy(q_all->data(),dqa,bqa,cudaMemcpyDeviceToHost);
+    cudaFree(d0); cudaFree(db); cudaFree(dq); cudaFree(ds);
+    if(dp) cudaFree(dp); if(dqa) cudaFree(dqa);
+    cudaFree(dScur); cudaFree(dSnew); cudaFree(dep); if(dt0s) cudaFree(dt0s);
+}
+
+// DA 求值：q(x0+dx,θ+dθ) ≈ qb + Φ dx + S dθ。返回 (q_eval, info)，
+// info=[max|Φdx|, max|S dθ|, refresh_required]。信任半径按 QOE 欧氏范数。
+void gveFieldDaEvalBatch(const std::vector<double> &qb, const std::vector<double> &S,
+                         const std::vector<double> &Phi, const std::vector<double> &dx,
+                         const std::vector<double> &dtheta, int n, int ne, int npar,
+                         double trust_radius, std::vector<double> &qout,
+                         std::vector<double> &info){
+    qout.assign((size_t)n*ne*6, 0.0);
+    info.assign(3, 0.0);
+    if(n <= 0 || ne <= 0) return;
+    double mx_x = 0.0, mx_t = 0.0, mx = 0.0;
+    for(int i = 0; i < n; ++i){
+        for(int e = 0; e < ne; ++e){
+            const size_t qo = ((size_t)i*ne + e)*6;
+            const size_t po = ((size_t)i*ne + e)*36;
+            const size_t so = qo*npar;
+            double sx2 = 0.0, st2 = 0.0;
+            for(int r = 0; r < 6; ++r){
+                double sx = 0.0, st = 0.0;
+                for(int c = 0; c < 6; ++c) sx += Phi[po + r*6 + c] * dx[(size_t)i*6 + c];
+                for(int j = 0; j < npar; ++j) st += S[so + (size_t)r*npar + j] * dtheta[j];
+                qout[qo + r] = qb[qo + r] + sx + st;
+                sx2 += sx*sx; st2 += st*st;
+            }
+            mx_x = std::max(mx_x, std::sqrt(sx2));
+            mx_t = std::max(mx_t, std::sqrt(st2));
+            mx = std::max(mx, std::sqrt(sx2 + st2));
+        }
+    }
+    info[0] = mx_x; info[1] = mx_t;
+    info[2] = (mx > trust_radius) ? 1.0 : 0.0;
+}
+
+void gveFieldChainBatch(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                        int nfr, int stride, double dt, double t0, bool want_phi,
+                        std::vector<double> &qall, std::vector<double> &phi_all,
+                        const std::vector<double> *t0_sat){
+    const int n = (int)oe0s.size();
+    if(stride < 1) throw std::runtime_error("gveFieldChainBatch: stride < 1");
+    if(nfr > 1 && ((nfr-1) % stride) != 0) throw std::runtime_error("gveFieldChainBatch: (nfr-1) not divisible by stride");
+    const int nchunk = (nfr > 1) ? ((nfr-1)/stride + 1) : 1;
+    qall.assign((size_t)n*nchunk*6, 0.0);
+    if(want_phi) phi_all.assign((size_t)n*std::max(0,nchunk-1)*36, 0.0); else phi_all.clear();
+    if(n == 0 || nfr <= 0) return;
+    std::vector<double> h0((size_t)n*6), hb((size_t)n, 1.0);
+    for(int i = 0; i < n; ++i){
+        for(int c = 0; c < 6; ++c) h0[(size_t)i*6+c] = oe0s[i](c);
+        if(!betas.empty()) hb[i] = (betas.size() == (size_t)n) ? betas[i] : betas[0];
+    }
+    const bool use_t0s = (t0_sat != nullptr) && !t0_sat->empty();
+    if(use_t0s && t0_sat->size() != (size_t)n)
+        throw std::runtime_error("gveFieldChainBatch: t0_sat size != n");
+    std::vector<double> ht0;
+    if(use_t0s) ht0.assign(t0_sat->begin(), t0_sat->end());
+    double *d0=nullptr, *db=nullptr, *dq=nullptr, *dp=nullptr, *dt0s=nullptr;
+    const size_t bq=(size_t)n*nchunk*6*sizeof(double);
+    const size_t bp=(size_t)n*std::max(0,nchunk-1)*36*sizeof(double);
+    cudaMalloc(&d0,(size_t)n*6*sizeof(double)); cudaMalloc(&db,(size_t)n*sizeof(double));
+    cudaMalloc(&dq,bq); if(want_phi) cudaMalloc(&dp,bp); else dp=nullptr;
+    cudaMemcpy(d0,h0.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(db,hb.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    if(use_t0s){
+        cudaMalloc(&dt0s,(size_t)n*sizeof(double));
+        cudaMemcpy(dt0s,ht0.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    }
+    qoejopt::gveFieldChainKernel<<<(n+63)/64,64>>>(d0,db,n,nchunk,stride,dt,t0,dt0s,dq,dp);
+    cudaError_t err = cudaDeviceSynchronize();
+    if(err != cudaSuccess) fprintf(stderr,"[gveFieldChainBatch] %s\n",cudaGetErrorString(err));
+    cudaMemcpy(qall.data(),dq,bq,cudaMemcpyDeviceToHost);
+    if(want_phi) cudaMemcpy(phi_all.data(),dp,bp,cudaMemcpyDeviceToHost);
+    cudaFree(d0); cudaFree(db); cudaFree(dq); if(dp) cudaFree(dp); if(dt0s) cudaFree(dt0s);
+}
+
+void gveGaussWBatch(const std::vector<Vector6d> &oe, std::vector<double> &Wout){
+    const int n = (int)oe.size();
+    Wout.assign((size_t)n*18, 0.0);
+    if(n == 0) return;
+    std::vector<double> h((size_t)n*6);
+    for(int i = 0; i < n; ++i) for(int c = 0; c < 6; ++c) h[(size_t)i*6+c] = oe[i](c);
+    double *d0=nullptr, *dW=nullptr;
+    cudaMalloc(&d0,(size_t)n*6*sizeof(double)); cudaMalloc(&dW,(size_t)n*18*sizeof(double));
+    cudaMemcpy(d0,h.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    qoejopt::gveGaussWKernel<<<(n+63)/64,64>>>(d0,n,dW);
+    cudaDeviceSynchronize();
+    cudaMemcpy(Wout.data(),dW,(size_t)n*18*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(d0); cudaFree(dW);
+}
+
+void gveRhsFieldBatch(const std::vector<Vector6d> &oe, const std::vector<double> &tv,
+                      const std::vector<double> &betas, std::vector<double> &out){
+    const int n=(int)oe.size(); out.assign((size_t)n*6,0.0); if(n==0) return;
+    std::vector<double> h((size_t)n*6), ht(tv.begin(),tv.begin()+n), hb((size_t)n,1.0);
+    for(int i=0;i<n;i++){ for(int c=0;c<6;c++) h[(size_t)i*6+c]=oe[i](c); if(!betas.empty()) hb[i]=(betas.size()==(size_t)n)?betas[i]:betas[0]; }
+    double *d0=nullptr,*db=nullptr,*dt=nullptr,*do_=nullptr;
+    cudaMalloc(&d0,(size_t)n*6*sizeof(double)); cudaMalloc(&db,(size_t)n*sizeof(double));
+    cudaMalloc(&dt,(size_t)n*sizeof(double)); cudaMalloc(&do_,(size_t)n*6*sizeof(double));
+    cudaMemcpy(d0,h.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(db,hb.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(dt,ht.data(),(size_t)n*sizeof(double),cudaMemcpyHostToDevice);
+    qoejopt::gveRhsFieldKernel<<<(n+63)/64,64>>>(d0,db,dt,n,do_);
+    cudaDeviceSynchronize();
+    cudaMemcpy(out.data(),do_,(size_t)n*6*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(d0); cudaFree(db); cudaFree(dt); cudaFree(do_);
+}
+
+void gveRhsFromApBatch(const std::vector<Vector6d> &oe, const std::vector<double> &ap,
+                       std::vector<double> &out){
+    const int n = (int)oe.size();
+    out.assign((size_t)n*6, 0.0);
+    if(n == 0) return;
+    std::vector<double> h((size_t)n*6, 0.0);
+    for(int i = 0; i < n; ++i) for(int c = 0; c < 6; ++c) h[(size_t)i*6+c] = oe[i](c);
+    double *d0=nullptr, *da=nullptr, *do_=nullptr;
+    cudaMalloc(&d0,(size_t)n*6*sizeof(double)); cudaMalloc(&da,(size_t)n*3*sizeof(double));
+    cudaMalloc(&do_,(size_t)n*6*sizeof(double));
+    cudaMemcpy(d0,h.data(),(size_t)n*6*sizeof(double),cudaMemcpyHostToDevice);
+    cudaMemcpy(da,ap.data(),(size_t)n*3*sizeof(double),cudaMemcpyHostToDevice);
+    qoejopt::gveRhsFromApKernel<<<(n+63)/64,64>>>(d0,da,n,do_);
+    cudaDeviceSynchronize();
+    cudaMemcpy(out.data(),do_,(size_t)n*6*sizeof(double),cudaMemcpyDeviceToHost);
+    cudaFree(d0); cudaFree(da); cudaFree(do_);
+}
+
+// 表模式下若已设逐星 beta，则标量接口自动改用逐星核（beta 参数被忽略）。
+static bool _useTableBeta(int n){
+    return g_drag_mode_host == 1 && g_drag_beta_host.size() == (std::size_t)n;
 }
 
 // 设定 CUDA RBF 力场（整星共享）：中心（km）/宽度 s（km）/权重 θ。centers 空 → 关闭。
@@ -1431,8 +2903,16 @@ void gveStepNoeBatch(const std::vector<Vector6d> &oe0s, double t0, double dt,
 
     const int threads = 256;
     const int blocks = (n + threads - 1) / threads;
+    const bool tabbeta = _useTableBeta(n);
+    static thread_local double *db = nullptr; static thread_local size_t cb = 0;
+    if(tabbeta){
+        const size_t bb = (size_t)n*sizeof(double);
+        if(bb > cb){ if(db) cudaFree(db); db = nullptr; cudaMalloc(&db, bb); cb = bb; }
+        cudaMemcpy(db, g_drag_beta_host.data(), bb, cudaMemcpyHostToDevice);
+    }
     _t = _now();
-    gveStepKernel<<<blocks, threads>>>(d0, n, dt, beta, df);
+    if(tabbeta) gveStepBetaKernel<<<blocks, threads>>>(d0, db, n, dt, df);
+    else        gveStepKernel<<<blocks, threads>>>(d0, n, dt, beta, df);
     cudaError_t err = cudaDeviceSynchronize();
     g_gve_kernel += _now() - _t;
     if(err != cudaSuccess)
@@ -1513,6 +2993,10 @@ void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
     const int n = (int)oe0s.size();
     rv_all.assign((size_t)nfr * n * 6, 0.0);
     if(n == 0 || nfr <= 0) return;
+    if(_useTableBeta(n)){                                     // 表模式 + 逐星 beta
+        gvePropagateNoeBatchBeta(oe0s, g_drag_beta_host, nfr, dt, nthreads, rv_all);
+        return;
+    }
 
     static thread_local std::vector<double> h0;
     h0.resize((size_t)n * 6);
@@ -1699,7 +3183,16 @@ void cartStepBatch(const std::vector<Vector6d> &x0s, double dt, int nthreads, do
                      cudaMalloc(&d0, bytes); cudaMalloc(&df, bytes); cap = bytes; }
     _t = _now(); cudaMemcpy(d0, h0.data(), bytes, cudaMemcpyHostToDevice); g_gve_h2d += _now() - _t;
     const int threads = 256, blocks = (n + threads - 1) / threads;
-    _t = _now(); cartStepKernel<<<blocks, threads>>>(d0, n, dt, beta, df);
+    const bool tabbeta = _useTableBeta(n);
+    static thread_local double *db = nullptr; static thread_local size_t cb = 0;
+    if(tabbeta){
+        const size_t bb = (size_t)n*sizeof(double);
+        if(bb > cb){ if(db) cudaFree(db); db = nullptr; cudaMalloc(&db, bb); cb = bb; }
+        cudaMemcpy(db, g_drag_beta_host.data(), bb, cudaMemcpyHostToDevice);
+    }
+    _t = _now();
+    if(tabbeta) cartStepBetaKernel<<<blocks, threads>>>(d0, db, n, dt, df);
+    else        cartStepKernel<<<blocks, threads>>>(d0, n, dt, beta, df);
     cudaError_t err = cudaDeviceSynchronize(); g_gve_kernel += _now() - _t;
     if(err != cudaSuccess) fprintf(stderr, "[cartStepBatch] kernel error: %s\n", cudaGetErrorString(err));
     _t = _now(); cudaMemcpy(hf.data(), df, bytes, cudaMemcpyDeviceToHost);
@@ -1728,10 +3221,58 @@ void cartPropagateBatch(const std::vector<Vector6d> &x0s, int nfr, double dt, in
     if(bx > cx){ if(dx) cudaFree(dx); dx = nullptr; cudaMalloc(&dx, bx); cx = bx; }
     _t = _now(); cudaMemcpy(d0, h0.data(), b0, cudaMemcpyHostToDevice); g_gve_h2d += _now() - _t;
     const int threads = 256, blocks = (n + threads - 1) / threads;
-    _t = _now(); cartPropagateKernel<<<blocks, threads>>>(d0, n, nfr, dt, beta, dx);
+    const bool tabbeta = _useTableBeta(n);
+    static thread_local double *db = nullptr; static thread_local size_t cb = 0;
+    if(tabbeta){
+        const size_t bb = (size_t)n*sizeof(double);
+        if(bb > cb){ if(db) cudaFree(db); db = nullptr; cudaMalloc(&db, bb); cb = bb; }
+        cudaMemcpy(db, g_drag_beta_host.data(), bb, cudaMemcpyHostToDevice);
+    }
+    _t = _now();
+    if(tabbeta) cartPropagateBetaKernel<<<blocks, threads>>>(d0, db, n, nfr, dt, dx);
+    else        cartPropagateKernel<<<blocks, threads>>>(d0, n, nfr, dt, beta, dx);
     cudaError_t err = cudaDeviceSynchronize(); g_gve_kernel += _now() - _t;
     if(err != cudaSuccess) fprintf(stderr, "[cartPropagateBatch] kernel error: %s\n", cudaGetErrorString(err));
     _t = _now(); cudaMemcpy(x_all.data(), dx, bx, cudaMemcpyDeviceToHost); g_gve_d2h += _now() - _t;
+}
+
+// 解析参数敏感度（CUDA）：QOE 初值 + 逐星 beta + 选定 rho 箱号 → 末帧 QOE 与 ∂oe/∂beta、∂oe/∂rho_k。
+#define PSENS_MAX 48
+void gveParamSensBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
+                       const std::vector<double> &betas, const std::vector<int> &bins,
+                       std::vector<double> &qend, std::vector<double> &Sb,
+                       std::vector<double> &Sr){
+    const int n = (int)oe0s.size();
+    const int nb = (int)bins.size();
+    qend.assign((size_t)n * 6, 0.0);
+    Sb.assign((size_t)n * 6, 0.0);
+    Sr.assign((size_t)n * nb * 6, 0.0);
+    if(n == 0) return;
+    if(nb > PSENS_MAX) throw std::runtime_error("gveParamSensBatch: nb > PSENS_MAX");
+    std::vector<double> h0((size_t)n * 6), hb((size_t)n);
+    for(int i = 0; i < n; ++i){
+        for(int c = 0; c < 6; ++c) h0[(size_t)i*6+c] = oe0s[i](c);
+        hb[(size_t)i] = (betas.size() == (size_t)n) ? betas[i]
+                      : (betas.empty() ? 1.0 : betas[0]);
+    }
+    double *d0=nullptr, *db=nullptr, *dq=nullptr, *dSb=nullptr, *dSr=nullptr;
+    int *dbi=nullptr;
+    const size_t b0=(size_t)n*6*sizeof(double), bb=(size_t)n*sizeof(double),
+                 bbi=(size_t)std::max(1,nb)*sizeof(int),
+                 bq=(size_t)n*6*sizeof(double), bSr=(size_t)n*std::max(1,nb)*6*sizeof(double);
+    cudaMalloc(&d0,b0); cudaMalloc(&db,bb); cudaMalloc(&dbi,bbi);
+    cudaMalloc(&dq,bq); cudaMalloc(&dSb,bq); cudaMalloc(&dSr,bSr);
+    cudaMemcpy(d0,h0.data(),b0,cudaMemcpyHostToDevice);
+    cudaMemcpy(db,hb.data(),bb,cudaMemcpyHostToDevice);
+    if(nb > 0) cudaMemcpy(dbi,bins.data(),(size_t)nb*sizeof(int),cudaMemcpyHostToDevice);
+    const int threads = 64, blocks = (n + threads - 1) / threads;
+    qoejopt::gveParamSensKernel<<<blocks, threads>>>(d0, db, n, nfr, dt, nb, dbi, dq, dSb, dSr);
+    cudaError_t err = cudaDeviceSynchronize();
+    if(err != cudaSuccess) fprintf(stderr, "[gveParamSensBatch] %s\n", cudaGetErrorString(err));
+    cudaMemcpy(qend.data(), dq, bq, cudaMemcpyDeviceToHost);
+    cudaMemcpy(Sb.data(), dSb, bq, cudaMemcpyDeviceToHost);
+    if(nb > 0) cudaMemcpy(Sr.data(), dSr, bSr, cudaMemcpyDeviceToHost);
+    cudaFree(d0); cudaFree(db); cudaFree(dbi); cudaFree(dq); cudaFree(dSb); cudaFree(dSr);
 }
 } // namespace kep3
 
@@ -2701,6 +4242,74 @@ __global__ void gveSensPropagateKernel(const double *oe0, int n, int nfr, double
             oe_all[((size_t)f * n + idx) * 6 + c] = y[c];
             S_all[((size_t)f * n + idx) * 6 + c] = S[c];
         }
+    }
+}
+
+// ---- 学习参数敏感度：整弧 ∂oe_end/∂beta_i（6）与 ∂oe_end/∂rho_k（6×nbins）。----
+// 与 gveSensPropagateKernel 同架构：帧首冻结 A，变分方程 dS/dt=A S+F 用 8 个 dt 子步线性 RK4。
+// 参数列 = [beta, rho_{bins[0]}, ..., rho_{bins[nb-1]}]；F 由 gveRhsDragParam_dev 给出。
+__global__ void gveParamSensKernel(const double *oe0, const double *betas, int n, int nfr, double dt,
+                                   int nb, const int *bins, double *qend, double *Sb, double *Sr) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    const double beta = betas[idx];
+    const int np = 1 + nb;
+    double y[6], S[6 * (1 + PSENS_MAX)];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6 * idx + c];
+    for (int p = 0; p < 6 * np; ++p) S[p] = 0.0;
+    const double hs = dt / (double)SENS_SUBSTEPS;
+    for (int f = 1; f < nfr; ++f) {
+        double A[6][6], fval[6];
+        gveRhsJacVal_dev(y, beta, A, fval);
+        double rv[6]; oe2rv_dev(y, rv);
+        double Fb[6]; double Fr[PSENS_MAX][6];
+        const int nbl = (nb < PSENS_MAX) ? nb : PSENS_MAX;
+        gveRhsDragParam_dev(y, rv, beta, nbl, bins, Fb, Fr);
+        for (int s = 0; s < SENS_SUBSTEPS; ++s) {
+            for (int p = 0; p < np; ++p) {
+                const double *F = (p == 0) ? Fb : Fr[p - 1];
+                double *Sp = S + 6 * p;
+                double s1[6], s2[6], s3[6], s4[6], z[6];
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) { double t = F[i]; for (int j = 0; j < 6; ++j) t += A[i][j] * Sp[j]; s1[i] = t; }
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) z[i] = Sp[i] + hs * s1[i] / 3.0;
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) { double t = F[i]; for (int j = 0; j < 6; ++j) t += A[i][j] * z[j]; s2[i] = t; }
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) z[i] = Sp[i] + hs * (-s1[i] / 3.0 + s2[i]);
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) { double t = F[i]; for (int j = 0; j < 6; ++j) t += A[i][j] * z[j]; s3[i] = t; }
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) z[i] = Sp[i] + hs * (s1[i] - s2[i] + s3[i]);
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) { double t = F[i]; for (int j = 0; j < 6; ++j) t += A[i][j] * z[j]; s4[i] = t; }
+                #pragma unroll
+                for (int i = 0; i < 6; ++i) Sp[i] += hs * (s1[i] + 3.0 * s2[i] + 3.0 * s3[i] + s4[i]) / 8.0;
+            }
+        }
+        // 状态推进（与 gveRhs_dev 同一 3/8-RK4）
+        double k1[6], k2[6], k3[6], k4[6], ty[6];
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) k1[c] = fval[c];
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) ty[c] = y[c] + dt * k1[c] / 3.0;
+        gveRhs_dev(ty, beta, k2);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) ty[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
+        gveRhs_dev(ty, beta, k3);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) ty[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
+        gveRhs_dev(ty, beta, k4);
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) y[c] += dt * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    }
+    if (qend) { for (int c = 0; c < 6; ++c) qend[6 * idx + c] = y[c]; }
+    if (Sb) { for (int c = 0; c < 6; ++c) Sb[6 * idx + c] = S[c]; }
+    if (Sr) {
+        for (int p = 0; p < nb; ++p)
+            for (int c = 0; c < 6; ++c) Sr[((size_t)idx * nb + p) * 6 + c] = S[6 * (p + 1) + c];
     }
 }
 

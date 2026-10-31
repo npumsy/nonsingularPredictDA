@@ -50,10 +50,51 @@ PYBIND11_MODULE(qoe, m)
        }, py::arg("rv"), py::arg("kappa") = 1.0, py::arg("thetas") = std::vector<double>{}, py::arg("lmax") = 2,
           "摄动加速度（去二体，ECI，m/s²）：J234+阻力(κ)+三体+SH(θ)");
 
-     m.def("setThirdBody", [](bool on){ setThirdBody(on); }, py::arg("on"),
-           "三体（日/月）确定性摄动开关");
-     m.def("setPropEpoch", [](double mjd0){ setPropEpoch(mjd0); }, py::arg("mjd0"),
-           "传播起点绝对历元（MJD）");
+     m.def("setThirdBody", [](bool on){ setThirdBody(on); kep3::setThirdBodyCuda(on); },
+           py::arg("on"),
+           "三体（日/月）确定性摄动开关（CPU TBPfull 与 CUDA GVE 场链同时生效）");
+     m.def("setPropEpoch", [](double mjd0){ setPropEpoch(mjd0); kep3::setPropEpochCuda(mjd0); },
+           py::arg("mjd0"),
+           "传播起点绝对历元（MJD）：CUDA 内 mjd = mjd0 + t/86400，t 为自 t_isl0 的秒");
+     m.def("setSrp", [](bool on){ kep3::setSrpCuda(on); }, py::arg("on"),
+           "太阳光压开关（CUDA GVE 场链）");
+     m.def("setSrpParams", [](double cr, double area_over_mass){
+           kep3::setSrpParamsCuda(cr, area_over_mass);
+       }, py::arg("cr")=1.5, py::arg("area_over_mass")=0.01,
+          "Cr 与 A/m (m^2/kg)；a=-Cr*A/m*P0*(AU/r_sun)^2*u_sun, P0=4.56e-6 N/m^2");
+     m.def("setThirdBodyEphem", [](py::array_t<double, py::array::c_style | py::array::forcecast> rs,
+                                   py::array_t<double, py::array::c_style | py::array::forcecast> rm,
+                                   double t0, double dt){
+           auto br = rs.request(); auto bm = rm.request();
+           std::vector<double> rv(static_cast<double*>(br.ptr),
+                                  static_cast<double*>(br.ptr) + br.size);
+           std::vector<double> mv(static_cast<double*>(bm.ptr),
+                                  static_cast<double*>(bm.ptr) + bm.size);
+           kep3::setThirdBodyEphemCuda(rv, mv, t0, dt);
+       }, py::arg("rsun_km"), py::arg("rmoon_km"), py::arg("t0_s"), py::arg("dt_s")=600.0,
+          "宿主日/月星历表 (n,3) km ECI；t0_s 为自 t_isl0 的秒，线性插值");
+     m.def("clearThirdBodyEphem", [](){ kep3::clearThirdBodyEphemCuda(); },
+           "清除宿主星历表（回退到 device 解析低精度星历）");
+     m.def("getThirdBodyEphemInfo", [](){ return kep3::getThirdBodyEphemInfoCuda(); },
+           "[table_on,n,t0,dt,use3b,use_srp,mjd0,Cr,A/m]");
+     m.def("pert3bSrpFlat", [](py::array_t<double, py::array::c_style | py::array::forcecast> rv,
+                               py::array_t<double, py::array::c_style | py::array::forcecast> tv){
+           auto br = rv.request();
+           if(br.size % 6 != 0) throw std::runtime_error("pert3bSrpFlat: rv size not multiple of 6");
+           const std::size_t nn = (std::size_t)br.size / 6;
+           const double *pr = static_cast<double*>(br.ptr);
+           std::vector<Vector6d> v(nn);
+           for(std::size_t i = 0; i < nn; ++i)
+               for(int c = 0; c < 6; ++c) v[i](c) = pr[i*6 + c];
+           auto bt = tv.request();
+           std::vector<double> tt(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+           std::vector<double> out;
+           { py::gil_scoped_release release; kep3::pert3bSrpBatch(v, tt, out); }
+           py::array_t<double> O({(py::ssize_t)v.size(), (py::ssize_t)3});
+           std::memcpy(O.mutable_data(), out.data(), out.size()*sizeof(double));
+           return O;
+       }, py::arg("rv"), py::arg("tv_s"),
+          "三体+SRP 加速度 (n,3) m/s^2（按当前开关/参数/星历）");
      m.def("setPole", [](double x, double y, double z){
            setPole(x, y, z); kep3::setPole(x, y, z);
        }, py::arg("x"), py::arg("y"), py::arg("z"),
@@ -397,6 +438,311 @@ PYBIND11_MODULE(qoe, m)
             { py::gil_scoped_release release; kep3::setRbfCuda(C, s, wv); }
             }, py::arg("centers"), py::arg("s"), py::arg("w"),
             "设定整星共享 RBF 力场：centers(m,3,km), s(km), w(m)；centers 空 → 关闭");
+      m.def("setDragTable",
+            [&](double h_lo_m, double h_hi_m,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rho,
+                py::array_t<double, py::array::c_style | py::array::forcecast> beta){
+            auto br = rho.request(); auto bb = beta.request();
+            std::vector<double> rv(static_cast<double*>(br.ptr), static_cast<double*>(br.ptr) + br.size);
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            { py::gil_scoped_release release; kep3::setDragTable(h_lo_m, h_hi_m, rv, bv); }
+            }, py::arg("h_lo_m"), py::arg("h_hi_m"), py::arg("rho"), py::arg("beta"),
+            "可学习阻力表：高度 [h_lo,h_hi] (m) 等分 rho.size() 箱；rho(kg/m³)；beta 逐星（空=1）");
+      m.def("getDragTable", [](){
+            auto t = kep3::getDragTable();
+            return py::make_tuple(std::get<0>(t), std::get<1>(t),
+                                  std::get<2>(t), std::get<3>(t), std::get<4>(t));
+            }, "返回 (h_lo_m, h_hi_m, rho, beta, mode)");
+      m.def("clearDragTable", [](){ kep3::clearDragTable(); }, "关闭阻力表，回到指数大气");
+      m.def("gveParamSensFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nfr,
+                double dt, py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                py::array_t<int, py::array::c_style | py::array::forcecast> bins){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveParamSensFlat");
+            auto bb = betas.request(); auto bi = bins.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<int> iv(static_cast<int*>(bi.ptr), static_cast<int*>(bi.ptr) + bi.size);
+            std::vector<double> q, Sb, Sr;
+            { py::gil_scoped_release release;
+              kep3::gveParamSensBatch(v, nfr, dt, bv, iv, q, Sb, Sr); }
+            const std::size_t n = v.size();
+            const std::vector<py::ssize_t> sh2{(py::ssize_t)n, 6};
+            const std::vector<py::ssize_t> sh3{(py::ssize_t)n, (py::ssize_t)iv.size(), 6};
+            py::array_t<double> Qarr(sh2);
+            py::array_t<double> Sbarr(sh2);
+            py::array_t<double> Srarr(sh3);
+            std::memcpy(Qarr.mutable_data(), q.data(), q.size()*sizeof(double));
+            std::memcpy(Sbarr.mutable_data(), Sb.data(), Sb.size()*sizeof(double));
+            if(!Sr.empty()) std::memcpy(Srarr.mutable_data(), Sr.data(), Sr.size()*sizeof(double));
+            return py::make_tuple(Qarr, Sbarr, Srarr);
+            }, py::arg("oe"), py::arg("nfr"), py::arg("dt"), py::arg("betas"), py::arg("bins"),
+            "整弧参数敏感度：返回 (oe_end(n,6), d/dbeta(n,6), d/drho(n,nbins,6))");
+      // ---- 可学习密度场 ----
+      m.def("setDragField",
+            [&](int lmax, int na, int nt, double href_km, double dh_km,
+                double tref_s, double thref,
+                py::array_t<double, py::array::c_style | py::array::forcecast> theta){
+            auto bt = theta.request();
+            std::vector<double> tv(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+            { py::gil_scoped_release release;
+              kep3::setDragField(lmax, na, nt, href_km, dh_km, tref_s, thref, tv); }
+            }, py::arg("lmax"), py::arg("na"), py::arg("nt"), py::arg("href_km"),
+            py::arg("dh_km"), py::arg("tref_s"), py::arg("thref"), py::arg("theta"),
+            "设定密度场：rho=rho_tab(h)*exp(Σθ S_lm φ_a F_k)；θ 列序 ((ilm*na+a)*nt+k)");
+      m.def("clearDragField", [](){ kep3::clearDragField(); }, "关闭密度场");
+      m.def("getDragField", [](){
+            return py::make_tuple(kep3::getDragFieldN(), kep3::getDragFieldTheta());
+            }, "返回 (npar, theta)");
+      m.def("dragFieldLogFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv,
+                py::array_t<double, py::array::c_style | py::array::forcecast> tv){
+            std::vector<Vector6d> v = _v6_from_np(rv, "dragFieldLogFlat");
+            auto bt = tv.request();
+            std::vector<double> tt(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+            std::vector<double> g;
+            { py::gil_scoped_release release; kep3::dragFieldLogBatch(v, tt, g); }
+            py::array_t<double> O((py::ssize_t)v.size());
+            std::memcpy(O.mutable_data(), g.data(), g.size()*sizeof(double));
+            return O;
+            }, py::arg("rv"), py::arg("tv"), "密度场 g(r,t)（无量纲），rv 为 m/m/s");
+      m.def("dragFieldAccelFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv,
+                py::array_t<double, py::array::c_style | py::array::forcecast> tv,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas){
+            std::vector<Vector6d> v = _v6_from_np(rv, "dragFieldAccelFlat");
+            auto bt = tv.request(); auto bb = betas.request();
+            std::vector<double> tt(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<double> a, r;
+            { py::gil_scoped_release release; kep3::dragFieldAccelBatch(v, tt, bv, a, r); }
+            py::array_t<double> A({(py::ssize_t)v.size(), (py::ssize_t)3});
+            py::array_t<double> R((py::ssize_t)v.size());
+            std::memcpy(A.mutable_data(), a.data(), a.size()*sizeof(double));
+            std::memcpy(R.mutable_data(), r.data(), r.size()*sizeof(double));
+            return py::make_tuple(A, R);
+            }, py::arg("rv"), py::arg("tv"), py::arg("betas"),
+            "含场阻力加速度 (n,3) m/s² 与密度 (n,) kg/m³");
+      m.def("dragFieldBasisFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv,
+                py::array_t<double, py::array::c_style | py::array::forcecast> tv){
+            std::vector<Vector6d> v = _v6_from_np(rv, "dragFieldBasisFlat");
+            auto bt = tv.request();
+            std::vector<double> tt(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+            std::vector<double> B;
+            { py::gil_scoped_release release; kep3::dragFieldBasisBatch(v, tt, B); }
+            const int npar = kep3::getDragFieldN();
+            py::array_t<double> O({(py::ssize_t)v.size(), (py::ssize_t)npar});
+            std::memcpy(O.mutable_data(), B.data(), B.size()*sizeof(double));
+            return O;
+            }, py::arg("rv"), py::arg("tv"), "场基 B=∂g/∂θ，(n,npar)");
+      m.def("gveFieldSensFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                int nfr, int stride, double dt, double t0,
+                py::array_t<int, py::array::c_style | py::array::forcecast> epochs,
+                bool want_phi){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveFieldSensFlat");
+            auto bb = betas.request(); auto be = epochs.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<int> ev(static_cast<int*>(be.ptr), static_cast<int*>(be.ptr) + be.size);
+            std::vector<double> q, S, P;
+            { py::gil_scoped_release release;
+              kep3::gveFieldSensBatch(v, bv, nfr, stride, dt, t0, ev, want_phi, q, S, P); }
+            const int n = (int)v.size();
+            const int ne = (int)ev.size();
+            const int npar = kep3::getDragFieldN();
+            py::array_t<double> Q({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6});
+            py::array_t<double> Sa({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6, (py::ssize_t)npar});
+            std::memcpy(Q.mutable_data(), q.data(), q.size()*sizeof(double));
+            std::memcpy(Sa.mutable_data(), S.data(), S.size()*sizeof(double));
+            py::array_t<double> Pa;
+            if(want_phi){
+                Pa = py::array_t<double>({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6, (py::ssize_t)6});
+                std::memcpy(Pa.mutable_data(), P.data(), P.size()*sizeof(double));
+            }
+            return py::make_tuple(Q, Sa, Pa);
+            }, py::arg("oe"), py::arg("betas"), py::arg("nfr"), py::arg("stride")=1,
+            py::arg("dt"), py::arg("t0"), py::arg("epochs"), py::arg("want_phi")=true,
+            "整弧状态+变分敏度：返回 (q_ep(n,ne,6), S(n,ne,6,npar), Phi(n,ne,6,6))");
+      m.def("gveFieldSensAllFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                int nfr, int stride, double dt, double t0,
+                py::array_t<int, py::array::c_style | py::array::forcecast> epochs,
+                bool want_phi){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveFieldSensAllFlat");
+            auto bb = betas.request(); auto be = epochs.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<int> ev(static_cast<int*>(be.ptr), static_cast<int*>(be.ptr) + be.size);
+            std::vector<double> q, S, P, Qall;
+            { py::gil_scoped_release release;
+              kep3::gveFieldSensBatch(v, bv, nfr, stride, dt, t0, ev, want_phi, q, S, P, &Qall); }
+            const int n = (int)v.size();
+            const int ne = (int)ev.size();
+            const int nchunk = (nfr > 1) ? ((nfr-1)/std::max(1,stride) + 1) : 1;
+            const int npar = kep3::getDragFieldN();
+            py::array_t<double> QA({(py::ssize_t)n, (py::ssize_t)nchunk, (py::ssize_t)6});
+            py::array_t<double> Q({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6});
+            py::array_t<double> Sa({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6, (py::ssize_t)npar});
+            std::memcpy(QA.mutable_data(), Qall.data(), Qall.size()*sizeof(double));
+            std::memcpy(Q.mutable_data(), q.data(), q.size()*sizeof(double));
+            std::memcpy(Sa.mutable_data(), S.data(), S.size()*sizeof(double));
+            py::array_t<double> Pa;
+            if(want_phi){
+                Pa = py::array_t<double>({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6, (py::ssize_t)6});
+                std::memcpy(Pa.mutable_data(), P.data(), P.size()*sizeof(double));
+            }
+            return py::make_tuple(QA, Q, Sa, Pa);
+            }, py::arg("oe"), py::arg("betas"), py::arg("nfr"), py::arg("stride")=1,
+            py::arg("dt"), py::arg("t0"), py::arg("epochs"), py::arg("want_phi")=true,
+            "整弧状态（全部 chunk）+ 指定 epoch 的 S/Φ：返回 (q_all,q_ep,S,Phi)");
+      m.def("fieldDaEvalFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> qb,
+                py::array_t<double, py::array::c_style | py::array::forcecast> S,
+                py::array_t<double, py::array::c_style | py::array::forcecast> Phi,
+                py::array_t<double, py::array::c_style | py::array::forcecast> dx,
+                py::array_t<double, py::array::c_style | py::array::forcecast> dtheta,
+                double trust_radius){
+            auto bq = qb.request(); auto bs = S.request(); auto bp = Phi.request();
+            auto bx = dx.request(); auto bt = dtheta.request();
+            const int n = (int)bq.shape[0], ne = (int)bq.shape[1];
+            const int npar = (int)bs.shape[3];
+            auto vec = [](py::array_t<double, py::array::c_style | py::array::forcecast> &a){
+                auto r = a.request();
+                return std::vector<double>(static_cast<double*>(r.ptr),
+                                           static_cast<double*>(r.ptr) + r.size);
+            };
+            std::vector<double> qv = vec(qb), Sv = vec(S), Pv = vec(Phi);
+            std::vector<double> xv = vec(dx), tv = vec(dtheta), out, info;
+            { py::gil_scoped_release release;
+              kep3::gveFieldDaEvalBatch(qv, Sv, Pv, xv, tv, n, ne, npar, trust_radius,
+                                        out, info); }
+            py::array_t<double> Q({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6});
+            std::memcpy(Q.mutable_data(), out.data(), out.size()*sizeof(double));
+            return py::make_tuple(Q, info);
+            }, py::arg("qb"), py::arg("S"), py::arg("Phi"), py::arg("dx"), py::arg("dtheta"),
+            py::arg("trust_radius")=1e9,
+            "DA 求值 q≈qb+Φdx+S dθ；返回 (q_eval, [max|Φdx|,max|S dθ|,refresh])");
+      m.def("gveFieldChainFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                int nfr, int stride, double dt, double t0, bool want_phi){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveFieldChainFlat");
+            auto bb = betas.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<double> q, ph;
+            { py::gil_scoped_release release;
+              kep3::gveFieldChainBatch(v, bv, nfr, stride, dt, t0, want_phi, q, ph); }
+            const std::size_t n = v.size();
+            const std::size_t nchunk = (nfr > 1) ? (std::size_t)((nfr-1)/std::max(1,stride) + 1) : 1;
+            py::array_t<double> Q({n, nchunk, (std::size_t)6});
+            std::memcpy(Q.mutable_data(), q.data(), q.size()*sizeof(double));
+            py::array_t<double> P;
+            if(want_phi){
+                P = py::array_t<double>({(py::ssize_t)n,
+                                         (py::ssize_t)(nchunk > 0 ? nchunk-1 : 0),
+                                         (py::ssize_t)6, (py::ssize_t)6});
+                std::memcpy(P.mutable_data(), ph.data(), ph.size()*sizeof(double));
+            }
+            return py::make_tuple(Q, P);
+            }, py::arg("oe"), py::arg("betas"), py::arg("nfr"), py::arg("stride")=1,
+            py::arg("dt"), py::arg("t0"), py::arg("want_phi")=true,
+            "整弧 QOE 轨迹 (n,nfr,6) 与逐步 STM (n,nfr-1,6,6)");
+      m.def("gveFieldChainEpochFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                int nfr, int stride, double dt,
+                py::array_t<double, py::array::c_style | py::array::forcecast> t0_arr,
+                bool want_phi){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveFieldChainEpochFlat");
+            auto bb = betas.request(); auto bt = t0_arr.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<double> tv(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+            std::vector<double> q, ph;
+            { py::gil_scoped_release release;
+              kep3::gveFieldChainBatch(v, bv, nfr, stride, dt, 0.0, want_phi, q, ph, &tv); }
+            const std::size_t n = v.size();
+            const std::size_t nchunk = (nfr > 1) ? (std::size_t)((nfr-1)/std::max(1,stride) + 1) : 1;
+            py::array_t<double> Q({n, nchunk, (std::size_t)6});
+            std::memcpy(Q.mutable_data(), q.data(), q.size()*sizeof(double));
+            py::array_t<double> P;
+            if(want_phi){
+                P = py::array_t<double>({(py::ssize_t)n,
+                                         (py::ssize_t)(nchunk > 0 ? nchunk-1 : 0),
+                                         (py::ssize_t)6, (py::ssize_t)6});
+                std::memcpy(P.mutable_data(), ph.data(), ph.size()*sizeof(double));
+            }
+            return py::make_tuple(Q, P);
+            }, py::arg("oe"), py::arg("betas"), py::arg("nfr"), py::arg("stride")=1,
+            py::arg("dt"), py::arg("t0_arr"), py::arg("want_phi")=true,
+            "逐星历元版整弧轨迹：t0_arr 长度须为 n");
+      m.def("gveFieldSensEpochFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                int nfr, int stride, double dt,
+                py::array_t<double, py::array::c_style | py::array::forcecast> t0_arr,
+                py::array_t<int, py::array::c_style | py::array::forcecast> epochs,
+                bool want_phi){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveFieldSensEpochFlat");
+            auto bb = betas.request(); auto bt = t0_arr.request(); auto be = epochs.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<double> tv(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+            std::vector<int> ev(static_cast<int*>(be.ptr), static_cast<int*>(be.ptr) + be.size);
+            std::vector<double> q, S, P;
+            { py::gil_scoped_release release;
+              kep3::gveFieldSensBatch(v, bv, nfr, stride, dt, 0.0, ev, want_phi,
+                                      q, S, P, nullptr, &tv); }
+            const int n = (int)v.size();
+            const int ne = (int)ev.size();
+            const int npar = kep3::getDragFieldN();
+            py::array_t<double> Q({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6});
+            py::array_t<double> Sa({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6, (py::ssize_t)npar});
+            std::memcpy(Q.mutable_data(), q.data(), q.size()*sizeof(double));
+            std::memcpy(Sa.mutable_data(), S.data(), S.size()*sizeof(double));
+            py::array_t<double> Pa;
+            if(want_phi){
+                Pa = py::array_t<double>({(py::ssize_t)n, (py::ssize_t)ne, (py::ssize_t)6, (py::ssize_t)6});
+                std::memcpy(Pa.mutable_data(), P.data(), P.size()*sizeof(double));
+            }
+            return py::make_tuple(Q, Sa, Pa);
+            }, py::arg("oe"), py::arg("betas"), py::arg("nfr"), py::arg("stride")=1,
+            py::arg("dt"), py::arg("t0_arr"), py::arg("epochs"), py::arg("want_phi")=true,
+            "逐星历元版状态+变分敏度：返回 (q_ep, S, Phi)，不返回 q_all");
+      m.def("gveGaussWFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveGaussWFlat");
+            std::vector<double> W;
+            { py::gil_scoped_release release; kep3::gveGaussWBatch(v, W); }
+            py::array_t<double> O({(py::ssize_t)v.size(), (py::ssize_t)6, (py::ssize_t)3});
+            std::memcpy(O.mutable_data(), W.data(), W.size()*sizeof(double));
+            return O;
+            }, py::arg("oe"), "W=∂f_QOE/∂a_p，形状 (n,6,3)");
+      m.def("gveRhsFromApFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> ap){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveRhsFromApFlat");
+            auto ba = ap.request();
+            std::vector<double> av(static_cast<double*>(ba.ptr), static_cast<double*>(ba.ptr) + ba.size);
+            std::vector<double> out;
+            { py::gil_scoped_release release; kep3::gveRhsFromApBatch(v, av, out); }
+            py::array_t<double> O({(py::ssize_t)v.size(), (py::ssize_t)6});
+            std::memcpy(O.mutable_data(), out.data(), out.size()*sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("ap"), "GVE 速率（不含 Kepler n）：(n,6)");
+      m.def("gveRhsFieldFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> tv,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gveRhsFieldFlat");
+            auto bt = tv.request(); auto bb = betas.request();
+            std::vector<double> tt(static_cast<double*>(bt.ptr), static_cast<double*>(bt.ptr) + bt.size);
+            std::vector<double> bv(static_cast<double*>(bb.ptr), static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<double> out;
+            { py::gil_scoped_release release; kep3::gveRhsFieldBatch(v, tt, bv, out); }
+            py::array_t<double> O({(py::ssize_t)v.size(), (py::ssize_t)6});
+            std::memcpy(O.mutable_data(), out.data(), out.size()*sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("tv"), py::arg("betas"), "含场 GVE RHS (n,6)");
       m.def("gvePropagateNoeBatchFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe, int nfr,
                 double dt, int nthreads, double beta){

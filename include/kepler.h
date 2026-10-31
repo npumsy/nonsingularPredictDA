@@ -1,6 +1,7 @@
 #include <functional>
 #include <vector>
 #include <array>
+#include <tuple>
 #include <Eigen/Dense>
 // #define BOOST_MATH_INSTRUMENT true
 
@@ -114,6 +115,64 @@ std::vector<double> gveGetTiming();
 void setRbfCuda(const std::vector<std::array<double,3>> &centers, double s,
                 const std::vector<double> &w);
 
+// ---- 可学习阻力模型（分段常数密度表 + 逐星 beta）----
+// h_lo_m/h_hi_m：高度范围（m）；rho：分箱密度（kg/m³）；beta：逐星倍率（空/长度 1 = 广播）。
+// 表模式下 tbp_dev / cartRhsDev 的阻力项改为 a=-0.5*beta*(C_dA/m)_nom*rho(h)*|v_rel|v_rel。
+void setDragTable(double h_lo_m, double h_hi_m, const std::vector<double> &rho,
+                  const std::vector<double> &beta);
+void clearDragTable();
+int getDragMode();
+std::tuple<double, double, std::vector<double>, std::vector<double>, int> getDragTable();
+
+// 解析参数敏感度 ∂oe_end/∂beta_i 与 ∂oe_end/∂rho_{bins[k]}（CUDA 前向变分）。
+void gveParamSensBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
+                       const std::vector<double> &betas, const std::vector<int> &bins,
+                       std::vector<double> &qend, std::vector<double> &Sb,
+                       std::vector<double> &Sr);
+
+// ---- 可学习密度场：rho = rho_tab(h)*exp(Σ θ_j S_lm φ_a(h) F_k(t)) ----
+// lmax<=3，na<=3 个高度多项式，nt<=5 个日周期谐波；列序 j=((ilm*na+a)*nt+k)。
+void setDragField(int lmax, int na, int nt, double href_km, double dh_km,
+                  double tref_s, double thref, const std::vector<double> &theta);
+void clearDragField();
+int getDragFieldN();
+std::vector<double> getDragFieldTheta();
+// 场值 g（无量纲）与含场阻力加速度（m/s²）/密度（kg/m³），逐星逐时刻。
+void dragFieldLogBatch(const std::vector<Vector6d> &rv, const std::vector<double> &tv,
+                       std::vector<double> &gout);
+void dragFieldAccelBatch(const std::vector<Vector6d> &rv, const std::vector<double> &tv,
+                         const std::vector<double> &betas, std::vector<double> &aout,
+                         std::vector<double> &rout);
+// 整弧 QOE 轨迹与逐步 STM：qall[f] (f=0..nfr-1)，phi_all[f]=∂q_{f+1}/∂q_f（可选）。
+void gveFieldChainBatch(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                        int nfr, int stride, double dt, double t0, bool want_phi,
+                        std::vector<double> &qall, std::vector<double> &phi_all,
+                        const std::vector<double> *t0_sat = nullptr);
+// 场基 B=∂g/∂θ（n,npar）；参数列序与 setDragField 相同。
+void dragFieldBasisBatch(const std::vector<Vector6d> &rv, const std::vector<double> &tv,
+                         std::vector<double> &Bout);
+// 整弧状态 + 变分敏度：在 epochs（帧号，须为 stride 的整数倍）输出
+// q_ep(n,ne,6)、S_ep=∂q/∂θ(n,ne,6,npar)、Φ_ep=∂q/∂q0(n,ne,6,6，可选)。
+// S 与状态在同一 RK4 链中推进：S_{c+1}=Φ_c S_c + h W(a⊗B)（块级变分）。
+void gveFieldSensBatch(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                       int nfr, int stride, double dt, double t0,
+                       const std::vector<int> &epochs, bool want_phi,
+                       std::vector<double> &q_ep, std::vector<double> &S_ep,
+                       std::vector<double> &phi_ep, std::vector<double> *q_all = nullptr,
+                       const std::vector<double> *t0_sat = nullptr);
+// DA 展开求值：q_eval = qb + Φ dx + S dθ；info=[max|Φdx|,max|S dθ|,refresh]。
+void gveFieldDaEvalBatch(const std::vector<double> &qb, const std::vector<double> &S,
+                         const std::vector<double> &Phi, const std::vector<double> &dx,
+                         const std::vector<double> &dtheta, int n, int ne, int npar,
+                         double trust_radius, std::vector<double> &qout,
+                         std::vector<double> &info);
+// W=∂f_QOE/∂a_p（n,6,3）与给定 ap 的 GVE 速率（n,6）。
+void gveGaussWBatch(const std::vector<Vector6d> &oe, std::vector<double> &Wout);
+void gveRhsFromApBatch(const std::vector<Vector6d> &oe, const std::vector<double> &ap,
+                       std::vector<double> &out);
+void gveRhsFieldBatch(const std::vector<Vector6d> &oe, const std::vector<double> &tv,
+                      const std::vector<double> &betas, std::vector<double> &out);
+
 // 整弧多帧 GVE（CUDA）：每星线程链式 nfr-1 次单步，输出每帧 rv（平铺 nfr*n*6，[f][i][6]）。
 void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt, int nthreads,
                           double beta, std::vector<double> &rv_all);
@@ -146,6 +205,27 @@ void cartPropagateBatch(const std::vector<Vector6d> &x0s, int nfr, double dt, in
 extern double g_pole[3];
 extern double g_pole_Q[9];
 void setPole(double x, double y, double z);
+
+// ---- 日/月三体 + 太阳光压（CUDA GVE / 密度场链）----
+// 所有 GVE 内核的 t 均为「自 t_isl0 起的绝对秒」，故 mjd = mjd0 + t/86400。
+// setThirdBodyCuda / setPropEpochCuda 与 CPU 的 setThirdBody / setPropEpoch 同义，
+// 分别控制 device 侧开关与 epoch；qoe.setThirdBody/qoe.setPropEpoch 同时写两侧。
+void setThirdBodyCuda(bool on);
+void setPropEpochCuda(double mjd0);
+// SRP: a = -Cr*(A/m)*P0*(AU/|r_sun|)^2 * u_sun, u_sun=(r_sun-r)/|r_sun-r|,
+// P0=4.56e-6 N/m^2；柱形地影（r·u_sun<0 且垂距<Re → 0，硬阴影）。
+void setSrpCuda(bool on);
+void setSrpParamsCuda(double cr, double area_over_mass);
+// 宿主星历表（km ECI，行优先 (n,3)；t 为自 t_isl0 的秒）。空表 → device 解析低精度星历。
+// 表在 [t0, t0+dt*(n-1)] 内线性插值，区间外钳位到端点。
+void setThirdBodyEphemCuda(const std::vector<double> &rsun, const std::vector<double> &rmoon,
+                           double t0, double dt);
+void clearThirdBodyEphemCuda();
+// [table_active(0/1), n, t0, dt, use3b, use_srp, mjd0]
+std::vector<double> getThirdBodyEphemInfoCuda();
+// 三体+SRP 加速度（m/s^2，ECI，去二体），逐星逐时刻；诊断/验证用。
+void pert3bSrpBatch(const std::vector<Vector6d> &rv_m, const std::vector<double> &tv_s,
+                    std::vector<double> &aout);
 
 template <class F, class T>
 T newton_raphson_iterate(F f, T guess, T min, T max, int digits, uint& max_iter);
