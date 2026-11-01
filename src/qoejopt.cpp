@@ -16,6 +16,7 @@
 #include <array>
 #include <vector>
 #include "qoejopt.h"
+#include "bias_window.h"
 #include "kepler.h"
 #include <Eigen/Dense>
 #include <cusolverDn.h>
@@ -49,7 +50,11 @@ static T *_upload(const py::array_t<T, py::array::c_style | py::array::forcecast
     const std::size_t bytes = (std::size_t)buf.size * sizeof(T);
     T *d = nullptr;
     if (bytes) {
-        if (cudaMalloc(&d, bytes) != cudaSuccess) throw std::runtime_error("qoejopt: cudaMalloc 失败");
+        cudaError_t err = cudaMalloc(&d, bytes);
+        if (err != cudaSuccess)
+            throw std::runtime_error(std::string("qoejopt: cudaMalloc 失败 (")
+                                     + std::to_string(bytes) + " B): "
+                                     + cudaGetErrorString(err));
         if (cudaMemcpy(d, buf.ptr, bytes, cudaMemcpyHostToDevice) != cudaSuccess)
             throw std::runtime_error("qoejopt: cudaMemcpy H2D 失败");
     }
@@ -794,6 +799,9 @@ static void _free_wctx() {
     cudaFree(c.d_isl_D); cudaFree(c.d_isl_W);
     cudaFree(c.d_gts_D); cudaFree(c.d_gts_W); cudaFree(c.d_gts_Q);
     cudaFree(c.d_ctr); cudaFree(c.d_qingt); cudaFree(c.d_beta);
+    cudaFree(c.d_dyn_bias);
+    cudaFree(c.d_beta_q); cudaFree(c.d_gamma_int);
+    cudaFree(c.d_jpG); cudaFree(c.d_pbdiag);
     cudaFree(c.d_X); cudaFree(c.d_rv); cudaFree(c.d_Ap);
     cudaFree(c.d_end); cudaFree(c.d_phi); cudaFree(c.d_res);
     cudaFree(c.d_state_sub); cudaFree(c.d_state_b);
@@ -861,6 +869,100 @@ static void set_win_beta(py::array_t<double, py::array::c_style | py::array::for
         std::copy(src, src + c.n, hb.begin() + (std::size_t)s * c.n);
     cudaMalloc(&c.d_beta, (std::size_t)nseg * c.n * sizeof(double));
     cudaMemcpy(c.d_beta, hb.data(), hb.size() * sizeof(double), cudaMemcpyHostToDevice);
+}
+
+// P1：区间偏差确定性项 Γβ（(L−1,n,6)）。空数组 = 清除，回到旧路径。
+static void set_win_dyn_bias(py::object bias) {
+    qoejopt::WinCtx &c = g_wctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.set_win_dyn_bias: 未先 setup_win");
+    if (c.d_dyn_bias) { cudaFree(c.d_dyn_bias); c.d_dyn_bias = nullptr; }
+    if (bias.is_none()) return;
+    auto a = bias.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+    auto b = a.request();
+    const std::size_t want = (std::size_t)std::max(0, c.L - 1) * c.n * 6;
+    if ((std::size_t)b.size != want)
+        throw std::runtime_error("qoejopt.set_win_dyn_bias: bias 需 (L-1,n,6)");
+    cudaMalloc(&c.d_dyn_bias, want * sizeof(double));
+    cudaMemcpy(c.d_dyn_bias, b.ptr, want * sizeof(double), cudaMemcpyHostToDevice);
+}
+
+// 阶段1：in-band β 列。β 当前值/区间 Γ 上传到 device；β 列由调用方在
+// setup_win 的 ncol/nnz 中预留，win_assemble 的 dyn 行据此写 15 非零。
+// 空 beta = 清除（beta_on=0，回到旧路径）。jpG 仅作契约保留（生产 ISL/GTS
+// 的 JpΓ 在 Python 侧装配，C++ dyn 核只用 gamma 与 beta）。
+static void set_win_beta_inband(
+        py::object beta, py::object gamma, py::object jpG, py::object pbdiag,
+        double phi, double Qb, int off_beta, int off_dyn,
+        int dyn_row_nnz, int beta_on) {
+    qoejopt::WinCtx &c = g_wctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.set_win_beta_inband: 未先 setup_win");
+    auto _free_buf = [](double *&p) { if (p) { cudaFree(p); p = nullptr; } };
+    _free_buf(c.d_beta_q); _free_buf(c.d_gamma_int);
+    _free_buf(c.d_jpG); _free_buf(c.d_pbdiag);
+    c.beta_on = 0; c.n_intervals = 0; c.ncol_beta = 0; c.dyn_row_nnz = 12;
+    if (beta.is_none() || !beta_on) return;
+    auto b = beta.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+    auto bb = b.request();
+    if (bb.ndim != 3 || bb.shape[1] != c.n || bb.shape[2] != 3)
+        throw std::runtime_error("qoejopt.set_win_beta_inband: beta 需 (W,n,3)");
+    const int Li = (int)bb.shape[0];
+    const std::size_t nb = (std::size_t)Li * c.n * 3;
+    cudaMalloc(&c.d_beta_q, nb * sizeof(double));
+    cudaMemcpy(c.d_beta_q, bb.ptr, nb * sizeof(double), cudaMemcpyHostToDevice);
+    if (gamma.is_none())
+        throw std::runtime_error("qoejopt.set_win_beta_inband: β-on 需要 gamma");
+    auto g = gamma.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+    auto gg = g.request();
+    if (gg.ndim != 4 || gg.shape[0] != Li || gg.shape[1] != c.n
+            || gg.shape[2] != 6 || gg.shape[3] != 3)
+        throw std::runtime_error("qoejopt.set_win_beta_inband: gamma 需 (W,n,6,3)");
+    const std::size_t ng = (std::size_t)Li * c.n * 18;
+    cudaMalloc(&c.d_gamma_int, ng * sizeof(double));
+    cudaMemcpy(c.d_gamma_int, gg.ptr, ng * sizeof(double), cudaMemcpyHostToDevice);
+    if (!jpG.is_none()) {
+        auto j = jpG.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        auto jj = j.request();
+        if (!(jj.ndim == 4 && jj.shape[2] == 3 && jj.shape[3] == 3))
+            throw std::runtime_error("qoejopt.set_win_beta_inband: jpG 需 (nfr,n,3,3)");
+        cudaMalloc(&c.d_jpG, (std::size_t)jj.size * sizeof(double));
+        cudaMemcpy(c.d_jpG, jj.ptr, (std::size_t)jj.size * sizeof(double),
+                   cudaMemcpyHostToDevice);
+    }
+    if (!pbdiag.is_none()) {
+        auto p = pbdiag.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>();
+        auto pp = p.request();
+        if ((std::size_t)pp.size != (std::size_t)c.n * 3)
+            throw std::runtime_error("qoejopt.set_win_beta_inband: pbdiag 需 (n,3)");
+        cudaMalloc(&c.d_pbdiag, (std::size_t)pp.size * sizeof(double));
+        cudaMemcpy(c.d_pbdiag, pp.ptr, (std::size_t)pp.size * sizeof(double),
+                   cudaMemcpyHostToDevice);
+    }
+    if (c.d_beta_q == nullptr || c.d_gamma_int == nullptr)
+        throw std::runtime_error(
+            "qoejopt.set_win_beta_inband: cudaMalloc 后 beta/gamma 为空");
+    c.beta_on = 1;
+    c.n_intervals = Li;
+    c.ncol_beta = 3 * c.n * Li;
+    c.off_beta = (off_beta > 0 ? off_beta : c.ncol);
+    c.off_dyn = (off_dyn >= 0 ? off_dyn : c.off_dyn);
+    c.dyn_row_nnz = (dyn_row_nnz > 0 ? dyn_row_nnz : 15);
+    c.gm_phi = phi;
+    c.gm_qb = Qb;
+    c.dyn_frozen = 0;
+}
+
+// 只更新当前 β 值（行/列布局与 Γ 不变）：每轮 GN/线搜索重新上传 (W,n,3)。
+static void set_win_beta_value(
+        py::array_t<double, py::array::c_style | py::array::forcecast> beta) {
+    qoejopt::WinCtx &c = g_wctx;
+    if (!c.d_X) throw std::runtime_error("qoejopt.set_win_beta_value: 未先 setup_win");
+    if (!c.d_beta_q)
+        throw std::runtime_error("qoejopt.set_win_beta_value: 未先 set_win_beta_inband");
+    auto b = beta.request();
+    const std::size_t want = (std::size_t)c.n_intervals * c.n * 3;
+    if ((std::size_t)b.size != want)
+        throw std::runtime_error("qoejopt.set_win_beta_value: beta 需 (W,n,3)");
+    cudaMemcpy(c.d_beta_q, b.ptr, want * sizeof(double), cudaMemcpyHostToDevice);
 }
 
 static void win_consensus_asm(py::array_t<double, py::array::c_style | py::array::forcecast> zcons,
@@ -1632,6 +1734,57 @@ PYBIND11_MODULE(qoejopt, m) {
           }, py::arg("X"), "CUDA 批量 QOE→rv 与解析 J=∂rv/∂oe：(n,6) → (rv (n,6), J (n,36))");
     m.def("gve_ctrl", &gve_ctrl, py::arg("x"),
           "GVE 控制矩阵 B=∂(oe_dot)/∂a(ECI)：x(n,6) oe → B(n,6,3)");
+    m.def("gveOuBiasFlat",
+          [](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+             double dt, int bias_nsub, double tau, double sigma_b,
+             py::array_t<double, py::array::c_style | py::array::forcecast> rtn,
+             py::array_t<double, py::array::c_style | py::array::forcecast> du) {
+            auto bo = oe.request(); auto br = rtn.request(); auto bd = du.request();
+            if (bo.ndim != 2 || bo.shape[1] != 6)
+                throw std::runtime_error("gveOuBiasFlat: oe 需 (n,6)");
+            if (br.size != 3 || bd.size != 3)
+                throw std::runtime_error("gveOuBiasFlat: rtn/du 需长度 3");
+            const int n = (int)bo.shape[0];
+            py::array_t<double> E({(py::ssize_t)n, (py::ssize_t)6});
+            py::array_t<double> Gm({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)3});
+            py::array_t<double> Qq({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)6});
+            py::array_t<double> Qb({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)3});
+            py::array_t<double> Qbb({(py::ssize_t)n, (py::ssize_t)3, (py::ssize_t)3});
+            { py::gil_scoped_release rel;
+              qoejopt::gveOuBiasBatch(
+                  static_cast<const double*>(bo.ptr), n, dt, bias_nsub, tau, sigma_b,
+                  static_cast<const double*>(br.ptr), static_cast<const double*>(bd.ptr),
+                  E.mutable_data(), Gm.mutable_data(), Qq.mutable_data(),
+                  Qb.mutable_data(), Qbb.mutable_data()); }
+            return py::make_tuple(E, Gm, Qq, Qb, Qbb);
+          }, py::arg("oe"), py::arg("dt"), py::arg("bias_nsub") = 16,
+          py::arg("tau") = 5760.0, py::arg("sigma_b") = 1e-6,
+          py::arg("rtn"), py::arg("du"),
+          "OU 偏差 Γ_b/Q 块（CUDA）：→ (end(n,6), Γ_b(n,6,3), Q_qq, Q_qb, Q_bb)");
+    m.def("gveBiasFramesFlat",
+          [](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+             int nfr, double dt, double tau, int stride, int bias_nsub,
+             py::array_t<double, py::array::c_style | py::array::forcecast> rtn) {
+            auto bo = oe.request(); auto br = rtn.request();
+            if (bo.ndim != 2 || bo.shape[1] != 6)
+                throw std::runtime_error("gveBiasFramesFlat: oe 需 (n,6)");
+            if (br.size != 3)
+                throw std::runtime_error("gveBiasFramesFlat: rtn 需长度 3");
+            const int n = (int)bo.shape[0];
+            const int st = std::max(1, stride);
+            const int nout = (nfr + st - 1) / st;
+            py::array_t<double> G({(py::ssize_t)n, (py::ssize_t)nout,
+                                   (py::ssize_t)6, (py::ssize_t)3});
+            py::array_t<double> E({(py::ssize_t)n, (py::ssize_t)6});
+            { py::gil_scoped_release rel;
+              qoejopt::gveBiasFramesBatch(
+                  static_cast<const double*>(bo.ptr), n, nfr, st, dt, tau,
+                  bias_nsub, static_cast<const double*>(br.ptr),
+                  G.mutable_data(), E.mutable_data()); }
+            return py::make_tuple(G, E);
+          }, py::arg("oe"), py::arg("nfr"), py::arg("dt"), py::arg("tau") = 5760.0,
+          py::arg("stride") = 1, py::arg("bias_nsub") = 0, py::arg("rtn"),
+          "P1 逐帧 OU 偏差 Γ(t)（CUDA）：→ (Γ(n,nout,6,3), end(n,6))");
     m.def("gve_dyn_factor", &gve_dyn_factor, py::arg("x_lo"), py::arg("x_hi"),
           py::arg("dt"), py::arg("beta") = 1.0,
           "窗内 dyn 二因子（3N 并行）：x_lo/x_hi (nseg,n,6) → (res(nseg,n,6), Φ(nseg,n,6,6))");
@@ -1732,6 +1885,18 @@ PYBIND11_MODULE(qoejopt, m) {
           py::arg("ctr"), py::arg("qingt"), "L 节点批量窗口：一次注册结构/观测到 device（prior=1 时末组为 6×6 先验行）");
     m.def("set_win_substeps", &set_win_substeps, py::arg("sub"),
           "L 节点批量窗口：关键帧 dyn 子步数（dt 按 sub 等分；关键帧间隔 1440 s 时用 144）");
+    m.def("set_win_dyn_bias", &set_win_dyn_bias, py::arg("bias"),
+          "P1 区间偏差 Γβ ((L-1,n,6))；None 清除。默认不设置=旧 dyn 行。");
+    m.def("set_win_beta_inband", &set_win_beta_inband,
+          py::arg("beta"), py::arg("gamma"), py::arg("jpG") = py::none(),
+          py::arg("pbdiag") = py::none(), py::arg("phi") = 1.0,
+          py::arg("Qb") = 1e-14, py::arg("off_beta") = -1,
+          py::arg("off_dyn") = -1, py::arg("dyn_row_nnz") = 15,
+          py::arg("beta_on") = 1,
+          "阶段1 in-band β：beta (W,n,3)、gamma (W,n,6,3)、jpG (nfr,n,3,3)、"
+          "pbdiag (n,3)；None/β_on=0 清除并回到旧 dyn 12 非零。");
+    m.def("set_win_beta_value", &set_win_beta_value, py::arg("beta"),
+          "仅更新 in-band β 当前值 (W,n,3)；Γ/JpG/先验不变。");
     m.def("set_win_beta", &set_win_beta, py::arg("beta"),
           "L 节点批量窗口：设置逐星阻力倍率 beta(n,)；缺省/不调用时 beta=1");
     m.def("win_consensus_asm", &win_consensus_asm, py::arg("zcons"), py::arg("u"),
@@ -1783,4 +1948,186 @@ PYBIND11_MODULE(qoejopt, m) {
     }, "子块内环计时 [pack, cartBwd, foldBwd, cartFwd, foldFwd, asm]（秒）");
     m.def("blk_reset_timing", &qoejopt::blkResetTiming, "清零子块内环计时");
     m.def("blk_free", &blk_free, "释放子块内环 device 缓冲");
+    // ---- Task #20: in-band [q;β] 联合装配/求解与行 API ----
+    auto _dptr = [](py::array_t<double, py::array::c_style | py::array::forcecast> &a) {
+        return static_cast<const double *>(a.request().ptr);
+    };
+    m.def("biasWindowSolve",
+          [&](int n, int L, int fpn, int E, int G, double sigma_isl,
+             double sigma_gts, double phi, double Qb,
+             py::array_t<int, py::array::c_style | py::array::forcecast> ei,
+             py::array_t<int, py::array::c_style | py::array::forcecast> ej,
+             py::array_t<double, py::array::c_style | py::array::forcecast> D,
+             py::array_t<double, py::array::c_style | py::array::forcecast> M,
+             py::array_t<double, py::array::c_style | py::array::forcecast> P,
+             py::array_t<double, py::array::c_style | py::array::forcecast> Jp,
+             py::array_t<double, py::array::c_style | py::array::forcecast> JpG,
+             py::array_t<double, py::array::c_style | py::array::forcecast> X,
+             py::array_t<double, py::array::c_style | py::array::forcecast> beta,
+             py::array_t<double, py::array::c_style | py::array::forcecast> Phi,
+             py::array_t<double, py::array::c_style | py::array::forcecast> Gam,
+             py::array_t<double, py::array::c_style | py::array::forcecast> Qis,
+             py::object qInfo, py::object Xp,
+             py::array_t<double, py::array::c_style | py::array::forcecast> PbDiag,
+             py::object gsat, py::object gD, py::object gM, py::object gQ,
+             py::object dyn_end, bool compute_cov, bool beta_only, bool compute_cond,
+             bool want_rows, bool no_solve, bool beta_off) {
+              qoejopt::BiasWinData d;
+              d.n = n; d.L = L; d.fpn = fpn; d.E = E; d.G = G;
+              d.sigma_isl = sigma_isl; d.sigma_gts = sigma_gts;
+              d.phi = phi; d.Qb = Qb; d.compute_cov = compute_cov;
+              d.beta_only = beta_only; d.compute_cond = compute_cond;
+              d.want_rows = want_rows; d.no_solve = no_solve;
+              d.beta_off = beta_off;
+              d.ei = static_cast<const int *>(ei.request().ptr);
+              d.ej = static_cast<const int *>(ej.request().ptr);
+              d.D = _dptr(D); d.M = _dptr(M); d.P = _dptr(P);
+              d.Jp = _dptr(Jp); d.JpG = _dptr(JpG);
+              d.X = _dptr(X); d.beta = _dptr(beta);
+              d.Phi = _dptr(Phi); d.Gam = _dptr(Gam); d.Qis = _dptr(Qis);
+              d.PbDiag = _dptr(PbDiag);
+              py::array_t<double, py::array::c_style | py::array::forcecast> a_q, a_xp,
+                  a_gD, a_gM, a_gQ;
+              py::array_t<int, py::array::c_style | py::array::forcecast> a_gs;
+              if (!qInfo.is_none()) { a_q = qInfo.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); d.qInfo = _dptr(a_q); }
+              if (!Xp.is_none()) { a_xp = Xp.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); d.Xp = _dptr(a_xp); }
+              if (!gsat.is_none()) { a_gs = gsat.cast<py::array_t<int, py::array::c_style | py::array::forcecast>>(); d.gsat = static_cast<const int *>(a_gs.request().ptr); }
+              if (!gD.is_none()) { a_gD = gD.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); d.gD = _dptr(a_gD); }
+              if (!gM.is_none()) { a_gM = gM.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); d.gM = _dptr(a_gM); }
+              if (!gQ.is_none()) { a_gQ = gQ.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); d.gQ = _dptr(a_gQ); }
+              py::array_t<double, py::array::c_style | py::array::forcecast> a_de;
+              if (!dyn_end.is_none()) { a_de = dyn_end.cast<py::array_t<double, py::array::c_style | py::array::forcecast>>(); d.dyn_end = _dptr(a_de); }
+              qoejopt::BiasWinResult r;
+              qoejopt::biasWindowSolve(d, r);
+              py::array_t<double> dX({L + 1, n, 6}), dB({L, n, 3}), sig({L, n, 3});
+              std::memset(dX.mutable_data(), 0, (size_t)(L + 1) * n * 6 * sizeof(double));
+              std::memset(dB.mutable_data(), 0, (size_t)L * n * 3 * sizeof(double));
+              if (r.dX.size() > 0)
+                  std::memcpy(dX.mutable_data(), r.dX.data(), (size_t)r.dX.size() * sizeof(double));
+              if (r.dbeta.size() > 0)
+                  std::memcpy(dB.mutable_data(), r.dbeta.data(), (size_t)r.dbeta.size() * sizeof(double));
+              std::memset(sig.mutable_data(), 0, (size_t)L * n * 3 * sizeof(double));
+              if ((int)r.betaSigma.size() == L * n * 3)
+                  std::memcpy(sig.mutable_data(), r.betaSigma.data(), (size_t)r.betaSigma.size() * sizeof(double));
+              py::array_t<int> rows(r.A_rows.size()), cols(r.A_cols.size());
+              py::array_t<double> vals(r.A_vals.size()), bvec(r.b_rows.size());
+              if (!r.A_rows.empty()) {
+                  std::memcpy(rows.mutable_data(), r.A_rows.data(), r.A_rows.size() * sizeof(int));
+                  std::memcpy(cols.mutable_data(), r.A_cols.data(), r.A_cols.size() * sizeof(int));
+                  std::memcpy(vals.mutable_data(), r.A_vals.data(), r.A_vals.size() * sizeof(double));
+                  std::memcpy(bvec.mutable_data(), r.b_rows.data(), r.b_rows.size() * sizeof(double));
+              }
+              return py::make_tuple(dX, dB, sig, r.cost, r.cost_isl, r.cost_dyn,
+                                    r.cost_beta, r.cost_q, r.cost_gts,
+                                    r.cond_joint, r.cond_beta,
+                                    rows, cols, vals, bvec,
+                                    r.nrows, r.ncol, r.nb, r.nq);
+          },
+          py::arg("n"), py::arg("L"), py::arg("fpn"), py::arg("E"),
+          py::arg("G"), py::arg("sigma_isl"), py::arg("sigma_gts"),
+          py::arg("phi"), py::arg("Qb"), py::arg("ei"), py::arg("ej"),
+          py::arg("D"), py::arg("M"), py::arg("P"), py::arg("Jp"),
+          py::arg("JpG"), py::arg("X"), py::arg("beta"), py::arg("Phi"),
+          py::arg("Gam"), py::arg("Qis"), py::arg("qInfo"), py::arg("Xp"),
+          py::arg("PbDiag"), py::arg("gsat"), py::arg("gD"), py::arg("gM"),
+          py::arg("gQ"), py::arg("dyn_end") = py::none(), py::arg("compute_cov") = true,
+          py::arg("beta_only") = false, py::arg("compute_cond") = true,
+          py::arg("want_rows") = false, py::arg("no_solve") = false,
+          py::arg("beta_off") = false,
+          "Task #20 in-band [q;β] 联合装配/求解：返回 dX,dbeta,betaSigma,cost 分块");
+    m.def("biasEphRow", [](py::array_t<double, py::array::c_style | py::array::forcecast> p,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> Jp,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> JpG,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> obs) {
+              auto o = qoejopt::biasEphRow(static_cast<const double *>(p.request().ptr),
+                                           static_cast<const double *>(Jp.request().ptr),
+                                           static_cast<const double *>(JpG.request().ptr),
+                                           static_cast<const double *>(obs.request().ptr));
+              py::array_t<double> r(3), Jq({3, 6}), Jb({3, 3});
+              std::memcpy(r.mutable_data(), o.r, 3 * sizeof(double));
+              std::memcpy(Jq.mutable_data(), o.Jq, 18 * sizeof(double));
+              std::memcpy(Jb.mutable_data(), o.Jb, 9 * sizeof(double));
+              return py::make_tuple(r, Jq, Jb);
+          }, py::arg("p"), py::arg("Jp"), py::arg("JpG"), py::arg("obs"));
+    m.def("biasIslRow", [](py::array_t<double, py::array::c_style | py::array::forcecast> pi,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> pj,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> JpGi,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> JpGj,
+                           double d) {
+              auto o = qoejopt::biasIslRow(static_cast<const double *>(pi.request().ptr),
+                                           static_cast<const double *>(pj.request().ptr),
+                                           static_cast<const double *>(JpGi.request().ptr),
+                                           static_cast<const double *>(JpGj.request().ptr), d);
+              py::array_t<double> Ji(3), Jj(3);
+              std::memcpy(Ji.mutable_data(), o.Ji, 3 * sizeof(double));
+              std::memcpy(Jj.mutable_data(), o.Jj, 3 * sizeof(double));
+              return py::make_tuple(o.r, Ji, Jj);
+          }, py::arg("pi"), py::arg("pj"), py::arg("JpGi"), py::arg("JpGj"), py::arg("d"));
+    m.def("biasGtsRow", [](py::array_t<double, py::array::c_style | py::array::forcecast> pi,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> Jp,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> JpG,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> qsta,
+                           double d) {
+              auto o = qoejopt::biasGtsRow(static_cast<const double *>(pi.request().ptr),
+                                           static_cast<const double *>(Jp.request().ptr),
+                                           static_cast<const double *>(JpG.request().ptr),
+                                           static_cast<const double *>(qsta.request().ptr), d);
+              py::array_t<double> Jq({3, 6}), Jb({3, 3});
+              std::memcpy(Jq.mutable_data(), o.Jq, 18 * sizeof(double));
+              std::memcpy(Jb.mutable_data(), o.Jb, 9 * sizeof(double));
+              return py::make_tuple(o.r, Jq, Jb);
+          }, py::arg("pi"), py::arg("Jp"), py::arg("JpG"), py::arg("qsta"), py::arg("d"));
+    m.def("biasGmRow", [](py::array_t<double, py::array::c_style | py::array::forcecast> bk,
+                          py::array_t<double, py::array::c_style | py::array::forcecast> bp,
+                          double phi, double Qb) {
+              auto o = qoejopt::biasGmRow(static_cast<const double *>(bk.request().ptr),
+                                          static_cast<const double *>(bp.request().ptr), phi, Qb);
+              py::array_t<double> r(3), Jk({3, 3}), Jp({3, 3});
+              std::memcpy(r.mutable_data(), o.r, 3 * sizeof(double));
+              std::memcpy(Jk.mutable_data(), o.Jk, 9 * sizeof(double));
+              std::memcpy(Jp.mutable_data(), o.Jp, 9 * sizeof(double));
+              return py::make_tuple(r, Jk, Jp);
+          }, py::arg("bk"), py::arg("bp"), py::arg("phi"), py::arg("Qb"));
+    m.def("biasGmRow0", [](py::array_t<double, py::array::c_style | py::array::forcecast> bk,
+                           py::array_t<double, py::array::c_style | py::array::forcecast> sigma) {
+              auto o = qoejopt::biasGmRow0(static_cast<const double *>(bk.request().ptr),
+                                           static_cast<const double *>(sigma.request().ptr));
+              py::array_t<double> r(3), Jk({3, 3}), Jp({3, 3});
+              std::memcpy(r.mutable_data(), o.r, 3 * sizeof(double));
+              std::memcpy(Jk.mutable_data(), o.Jk, 9 * sizeof(double));
+              std::memcpy(Jp.mutable_data(), o.Jp, 9 * sizeof(double));
+              return py::make_tuple(r, Jk, Jp);
+          }, py::arg("bk"), py::arg("sigma"));
+
+    m.def("biasRtnBasis", [](py::array_t<double, py::array::c_style | py::array::forcecast> rv) {
+              py::array_t<double> E({3, 3});
+              qoejopt::biasRtnBasis(static_cast<const double *>(rv.request().ptr),
+                                    E.mutable_data());
+              return E;
+          }, py::arg("rv"));
+    m.def("biasEciToRtn", [](py::array_t<double, py::array::c_style | py::array::forcecast> b,
+                             py::array_t<double, py::array::c_style | py::array::forcecast> E) {
+              py::array_t<double> out(3);
+              qoejopt::biasEciToRtn(static_cast<const double *>(b.request().ptr),
+                                    static_cast<const double *>(E.request().ptr),
+                                    out.mutable_data());
+              return out;
+          }, py::arg("b_eci"), py::arg("E"));
+    m.def("biasRtnToEci", [](py::array_t<double, py::array::c_style | py::array::forcecast> b,
+                             py::array_t<double, py::array::c_style | py::array::forcecast> E) {
+              py::array_t<double> out(3);
+              qoejopt::biasRtnToEci(static_cast<const double *>(b.request().ptr),
+                                    static_cast<const double *>(E.request().ptr),
+                                    out.mutable_data());
+              return out;
+          }, py::arg("b_rtn"), py::arg("E"));
+    m.def("biasJpGRtnToEci", [](py::array_t<double, py::array::c_style | py::array::forcecast> J,
+                                py::array_t<double, py::array::c_style | py::array::forcecast> E) {
+              py::array_t<double> out({3, 3});
+              qoejopt::biasJpGRtnToEci(static_cast<const double *>(J.request().ptr),
+                                       static_cast<const double *>(E.request().ptr),
+                                       out.mutable_data());
+              return out;
+          }, py::arg("JpG_rtn"), py::arg("E"));
+
 }

@@ -755,6 +755,33 @@ PYBIND11_MODULE(qoe, m)
             return O;
             }, py::arg("oe"), py::arg("nfr"), py::arg("dt"), py::arg("nthreads")=16, py::arg("beta")=1.0,
             "整弧多帧 GVE（CUDA）：(n,6) → rv (nfr,n,6)");
+      m.def("gveOuBiasFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                double dt, int bias_nsub, double tau, double sigma_b,
+                py::array_t<double, py::array::c_style | py::array::forcecast> rtn,
+                py::array_t<double, py::array::c_style | py::array::forcecast> du){
+            auto bo = oe.request(); auto br = rtn.request(); auto bd = du.request();
+            if(bo.ndim != 2 || bo.shape[1] != 6)
+                throw std::runtime_error("gveOuBiasFlat: oe 需 (n,6)");
+            if(br.size != 3 || bd.size != 3)
+                throw std::runtime_error("gveOuBiasFlat: rtn/du 需长度 3");
+            const int n = (int)bo.shape[0];
+            py::array_t<double> E({(py::ssize_t)n, (py::ssize_t)6});
+            py::array_t<double> Gm({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)3});
+            py::array_t<double> Qq({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)6});
+            py::array_t<double> Qb({(py::ssize_t)n, (py::ssize_t)6, (py::ssize_t)3});
+            py::array_t<double> Qbb({(py::ssize_t)n, (py::ssize_t)3, (py::ssize_t)3});
+            { py::gil_scoped_release release;
+              qoejopt::gveOuBiasBatch(
+                  static_cast<const double*>(bo.ptr), n, dt, bias_nsub, tau, sigma_b,
+                  static_cast<const double*>(br.ptr), static_cast<const double*>(bd.ptr),
+                  E.mutable_data(), Gm.mutable_data(), Qq.mutable_data(),
+                  Qb.mutable_data(), Qbb.mutable_data()); }
+            return py::make_tuple(E, Gm, Qq, Qb, Qbb);
+            }, py::arg("oe"), py::arg("dt"), py::arg("bias_nsub")=16,
+            py::arg("tau")=5760.0, py::arg("sigma_b")=1e-6,
+            py::arg("rtn"), py::arg("du"),
+            "OU 偏差 Γ_b/Q 块（CUDA）：返回 (end, Gamma_b(n,6,3), Q_qq, Q_qb, Q_bb)");
       m.def("gvePropagateChunkFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv0, int nfr, int L,
                 double dt, int nthreads, double beta){

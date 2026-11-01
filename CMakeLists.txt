@@ -139,6 +139,22 @@ target_link_libraries(gtest_qoe dastate qoe_core GTest::gtest GTest::gtest_main)
 target_link_libraries(gtest_qoe dace::dace OpenMP::OpenMP_CXX)
 set_target_properties(gtest_qoe PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
 
+# --- gtest: acceleration-network usability (TorchScript + Eigen) ---
+add_executable(gtest_accel_net test/test_accel_net_gtest.cpp
+  src/kepler.cpp src/elements.cpp src/integrater.cpp)
+target_link_directories(gtest_accel_net PRIVATE "/home/msy/miniconda3/envs/rover_slam/lib")
+target_link_libraries(gtest_accel_net dastate qoe_core torch GTest::gtest GTest::gtest_main)
+target_include_directories(gtest_accel_net PRIVATE ${PROJECT_SOURCE_DIR}/include /usr/include/eigen3 ${TORCH_INCLUDE_DIRS})
+set_target_properties(gtest_accel_net PROPERTIES BUILD_RPATH "${DACE_LIBDIR};/home/msy/miniconda3/envs/rover_slam/lib")
+
+# --- gtest: merged bias suite (OU kernel + window Γβ + DACE DA + in-band oracle + prod harness) ---
+add_executable(gtest_bias test/test_bias_gtest.cpp
+  src/kepler.cpp src/elements.cpp src/integrater.cpp)
+target_link_libraries(gtest_bias dastate qoe_core dace::dace GTest::gtest GTest::gtest_main)
+target_link_libraries(gtest_bias OpenMP::OpenMP_CXX CUDA::cudart)
+target_include_directories(gtest_bias PRIVATE ${PROJECT_SOURCE_DIR}/include /usr/include/eigen3)
+set_target_properties(gtest_bias PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
+
 # --- gtest：FLS 逐星边缘核（P1'）——合成小例落盘 + 与同算法 host 参考对拍
 #     + 真实规模核计时 + 求解链（SymbolicDecomposition/add_MtM/factor/solve）耗时归因（glog 输出）---
 find_library(GLOG_LIB NAMES glog PATHS /usr/local/lib /usr/lib/x86_64-linux-gnu)

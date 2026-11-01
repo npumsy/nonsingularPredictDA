@@ -143,6 +143,25 @@ void gveStmIADev(const double *d_oe, int n, double dt, double beta, double *d_oe
 // GVE 控制矩阵 B=∂(oe_dot)/∂a（ECI 3 轴，每星 6×3）：FLS 过程噪声 x_dot=A·x+B·u。d_B=(n,6,3)。
 void gveCtrlDev(const double *d_oe, int n, double *d_B);
 
+// P1：逐帧 OU 偏差灵敏度 Γ(t)（每星一个线程，区间起点 RTN 列）。
+// oe_host (n,6)，frames = 0,stride,...；输出 gamma (n,nfr_out,6,3)，
+// end 为该线程走到第末帧后的 QOE (n,6)，可空。每帧子步数与
+// gveOuBiasBatch 同约定：nsub=max(ceil(dt/10), bias_nsub)。
+void gveBiasFramesBatch(const double *oe_host, int n, int nfr_in, int stride,
+                        double dt, double tau, int bias_nsub,
+                        const double *rtn, double *gamma_out, double *end_out);
+void gveBiasFramesDevice(const double *d_oe, int n, int nfr_in, int stride,
+                         double dt, double tau, int bias_nsub,
+                         double *d_gamma, double *d_end);
+
+// OU（Ornstein–Uhlenbeck）RTN 加速度偏差（Stage A，全 N 并行）：子步 h=Δt/nsub，
+// nsub=max(ceil(Δt/10), bias_nsub)（与 Python oracle `fls_marg.proc_Q_qoe` 同策略）。
+// 输出 Γ_b=(n,6,3)、Q_qq=(n,6,6)、Q_qb=(n,6,3)、Q_bb=(n,3,3)，可选末态 end=(n,6)。
+void gveOuBiasBatch(const double *oe_host, int n, double dt, int bias_nsub,
+                    double tau, double sigma_b, const double *rtn, const double *du,
+                    double *end_out, double *gamma_out, double *qqq_out,
+                    double *qqb_out, double *qbb_out);
+
 // 窗内 dyn 二因子（3N 并行）：x_lo/x_hi (nseg,n,6) → res(nseg,n,6)、Φ(nseg,n,36)。
 void gveDynFactorDev(const double *d_xlo, const double *d_xhi, int nseg, int n,
                      double dt, double beta, double *d_res, double *d_Phi);
@@ -191,6 +210,22 @@ struct WinCtx {
     double *d_gts_D = nullptr, *d_gts_W = nullptr, *d_gts_Q = nullptr;
     double *d_ctr = nullptr, *d_qingt = nullptr;
     double *d_beta = nullptr;                                  // (n,) 逐星阻力倍率；空=beta=1
+    // P1：每区间每星 3D 加速度偏差的确定性项 Γβ（(L−1,n,6) QOE 6 维）。
+    // 非空时 winDynAsmKernel 的残差为 e = x_{k+1} − end − Γβ；空=旧路径逐位不变。
+    double *d_dyn_bias = nullptr;
+    // 阶段1（无 port 的 C++ 全局 β 列）：默认全 0/空，不分配、不改变旧路径。
+    // β 变量按区间/星追加在 q 列之后：3N/区间；下列缓冲由 bias-on 显式 set。
+    int beta_on = 0;                 // 0=不创建 β 列/行（逐位不变）
+    int n_intervals = 0;             // β 区间数（默认 L-1 或 L，由调用方定）
+    int ncol_beta = 0;               // 3*N*n_intervals；q 列后追加
+    int off_beta = 0;                // = ncol（q 列数），β 首列偏移
+    int dyn_row_nnz = 12;            // dyn 每行非零：off=12，β-on=15（q_k 6, q_{k+1} 6, β_k 3）
+    int dyn_frozen = 0;              // β-on：首次 win_assemble 后冻结 end/Φ（固定线性化点）
+    double *d_beta_q = nullptr;      // (n_intervals,n,3) 当前 β（RTN）
+    double *d_gamma_int = nullptr;   // (n_intervals,n,6,3) 区间 Γ
+    double *d_jpG = nullptr;         // (nfr,n,3,3) 逐帧 JpΓ
+    double *d_pbdiag = nullptr;      // (n,3) β_0 RTN 先验 σ
+    double gm_phi = 1.0, gm_qb = 1e-14;  // GM 端点 carry
     double *d_X = nullptr, *d_rv = nullptr, *d_Ap = nullptr;   // 节点 QOE / rv / ∂p/∂oe(18)
     double *d_end = nullptr, *d_phi = nullptr;                 // ((L-1)*n) 单步 φ 末态(QOE) 与 Φ_oe(36)
     int dyn_sub = 1;                                           // 关键帧 dyn 子步数（1=单步；710s 用 710）

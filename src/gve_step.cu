@@ -633,7 +633,15 @@ __device__ __forceinline__ void gveRhsFieldDev(const double* OE, double beta, do
 // 逐式镜像上面的 double 物理；无有限差分、无 12× 重复求值（这正是 nvcc 卡死的根源）。
 // FD 版只保留在 Python 侧做校验（validate_*），设备端不再有 FD。
 // ============================================================================
-struct Dual6 { double v; double d[6]; };
+struct Dual6 {
+    double v; double d[6];
+    // 默认零初始化：导数链里若某分支只写 .v（或漏写 d），未定义值不得
+    // 来自上一次 kernel 残留的 local memory；这保证 A=∂f/∂oe 与调用历史无关。
+    __device__ __forceinline__ Dual6() : v(0.0) {
+        #pragma unroll
+        for (int i = 0; i < 6; ++i) d[i] = 0.0;
+    }
+};
 __device__ __forceinline__ Dual6 d6_c(double v){ Dual6 r; r.v=v;
     #pragma unroll
     for(int i=0;i<6;i++) r.d[i]=0.0; return r; }
@@ -4543,6 +4551,648 @@ void gveCtrlDev(const double *d_oe, int n, double *d_B) {
     if (err != cudaSuccess) fprintf(stderr, "[gveCtrlDev] %s\n", cudaGetErrorString(err));
 }
 
+// ---- OU（Ornstein–Uhlenbeck）RTN 加速度偏差：Γ_b 与 Q 块（Stage A）----
+// Python oracle: `fls_marg.proc_Q_qoe(..., bias_sigma>0)`。子步 h=Δt/nsub（≤10 s），
+// 中点瞬时 RTN 的 B 与半段 STM Φ(h/2) 逐段推进：
+//   Γ_b = ∫Φ(Δt−s)B(s)e^{−s/τ}ds, Q_qq = Q_white + ∫ΦB(q_b I)BᵀΦᵀds + Γ_b P_b Γ_bᵀ
+//   Q_qb = ∫ΦB q_b e^{−(Δt−s)/τ}ds + Γ_b P_b φᵀ, Q_bb = σ_b²(1−φ²)I + φP_bφᵀ.
+// 一线程一星、子步串行；星间（N=1152）在 GPU 上并行。与 gveStmDeviceGrp 同一
+// gveRhsJacVal_dev / gveGaussW_dev / oe2rv_dev，故与 Python 同源口径一致。
+__device__ __forceinline__ void gveStmStepDev(const double *y0, double dt, double beta,
+                                              double *yf, double Phi[6][6]) {
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6];
+    double P[6][6], K1[6][6], K2[6][6], K3[6][6], K4[6][6], A[6][6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = y0[c];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) P[a][b] = (a == b) ? 1.0 : 0.0;
+    gveRhsJacVal_dev(y, beta, A, k1);
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) {
+        double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * P[c][b]; K1[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * k1[c] / 3.0;
+    gveRhsJacVal_dev(tmp, beta, A, k2);
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) {
+        double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * K1[c][b] / 3.0);
+        K2[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (-k1[c] / 3.0 + k2[c]);
+    gveRhsJacVal_dev(tmp, beta, A, k3);
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) {
+        double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (-K1[c][b] / 3.0 + K2[c][b]));
+        K3[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) tmp[c] = y[c] + dt * (k1[c] - k2[c] + k3[c]);
+    gveRhsJacVal_dev(tmp, beta, A, k4);
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) for (int b = 0; b < 6; ++b) {
+        double s = 0; for (int c = 0; c < 6; ++c) s += A[a][c] * (P[c][b] + dt * (K1[c][b] - K2[c][b] + K3[c][b]));
+        K4[a][b] = s; }
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) yf[c] = y[c] + dt * (k1[c] + 3.0 * k2[c] + 3.0 * k3[c] + k4[c]) / 8.0;
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = 0; b < 6; ++b)
+            Phi[a][b] = P[a][b] + dt * (K1[a][b] + 3.0 * K2[a][b] + 3.0 * K3[a][b] + K4[a][b]) / 8.0;
+}
+
+__global__ void gveOuBiasKernel(const double *oe0, int n, double dt, int nsub,
+                                double tau, double sb,
+                                double r0, double r1, double r2,
+                                double u0, double u1, double u2,
+                                double *end_out, double *Gamma_out, double *Qqq_out,
+                                double *Qqb_out, double *Qbb_out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double sb2 = sb * sb;
+    const double qb = 2.0 * sb2 / tau;
+    const double h = dt / (double)nsub;
+    const double dec = exp(-h / tau);
+    const double decy = tau * (1.0 - dec) * qb;
+    const double rtn[3] = { r0, r1, r2 };
+    const double du[3] = { u0, u1, u2 };
+    double Pb[3][3];
+    #pragma unroll
+    for (int a = 0; a < 3; ++a)
+        #pragma unroll
+        for (int b = 0; b < 3; ++b)
+            Pb[a][b] = (a == b) ? (sb * rtn[a]) * (sb * rtn[a]) : 0.0;
+    double y[6];
+    #pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6 * i + c];
+    double M[6][3], Pw[6][6], Pn[6][6], Nq[6][3];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) {
+        #pragma unroll
+        for (int b = 0; b < 3; ++b) M[a][b] = 0.0, Nq[a][b] = 0.0;
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) Pw[a][b] = 0.0, Pn[a][b] = 0.0;
+    }
+    for (int j = 0; j < nsub; ++j) {
+        const double s_mid = ((double)j + 0.5) * h;
+        double y_mid[6], y_nxt[6], Ph[6][6], Pbh[6][6];
+        gveStmStepDev(y, 0.5 * h, 1.0, y_mid, Ph);      // 半段：中点态 + Φ(h/2)
+        gveStmStepDev(y_mid, 0.5 * h, 1.0, y_nxt, Pbh); // 后半段
+        double Phi[6][6];
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+                for (int c = 0; c < 6; ++c) s += Pbh[a][c] * Ph[c][b];
+                Phi[a][b] = s;
+            }
+        double rv[6]; oe2rv_dev(y_mid, rv);
+        double rn = sqrt(rv[0]*rv[0] + rv[1]*rv[1] + rv[2]*rv[2]);
+        double R[3] = { rv[0]/rn, rv[1]/rn, rv[2]/rn };
+        double hv[3] = { rv[1]*rv[5] - rv[2]*rv[4], rv[2]*rv[3] - rv[0]*rv[5],
+                         rv[0]*rv[4] - rv[1]*rv[3] };
+        double hn = sqrt(hv[0]*hv[0] + hv[1]*hv[1] + hv[2]*hv[2]);
+        double Nv[3] = { hv[0]/hn, hv[1]/hn, hv[2]/hn };
+        double Tv[3] = { Nv[1]*R[2] - Nv[2]*R[1], Nv[2]*R[0] - Nv[0]*R[2],
+                         Nv[0]*R[1] - Nv[1]*R[0] };
+        double W[6][3]; gveGaussW_dev(y_mid, W);         // ∂oe_dot/∂a_ECI
+        // E[j][k] = RTN 轴 k 的第 j 个 ECI 分量（列 = R,T,N）
+        double E[3][3] = { { R[0], Tv[0], Nv[0] },
+                           { R[1], Tv[1], Nv[1] },
+                           { R[2], Tv[2], Nv[2] } };
+        double B[6][3], G[6][3];
+        #pragma unroll
+        for (int a = 0; a < 6; ++a) {
+            #pragma unroll
+            for (int k = 0; k < 3; ++k)
+                B[a][k] = W[a][0]*E[0][k] + W[a][1]*E[1][k] + W[a][2]*E[2][k];
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                double s = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += Ph[a][c] * B[c][k];
+                G[a][k] = s;
+            }
+        }
+        const double cM = h * exp(-s_mid / tau);
+        double M2[6][3], N2[6][3], A1[6][6], Pw2[6][6], Pn2[6][6];
+        #pragma unroll
+        for (int a = 0; a < 6; ++a) {
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                double s1 = 0.0, s2 = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) { s1 += Phi[a][c]*M[c][k]; s2 += Phi[a][c]*Nq[c][k]; }
+                M2[a][k] = s1 + cM * G[a][k];
+                N2[a][k] = dec * s2 + decy * G[a][k];
+            }
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += Phi[a][c] * Pw[c][b];
+                A1[a][b] = s;
+            }
+        }
+        double A2[6][6];
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += A1[a][c] * Phi[b][c];
+                A2[a][b] = s;
+            }
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double sw = 0.0;
+                #pragma unroll
+                for (int k = 0; k < 3; ++k) sw += G[a][k] * (du[k]*du[k]) * G[b][k];
+                Pw2[a][b] = A2[a][b] + h * sw;
+            }
+        // Pn：与 Pw 同式但基准是 ΦPnΦᵀ + h q_b G Gᵀ
+        #pragma unroll
+        for (int a = 0; a < 6; ++a) {
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += Phi[a][c] * Pn[c][b];
+                A1[a][b] = s;
+            }
+        }
+        #pragma unroll
+        for (int a = 0; a < 6; ++a)
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+                #pragma unroll
+                for (int c = 0; c < 6; ++c) s += A1[a][c] * Phi[b][c];
+                Pn2[a][b] = s;
+                #pragma unroll
+                for (int k = 0; k < 3; ++k) Pn2[a][b] += h * qb * G[a][k] * G[b][k];
+            }
+        #pragma unroll
+        for (int a = 0; a < 6; ++a) {
+            #pragma unroll
+            for (int k = 0; k < 3; ++k) { M[a][k] = M2[a][k]; Nq[a][k] = N2[a][k]; }
+            #pragma unroll
+            for (int b = 0; b < 6; ++b) { Pw[a][b] = Pw2[a][b]; Pn[a][b] = Pn2[a][b]; }
+        }
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) y[c] = y_nxt[c];
+    }
+    const double phi = exp(-dt / tau);
+    double Q[6][6], Qb[6][3];
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) {
+        #pragma unroll
+        for (int b = 0; b < 6; ++b) {
+            double s = Pw[a][b] + Pn[a][b];
+            #pragma unroll
+            for (int k = 0; k < 3; ++k)
+                #pragma unroll
+                for (int l = 0; l < 3; ++l) s += M[a][k] * Pb[k][l] * M[b][l];
+            Q[a][b] = s;
+        }
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            double s = Nq[a][k];
+            #pragma unroll
+            for (int l = 0; l < 3; ++l) s += phi * M[a][l] * Pb[l][k];
+            Qb[a][k] = s;
+        }
+    }
+    // 与 Python oracle 一致：Q ← (Q+Qᵀ)/2（消去累计舍入的非对称）
+    #pragma unroll
+    for (int a = 0; a < 6; ++a)
+        #pragma unroll
+        for (int b = a; b < 6; ++b) {
+            double t = 0.5 * (Q[a][b] + Q[b][a]);
+            Q[a][b] = t; Q[b][a] = t;
+        }
+    double tr = 0.0;
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) tr += Q[a][a];
+    if (tr < 1e-300) tr = 1e-300;
+    const double floor = 1e-12 * tr;
+    double *Go = Gamma_out + (size_t)i * 18;
+    double *Qo = Qqq_out + (size_t)i * 36;
+    double *Qbo = Qqb_out + (size_t)i * 18;
+    double *Qbbo = Qbb_out + (size_t)i * 9;
+    #pragma unroll
+    for (int a = 0; a < 6; ++a) {
+        #pragma unroll
+        for (int k = 0; k < 3; ++k) { Go[a*3+k] = M[a][k]; Qbo[a*3+k] = Qb[a][k]; }
+        #pragma unroll
+        for (int b = 0; b < 6; ++b)
+            Qo[a*6+b] = Q[a][b] + ((a == b) ? floor : 0.0);
+    }
+    #pragma unroll
+    for (int k = 0; k < 3; ++k)
+        #pragma unroll
+        for (int l = 0; l < 3; ++l)
+            Qbbo[k*3+l] = sb2 * (1.0 - phi*phi) * ((k == l) ? 1.0 : 0.0)
+                        + (phi*phi) * Pb[k][l];
+    if (end_out != nullptr)
+        #pragma unroll
+        for (int c = 0; c < 6; ++c) end_out[6 * (size_t)i + c] = y[c];
+}
+
+__global__ void gveBiasFramesKernel(const double *oe0, int n, int nfr, int stride,
+                                    double dt, double tau, int bias_nsub,
+                                    double *gamma_out, double *end_out);
+__global__ void gveOuBiasQKernel(const double *oe0, int n, double dt, int nsub,
+                                 double tau, double sb, double r0, double r1,
+                                 double r2, double u0, double u1, double u2,
+                                 int nfr_g, const double *Gamma_all,
+                                 double *Qqq_out, double *Qqb_out,
+                                 double *Qbb_out);
+void gveOuBiasBatch(const double *oe_host, int n, double dt, int bias_nsub,
+                    double tau, double sigma_b, const double *rtn, const double *du,
+                    double *end_out, double *gamma_out, double *qqq_out,
+                    double *qqb_out, double *qbb_out) {
+    if (oe_host == nullptr) throw std::invalid_argument("gveOuBiasBatch: oe 为空");
+    if (rtn == nullptr) throw std::invalid_argument("gveOuBiasBatch: rtn 为空");
+    if (du == nullptr) throw std::invalid_argument("gveOuBiasBatch: du 为空");
+    if (gamma_out == nullptr || qqq_out == nullptr || qqb_out == nullptr ||
+        qbb_out == nullptr)
+        throw std::invalid_argument("gveOuBiasBatch: 输出指针为空");
+    if (n <= 0) throw std::invalid_argument("gveOuBiasBatch: n <= 0");
+    if (!std::isfinite(dt) || dt <= 0.0)
+        throw std::invalid_argument("gveOuBiasBatch: dt 需有限且 > 0");
+    if (!std::isfinite(tau) || tau <= 0.0)
+        throw std::invalid_argument("gveOuBiasBatch: tau 需有限且 > 0");
+    if (!std::isfinite(sigma_b) || sigma_b < 0.0)
+        throw std::invalid_argument("gveOuBiasBatch: sigma_b 需有限且 >= 0");
+    for (int k = 0; k < 3; ++k) {
+        if (!std::isfinite(rtn[k]) || !std::isfinite(du[k]))
+            throw std::invalid_argument("gveOuBiasBatch: rtn/du 含非有限值");
+    }
+    if (bias_nsub < 0) throw std::invalid_argument("gveOuBiasBatch: bias_nsub < 0");
+    int nsub = std::max(1, (int)std::ceil(dt / 10.0));
+    if (bias_nsub > 0) nsub = std::max(nsub, bias_nsub);
+    double *d_oe = nullptr, *d_end = nullptr, *d_Gall = nullptr, *d_Q = nullptr,
+           *d_Qqb = nullptr, *d_Qbb = nullptr;
+    const size_t b_oe = (size_t)n * 6 * sizeof(double);
+    const size_t b_end = (size_t)n * 6 * sizeof(double);
+    // 2 帧（t=0, t=dt）逐帧 Γ；末帧供 Γ 输出与 Q 核的 ΓPbΓᵀ 使用。
+    const size_t b_Gall = (size_t)n * 2 * 18 * sizeof(double);
+    const size_t b_Q = (size_t)n * 36 * sizeof(double);
+    const size_t b_Qqb = (size_t)n * 18 * sizeof(double);
+    const size_t b_Qbb = (size_t)n * 9 * sizeof(double);
+    cudaMalloc(&d_oe, b_oe); cudaMalloc(&d_end, b_end); cudaMalloc(&d_Gall, b_Gall);
+    cudaMalloc(&d_Q, b_Q); cudaMalloc(&d_Qqb, b_Qqb); cudaMalloc(&d_Qbb, b_Qbb);
+    cudaMemcpy(d_oe, oe_host, b_oe, cudaMemcpyHostToDevice);
+    const int threads = 128, blocks = (n + threads - 1) / threads;
+    // Γ/端态走与 frames 完全同构的核（已验证与 FD 一致且与调用历史无关）。
+    gveBiasFramesKernel<<<blocks, threads>>>(d_oe, n, 2, 1, dt, tau, nsub,
+                                             d_Gall, d_end);
+    // Q 只在这个小核里累计；Γ 作为输入，避免大核同时累加 Γ/Q。
+    gveOuBiasQKernel<<<blocks, threads>>>(d_oe, n, dt, nsub, tau, sigma_b,
+                                          rtn[0], rtn[1], rtn[2],
+                                          du[0], du[1], du[2], 2, d_Gall,
+                                          d_Q, d_Qqb, d_Qbb);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        fprintf(stderr, "[gveOuBiasBatch] %s\n", cudaGetErrorString(err));
+    if (end_out) cudaMemcpy(end_out, d_end, b_end, cudaMemcpyDeviceToHost);
+    if (gamma_out) cudaMemcpy2D(gamma_out, (size_t)18 * sizeof(double),
+                                d_Gall + 18, (size_t)36 * sizeof(double),
+                                (size_t)18 * sizeof(double), (size_t)n,
+                                cudaMemcpyDeviceToHost);
+    if (qqq_out) cudaMemcpy(qqq_out, d_Q, b_Q, cudaMemcpyDeviceToHost);
+    if (qqb_out) cudaMemcpy(qqb_out, d_Qqb, b_Qqb, cudaMemcpyDeviceToHost);
+    if (qbb_out) cudaMemcpy(qbb_out, d_Qbb, b_Qbb, cudaMemcpyDeviceToHost);
+    cudaFree(d_oe); cudaFree(d_end); cudaFree(d_Gall);
+    cudaFree(d_Q); cudaFree(d_Qqb); cudaFree(d_Qbb);
+}
+
+// ---- P1：逐帧 Γ(t)（区间起点 RTN 列）----
+// 与 gveOuBiasKernel 同一子步模型，但只推进 Γ、不累计 Q：
+//   Γ_0=0, Γ_{j+1}=Φ(h)Γ_j + h e^{−t_mid/τ} Φ(h/2) B_rtn(mid)
+// 子步 h=dt/nsub，nsub=max(ceil(dt/10),1)，与 gveOuBiasBatch 的总区间
+// 子步口径一致（Δt=10 s 时一步）。Γ 与 σ_b/rtn 无关（只由轨道和 τ 决定）。
+__global__ void gveBiasFramesKernel(const double *oe0, int n, int nfr, int stride,
+                                    double dt, double tau, int bias_nsub,
+                                    double *gamma_out, double *end_out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const int nout = (nfr + stride - 1) / stride;
+    // 与 gveOuBiasBatch 同约定：nsub=max(ceil(dt/10), bias_nsub)。
+    // 默认 bias_nsub=0 → 10 s 帧一步（与 Stage A 的总区间子步 h≈10 s 一致）。
+    int nsub = (int)ceil(dt / 10.0);
+    if (bias_nsub > 0) nsub = std::max(nsub, bias_nsub);
+    if (nsub < 1) nsub = 1;
+    const double h = dt / (double)nsub;
+    double y[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6 * i + c];
+    double Gam[6][3];
+#pragma unroll
+    for (int a = 0; a < 6; ++a)
+#pragma unroll
+        for (int k = 0; k < 3; ++k) Gam[a][k] = 0.0;
+    int io = 0;
+    for (int j = 0; j < nfr; ++j) {
+        if (j % stride == 0) {
+            double *g = gamma_out + (size_t)(i * nout + io) * 18;
+#pragma unroll
+            for (int a = 0; a < 6; ++a)
+#pragma unroll
+                for (int k = 0; k < 3; ++k) g[a * 3 + k] = Gam[a][k];
+            ++io;
+        }
+        if (j == nfr - 1) break;
+        for (int s = 0; s < nsub; ++s) {
+            double y_mid[6], y_nxt[6], Ph[6][6], Pbh[6][6];
+            gveStmStepDev(y, 0.5 * h, 1.0, y_mid, Ph);
+            gveStmStepDev(y_mid, 0.5 * h, 1.0, y_nxt, Pbh);
+            double Phi[6][6];
+#pragma unroll
+            for (int a = 0; a < 6; ++a)
+#pragma unroll
+                for (int b = 0; b < 6; ++b) {
+                    double v = 0.0;
+#pragma unroll
+                    for (int c = 0; c < 6; ++c) v += Pbh[a][c] * Ph[c][b];
+                    Phi[a][b] = v;
+                }
+            double rv[6]; oe2rv_dev(y_mid, rv);
+            double rn = sqrt(rv[0]*rv[0] + rv[1]*rv[1] + rv[2]*rv[2]);
+            double R[3] = { rv[0]/rn, rv[1]/rn, rv[2]/rn };
+            double hv[3] = { rv[1]*rv[5] - rv[2]*rv[4], rv[2]*rv[3] - rv[0]*rv[5],
+                             rv[0]*rv[4] - rv[1]*rv[3] };
+            double hn = sqrt(hv[0]*hv[0] + hv[1]*hv[1] + hv[2]*hv[2]);
+            double Nv[3] = { hv[0]/hn, hv[1]/hn, hv[2]/hn };
+            double Tv[3] = { Nv[1]*R[2] - Nv[2]*R[1], Nv[2]*R[0] - Nv[0]*R[2],
+                             Nv[0]*R[1] - Nv[1]*R[0] };
+            double W[6][3]; gveGaussW_dev(y_mid, W);
+            double E[3][3] = { { R[0], Tv[0], Nv[0] },
+                               { R[1], Tv[1], Nv[1] },
+                               { R[2], Tv[2], Nv[2] } };
+            double B[6][3], G[6][3];
+#pragma unroll
+            for (int a = 0; a < 6; ++a)
+#pragma unroll
+                for (int k = 0; k < 3; ++k)
+                    B[a][k] = W[a][0]*E[0][k] + W[a][1]*E[1][k] + W[a][2]*E[2][k];
+#pragma unroll
+            for (int a = 0; a < 6; ++a)
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    double v = 0.0;
+#pragma unroll
+                    for (int c = 0; c < 6; ++c) v += Ph[a][c] * B[c][k];
+                    G[a][k] = v;
+                }
+            const double tm = (double)j * dt + ((double)s + 0.5) * h;
+            const double cf = h * exp(-tm / tau);
+            // 必须先算完整个矩阵-向量积再写回：原地更新会让 a>0 行读到
+            // 已污染的新行（与 winDynAsmKernel 的 B 同理）。
+            double Gam2[6][3];
+#pragma unroll
+            for (int a = 0; a < 6; ++a)
+#pragma unroll
+                for (int k = 0; k < 3; ++k) {
+                    double s1 = 0.0;
+#pragma unroll
+                    for (int c = 0; c < 6; ++c) s1 += Phi[a][c] * Gam[c][k];
+                    Gam2[a][k] = s1 + cf * G[a][k];   // 与 gveOuBiasKernel 同序
+                }
+#pragma unroll
+            for (int a = 0; a < 6; ++a)
+#pragma unroll
+                for (int k = 0; k < 3; ++k) Gam[a][k] = Gam2[a][k];
+#pragma unroll
+            for (int c = 0; c < 6; ++c) y[c] = y_nxt[c];
+        }
+    }
+    if (end_out != nullptr) {
+#pragma unroll
+        for (int c = 0; c < 6; ++c) end_out[(size_t)i * 6 + c] = y[c];
+    }
+}
+
+void gveBiasFramesDevice(const double *d_oe, int n, int nfr_in, int stride,
+                         double dt, double tau, int bias_nsub,
+                         double *d_gamma, double *d_end) {
+    if (d_oe == nullptr || d_gamma == nullptr)
+        throw std::invalid_argument("gveBiasFramesDevice: 空指针");
+    if (n <= 0 || nfr_in <= 0)
+        throw std::invalid_argument("gveBiasFramesDevice: n/nfr 需 > 0");
+    if (!std::isfinite(dt) || dt <= 0.0)
+        throw std::invalid_argument("gveBiasFramesDevice: dt 需有限且 > 0");
+    if (!std::isfinite(tau) || tau <= 0.0)
+        throw std::invalid_argument("gveBiasFramesDevice: tau 需有限且 > 0");
+    const int st = std::max(1, stride);
+    const int ns = std::max(0, bias_nsub);
+    const int threads = 128, blocks = (n + threads - 1) / threads;
+    gveBiasFramesKernel<<<blocks, threads>>>(d_oe, n, nfr_in, st, dt, tau, ns,
+                                             d_gamma, d_end);
+    cudaError_t err = cudaDeviceSynchronize();
+    if (err != cudaSuccess)
+        fprintf(stderr, "[gveBiasFramesDevice] %s\n", cudaGetErrorString(err));
+}
+
+// ---- Q-only 核：Γ 由 gveBiasFramesKernel 提供，本核只累计 Pw/Pn/Nq ----
+// 与旧 gveOuBiasKernel 同一子步模型（y/Φ/B/G 递推不变），但把 M=Γ 作为输入，
+// 避免在一个大核里同时累加 Γ 与 Q（寄存器/局部内存状态相关的不确定性）。
+__global__ void gveOuBiasQKernel(const double *oe0, int n, double dt, int nsub,
+                                 double tau, double sb, double r0, double r1,
+                                 double r2, double u0, double u1, double u2,
+                                 int nfr_g, const double *Gamma_all,
+                                 double *Qqq_out, double *Qqb_out,
+                                 double *Qbb_out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const double sb2 = sb * sb;
+    const double qb = 2.0 * sb2 / tau;
+    const double h = dt / (double)nsub;
+    const double dec = exp(-h / tau);
+    const double decy = tau * (1.0 - dec) * qb;
+    const double rtn[3] = { r0, r1, r2 };
+    const double du[3] = { u0, u1, u2 };
+    double Pb[3][3];
+#pragma unroll
+    for (int a = 0; a < 3; ++a)
+#pragma unroll
+        for (int b = 0; b < 3; ++b)
+            Pb[a][b] = (a == b) ? (sb * rtn[a]) * (sb * rtn[a]) : 0.0;
+    double y[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = oe0[6 * i + c];
+    double Pw[6][6], Pn[6][6], Nq[6][3];
+#pragma unroll
+    for (int a = 0; a < 6; ++a) {
+#pragma unroll
+        for (int b = 0; b < 3; ++b) Nq[a][b] = 0.0;
+#pragma unroll
+        for (int b = 0; b < 6; ++b) Pw[a][b] = 0.0, Pn[a][b] = 0.0;
+    }
+    for (int j = 0; j < nsub; ++j) {
+        const double s_mid = ((double)j + 0.5) * h;
+        double y_mid[6], y_nxt[6], Ph[6][6], Pbh[6][6];
+        gveStmStepDev(y, 0.5 * h, 1.0, y_mid, Ph);
+        gveStmStepDev(y_mid, 0.5 * h, 1.0, y_nxt, Pbh);
+        double Phi[6][6];
+#pragma unroll
+        for (int a = 0; a < 6; ++a)
+#pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+#pragma unroll
+                for (int c = 0; c < 6; ++c) s += Pbh[a][c] * Ph[c][b];
+                Phi[a][b] = s;
+            }
+        double rv[6]; oe2rv_dev(y_mid, rv);
+        double rn = sqrt(rv[0]*rv[0] + rv[1]*rv[1] + rv[2]*rv[2]);
+        double R[3] = { rv[0]/rn, rv[1]/rn, rv[2]/rn };
+        double hv[3] = { rv[1]*rv[5] - rv[2]*rv[4], rv[2]*rv[3] - rv[0]*rv[5],
+                         rv[0]*rv[4] - rv[1]*rv[3] };
+        double hn = sqrt(hv[0]*hv[0] + hv[1]*hv[1] + hv[2]*hv[2]);
+        double Nv[3] = { hv[0]/hn, hv[1]/hn, hv[2]/hn };
+        double Tv[3] = { Nv[1]*R[2] - Nv[2]*R[1], Nv[2]*R[0] - Nv[0]*R[2],
+                         Nv[0]*R[1] - Nv[1]*R[0] };
+        double W[6][3]; gveGaussW_dev(y_mid, W);
+        double E[3][3] = { { R[0], Tv[0], Nv[0] },
+                           { R[1], Tv[1], Nv[1] },
+                           { R[2], Tv[2], Nv[2] } };
+        double B[6][3], G[6][3];
+#pragma unroll
+        for (int a = 0; a < 6; ++a)
+#pragma unroll
+            for (int k = 0; k < 3; ++k)
+                B[a][k] = W[a][0]*E[0][k] + W[a][1]*E[1][k] + W[a][2]*E[2][k];
+#pragma unroll
+        for (int a = 0; a < 6; ++a)
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                double v = 0.0;
+#pragma unroll
+                for (int c = 0; c < 6; ++c) v += Ph[a][c] * B[c][k];
+                G[a][k] = v;
+            }
+        double A1[6][6], Pw2[6][6], Pn2[6][6];
+#pragma unroll
+        for (int a = 0; a < 6; ++a) {
+#pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+#pragma unroll
+                for (int c = 0; c < 6; ++c) s += Phi[a][c] * Pw[c][b];
+                A1[a][b] = s;
+            }
+        }
+#pragma unroll
+        for (int a = 0; a < 6; ++a)
+#pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+#pragma unroll
+                for (int c = 0; c < 6; ++c) s += A1[a][c] * Phi[b][c];
+                double sw = 0.0;
+#pragma unroll
+                for (int k = 0; k < 3; ++k) sw += G[a][k] * (du[k]*du[k]) * G[b][k];
+                Pw2[a][b] = s + h * sw;
+            }
+#pragma unroll
+        for (int a = 0; a < 6; ++a)
+#pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+#pragma unroll
+                for (int c = 0; c < 6; ++c) s += Phi[a][c] * Pn[c][b];
+                A1[a][b] = s;
+            }
+#pragma unroll
+        for (int a = 0; a < 6; ++a)
+#pragma unroll
+            for (int b = 0; b < 6; ++b) {
+                double s = 0.0;
+#pragma unroll
+                for (int c = 0; c < 6; ++c) s += A1[a][c] * Phi[b][c];
+                for (int k = 0; k < 3; ++k) s += h * qb * G[a][k] * G[b][k];
+                Pn2[a][b] = s;
+            }
+        double Nq2[6][3];
+#pragma unroll
+        for (int a = 0; a < 6; ++a) {
+#pragma unroll
+            for (int k = 0; k < 3; ++k) {
+                double s = 0.0;
+#pragma unroll
+                for (int c = 0; c < 6; ++c) s += Phi[a][c] * Nq[c][k];
+                Nq2[a][k] = dec * s + decy * G[a][k];
+            }
+#pragma unroll
+            for (int b = 0; b < 6; ++b) { Pw[a][b] = Pw2[a][b]; Pn[a][b] = Pn2[a][b]; }
+        }
+#pragma unroll
+        for (int a = 0; a < 6; ++a)
+#pragma unroll
+            for (int k = 0; k < 3; ++k) Nq[a][k] = Nq2[a][k];
+#pragma unroll
+        for (int c = 0; c < 6; ++c) y[c] = y_nxt[c];
+    }
+    const double *M = Gamma_all + ((size_t)(i * nfr_g) + (nfr_g - 1)) * 18;
+    const double phi = exp(-dt / tau);
+    for (int a = 0; a < 6; ++a) {
+        for (int b = 0; b < 6; ++b) {
+            double s = Pw[a][b] + Pn[a][b];
+#pragma unroll
+            for (int k1 = 0; k1 < 3; ++k1)
+#pragma unroll
+                for (int k2 = 0; k2 < 3; ++k2)
+                    s += M[a * 3 + k1] * Pb[k1][k2] * M[b * 3 + k2];
+            Qqq_out[((size_t)i * 6 + a) * 6 + b] = s;
+        }
+        for (int k = 0; k < 3; ++k) {
+            double s = Nq[a][k];
+#pragma unroll
+            for (int k2 = 0; k2 < 3; ++k2)
+                s += phi * M[a * 3 + k2] * Pb[k2][k];
+            Qqb_out[((size_t)i * 6 + a) * 3 + k] = s;
+        }
+    }
+    for (int a = 0; a < 3; ++a)
+#pragma unroll
+        for (int b = 0; b < 3; ++b)
+            Qbb_out[(size_t)i * 9 + a * 3 + b] =
+                (a == b) ? (sb2 * (1.0 - phi * phi) + phi * phi * Pb[a][b]) : 0.0;
+}
+
+void gveBiasFramesBatch(const double *oe_host, int n, int nfr_in, int stride,
+                        double dt, double tau, int bias_nsub,
+                        const double *rtn, double *gamma_out, double *end_out) {
+    (void)rtn;   // Γ 与偏差先验无关
+    if (oe_host == nullptr || gamma_out == nullptr)
+        throw std::invalid_argument("gveBiasFramesBatch: 空指针");
+    if (n <= 0 || nfr_in <= 0)
+        throw std::invalid_argument("gveBiasFramesBatch: n/nfr 需 > 0");
+    if (!std::isfinite(dt) || dt <= 0.0)
+        throw std::invalid_argument("gveBiasFramesBatch: dt 需有限且 > 0");
+    if (!std::isfinite(tau) || tau <= 0.0)
+        throw std::invalid_argument("gveBiasFramesBatch: tau 需有限且 > 0");
+    const int st = std::max(1, stride);
+    const int nout = (nfr_in + st - 1) / st;
+    const size_t b_oe = (size_t)n * 6 * sizeof(double);
+    const size_t b_g = (size_t)n * nout * 18 * sizeof(double);
+    const size_t b_e = (size_t)n * 6 * sizeof(double);
+    double *d_oe = nullptr, *d_g = nullptr, *d_e = nullptr;
+    cudaMalloc(&d_oe, b_oe); cudaMalloc(&d_g, b_g); cudaMalloc(&d_e, b_e);
+    cudaMemcpy(d_oe, oe_host, b_oe, cudaMemcpyHostToDevice);
+    gveBiasFramesDevice(d_oe, n, nfr_in, st, dt, tau, bias_nsub, d_g, d_e);
+    cudaMemcpy(gamma_out, d_g, b_g, cudaMemcpyDeviceToHost);
+    if (end_out != nullptr) cudaMemcpy(end_out, d_e, b_e, cudaMemcpyDeviceToHost);
+    cudaFree(d_oe); cudaFree(d_g); cudaFree(d_e);
+}
+
 // ---- RBF θ 敏度：S_f = ∂oe_f/∂θ（逐基 k，变分方程 + 同一 3/8-RK4；与 κ 敏度同结构）----
 // ∂f/∂θ_k = gveRhsFromAp_dev(oe, b_k(rv)·1e3)（b_k 为第 k 基加速度 km/s²→m/s²）；
 // A=∂f/∂oe 解析（gveRhsJacVal_dev；含 RBF 的位置依赖）。S 为 (6×m) 每星，(nfr,n,6,m)。
@@ -5171,7 +5821,10 @@ __device__ __forceinline__ double wrap_pi_dev(double x) {
 
 __global__ void winDynAsmKernel(const double *d_X, const double *d_end, const double *d_phi,
                                 const double *qingt, int n, int L, int off_dyn, int base_b,
-                                int q_perstar, const double *gcorr, double *A_val, double *b) {
+                                int q_perstar, const double *gcorr, const double *dbias,
+                                int beta_on, const double *d_beta_q, const double *d_gamma_int,
+                                int off_beta, int row_nnz, double *A_val, double *b) {
+    (void)off_beta;   // 列索引由 Python CSR 提供；核只写值
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;      // (k*n+i)
     const int nk = (L - 1) * n;
     if (idx >= nk) return;
@@ -5181,6 +5834,8 @@ __global__ void winDynAsmKernel(const double *d_X, const double *d_end, const do
     const double *xnext = d_X + ((size_t)(idx + n)) * 6;        // (k+1,i)
     const double *xe = d_end + (size_t)idx * 6;
     const double *Ph = d_phi + (size_t)idx * 36;
+    const double *bq = beta_on ? (d_beta_q + (size_t)idx * 3) : nullptr;
+    const double *Gm = beta_on ? (d_gamma_int + (size_t)idx * 18) : nullptr;
     double e[6];
     if (q_perstar == 2) {
         // fixed EKF 仿射约束 r = x_{k+1} − (x_pred − Φx_ref) − Φ·x_k：
@@ -5199,12 +5854,27 @@ __global__ void winDynAsmKernel(const double *d_X, const double *d_end, const do
 #pragma unroll
         for (int c = 0; c < 6; ++c) e[c] = xnext[c] - xe[c];
     }
+    // P1：显式区间偏差 Γβ（d_dyn_bias 非空时）。e = x_{k+1} − end − Γβ。
+    if (dbias != nullptr) {
+#pragma unroll
+        for (int c = 0; c < 6; ++c) e[c] -= dbias[(size_t)idx * 6 + c];
+    }
+    // 阶段1 in-band β：残差 e = x_{k+1} − end − Γ_k β_k；β 也作为变量。
+    if (beta_on) {
+#pragma unroll
+        for (int c = 0; c < 6; ++c) {
+            double s = 0.0;
+#pragma unroll
+            for (int l = 0; l < 3; ++l) s += Gm[c * 3 + l] * bq[l];
+            e[c] -= s;
+        }
+    }
     // 残差取最短角；wrap 在切点外导数为 1，下面的 Jacobian 仍是单位差，不改。
     e[1] = wrap_pi_dev(e[1]);   // u
     e[5] = wrap_pi_dev(e[5]);   // Ω
     for (int a = 0; a < 6; ++a) {
         const size_t row = (size_t)idx * 6 + a;
-        double *av = A_val + off_dyn + row * 12;
+        double *av = A_val + off_dyn + row * (size_t)row_nnz;
         double bb = 0.0;
 #pragma unroll
         for (int j = 0; j < 6; ++j) bb += q[a * 6 + j] * e[j];
@@ -5218,6 +5888,15 @@ __global__ void winDynAsmKernel(const double *d_X, const double *d_end, const do
         }
 #pragma unroll
         for (int cc = 0; cc < 6; ++cc) av[6 + cc] = q[a * 6 + cc];   // 节点 k+1 列：I 加权
+        if (beta_on) {                                          // β_k 列：−Qis·Γ_k
+#pragma unroll
+            for (int l = 0; l < 3; ++l) {
+                double s = 0.0;
+#pragma unroll
+                for (int j = 0; j < 6; ++j) s += q[a * 6 + j] * (-Gm[j * 3 + l]);
+                av[12 + l] = s;
+            }
+        }
     }
 }
 
@@ -5238,7 +5917,7 @@ double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const d
     const int threads = 256;
     const int nk = (c.L - 1) * c.n;
     double td = _now();
-    if (nk > 0) {
+    if (nk > 0 && !(c.beta_on && c.dyn_frozen)) {
         if (c.dyn_sub == 0) {
             // fixed EKF dyn: d_end/d_phi/d_qingt already set
         } else if (c.dyn_sub > 1)
@@ -5249,6 +5928,7 @@ double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const d
             gveStmDeviceGrpBeta(c.d_X, nk, c.dt, c.d_beta, c.d_end, c.d_phi);
         else
             gveStmDeviceGrp(c.d_X, nk, c.dt, 1.0, c.d_end, c.d_phi);   // 单步 φ + Φ（同一 3/8-RK4）
+        if (c.beta_on) c.dyn_frozen = 1;   // 阶段1：固定线性化点，后续只剩 x_{k+1} 变化
     }
     wt_dyn += _now() - td;
 
@@ -5268,12 +5948,17 @@ double winAssembleDevice(WinCtx &c, const double *hX, const double *hRv, const d
     if (nDYN > 0)
         winDynAsmKernel<<<(nk + threads - 1) / threads, threads>>>(
             c.d_X, c.d_end, c.d_phi, c.d_qingt, c.n, c.L, c.off_dyn, nISL + nGTS,
-            c.q_perstar, c.gauge_k > 0 ? c.d_gauge_corr : nullptr, A_val, b);
+            c.q_perstar, c.gauge_k > 0 ? c.d_gauge_corr : nullptr,
+            c.d_dyn_bias, c.beta_on, c.d_beta_q, c.d_gamma_int,
+            c.off_beta, c.dyn_row_nnz, A_val, b);
     const int ncol = c.ncol;
     if (ncol > 0 && !c.prior)
         jointDampKernel<<<(ncol + threads - 1) / threads, threads>>>(
             c.d_X, c.d_ctr, ncol, c.issq, c.off_damp, nISL + nGTS + nDYN, A_val, b);
-    cudaDeviceSynchronize();
+    cudaError_t _asm_err = cudaDeviceSynchronize();
+    if (_asm_err != cudaSuccess)
+        fprintf(stderr, "[winAssembleDevice] %s (beta_on=%d row_nnz=%d)\n",
+                cudaGetErrorString(_asm_err), c.beta_on, c.dyn_row_nnz);
     wt_asm += _now() - ta;
 
     double tr = _now();
@@ -5340,6 +6025,9 @@ __global__ void winGtsRes2Kernel(const double *d_rv, const int *gts_a, const dou
 
 __global__ void winDynRes2Kernel(const double *d_X, const double *d_end, const double *d_phi,
                                  const double *qingt, const double *gcorr,
+                                 const double *dbias,
+                                 int beta_on, const double *d_beta_q,
+                                 const double *d_gamma_int,
                                  int n, int L, int q_perstar, double *acc) {
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;      // (k*n+i)
     const int nk = (L - 1) * n;
@@ -5365,6 +6053,23 @@ __global__ void winDynRes2Kernel(const double *d_X, const double *d_end, const d
     } else {
 #pragma unroll
         for (int c2 = 0; c2 < 6; ++c2) dif[c2] = xnext[c2] - xe[c2];
+    }
+    // P1：与 winDynAsmKernel 同口径，代价/线搜索必须减去 Γβ。
+    if (dbias != nullptr) {
+#pragma unroll
+        for (int c2 = 0; c2 < 6; ++c2) dif[c2] -= dbias[(size_t)idx * 6 + c2];
+    }
+    // 阶段1 in-band β：与 winDynAsmKernel 同口径减 Γ_k β_k。
+    if (beta_on) {
+        const double *bq = d_beta_q + (size_t)idx * 3;
+        const double *Gm = d_gamma_int + (size_t)idx * 18;
+#pragma unroll
+        for (int c2 = 0; c2 < 6; ++c2) {
+            double s = 0.0;
+#pragma unroll
+            for (int l = 0; l < 3; ++l) s += Gm[c2 * 3 + l] * bq[l];
+            dif[c2] -= s;
+        }
     }
     double c = 0.0;
 #pragma unroll
@@ -5629,6 +6334,7 @@ double winTotalCostDevice(WinCtx &c, const double *d_pri_fac, const double *d_zp
         winDynRes2Kernel<<<(nk + threads - 1) / threads, threads>>>(
             c.d_X, c.d_end, c.d_phi, c.d_qingt,
             c.gauge_k > 0 ? c.d_gauge_corr : nullptr,
+            c.d_dyn_bias, c.beta_on, c.d_beta_q, c.d_gamma_int,
             c.n, c.L, c.q_perstar, c.d_res);
     if (prior_on && d_pri_fac && d_zp && prior_node >= 0 && prior_node < c.L)
         winPriorRes2Kernel<<<(c.n + threads - 1) / threads, threads>>>(
