@@ -1235,6 +1235,55 @@ __global__ void gveStepBetaKernel(const double* oe0, const double* betas, int n,
     for(int c = 0; c < 6; ++c) out[c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
 }
 
+// 外部加速度（部署力场）：GVE RHS = 已知摄动 + a_ext。a_ext 为空/0 时与 gveRhs_dev 逐位一致
+// （ap+0.0 在 IEEE 下恒等），因此零场路径不会引入偏差。
+__device__ __forceinline__ void gveRhsExt_dev(const double* OE, double beta,
+                                              const double* aext, double* out){
+    double rv[6]; oe2rv_dev(OE, rv);
+    double ap[3]; pertAccel_dev(rv, beta, ap);
+    if(aext != nullptr){ ap[0] += aext[0]; ap[1] += aext[1]; ap[2] += aext[2]; }
+    gveRhsFromAp_dev(OE, ap, out);
+}
+
+// 整弧多帧（逐星 κ + 外部加速度表）：ext 布局 [slot][star][3]，每 stride 帧换一个时隙
+// （180 s/180 s），时隙内保持常值（与训练口径一致）。
+__global__ void gvePropagateExtKernel(const double* oe0, const double* betas,
+                                      const double* ext, int n, int nfr, double dt,
+                                      int stride, int nslot, double* rv_all){
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if(idx >= n) return;
+    const double beta = (betas == nullptr) ? 1.0 : betas[idx];
+    const double* y0 = oe0 + 6*idx;
+    double y[6], k1[6], k2[6], k3[6], k4[6], tmp[6], rv[6];
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) y[c] = y0[c];
+    oe2rv_dev(y, rv);
+    #pragma unroll
+    for(int c = 0; c < 6; ++c) rv_all[((size_t)0*n + idx)*6 + c] = rv[c];
+    const int st = (stride > 0) ? stride : 1;
+    for(int f = 1; f < nfr; ++f){
+        int slot = (f - 1) / st;
+        if(slot > nslot - 1) slot = nslot - 1;
+        const double* ae = (ext == nullptr) ? nullptr
+                          : (ext + ((size_t)slot*n + idx)*3);
+        gveRhsExt_dev(y, beta, ae, k1);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*k1[c]/3.0;
+        gveRhsExt_dev(tmp, beta, ae, k2);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(-k1[c]/3.0 + k2[c]);
+        gveRhsExt_dev(tmp, beta, ae, k3);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) tmp[c] = y[c] + dt*(k1[c] - k2[c] + k3[c]);
+        gveRhsExt_dev(tmp, beta, ae, k4);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) y[c] = y[c] + dt*(k1[c] + 3.0*k2[c] + 3.0*k3[c] + k4[c])/8.0;
+        oe2rv_dev(y, rv);
+        #pragma unroll
+        for(int c = 0; c < 6; ++c) rv_all[((size_t)f*n + idx)*6 + c] = rv[c];
+    }
+}
+
 // 整弧多帧：每星一个线程，链式 nfr-1 次单步 3/8-RK4，输出每帧 rv（m, m/s），布局 [f][i]。
 __global__ void gvePropagateKernel(const double* oe0, int n, int nfr, double dt, double beta, double* rv_all){
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1473,6 +1522,15 @@ __global__ void stmFoldJ2Kernel(const double* oe0, int n, int nfr, double dt,
             for(int q = 0; q < 36; ++q) Po[q] = ((const double*)Phi)[q];
         }
     }
+}
+
+// 阻力表 host 状态提前声明：STM 折叠核（定义在此函数之后）也要用它选择逐星 β。
+static int g_drag_mode_host = 0;
+static std::vector<double> g_drag_beta_host;
+
+// 表模式下若已设逐星 beta，则标量接口自动改用逐星核（beta 参数被忽略）。
+static bool _useTableBeta(int n){
+    return g_drag_mode_host == 1 && g_drag_beta_host.size() == (std::size_t)n;
 }
 
 namespace qoejopt {
@@ -2247,7 +2305,19 @@ __global__ void stmFoldGveBetaKernel(const double *oe0, const double *betas, int
 
 void stmFoldGveDevice(const double *d_oe, int n, int nfr, double dt, double beta, double *d_A) {
     const int threads = 256, blocks = (n + threads - 1) / threads;
-    stmFoldGveKernel<<<blocks, threads>>>(d_oe, n, nfr, dt, 1, beta, d_A, nullptr, nullptr);
+    // 表模式：与状态传播一致，用表里的逐星 β 做 STM（否则基态带表、雅可比带 β=1）。
+    static thread_local double *db = nullptr; static thread_local size_t cb = 0;
+    const double *betas = nullptr;
+    if(_useTableBeta(n)){
+        const size_t bb = (size_t)n*sizeof(double);
+        if(bb > cb){ if(db) cudaFree(db); db = nullptr; cudaMalloc(&db, bb); cb = bb; }
+        cudaMemcpy(db, g_drag_beta_host.data(), bb, cudaMemcpyHostToDevice);
+        betas = db;
+    }
+    if(betas)
+        stmFoldGveBetaKernel<<<blocks, threads>>>(d_oe, betas, n, nfr, dt, 1, d_A, nullptr, nullptr);
+    else
+        stmFoldGveKernel<<<blocks, threads>>>(d_oe, n, nfr, dt, 1, beta, d_A, nullptr, nullptr);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) fprintf(stderr, "[stmFoldGveDevice] %s\n", cudaGetErrorString(err));
 }
@@ -2466,8 +2536,6 @@ std::vector<double> getThirdBodyEphemInfoCuda(){
 // ---- 可学习阻力模型（CUDA）：高度分段常数密度表 + 逐星 beta ----
 // h_lo_m/h_hi_m：最低/最高地心高度（m）；rho：分箱密度（kg/m³，索引 0=最低箱）；
 // beta：逐星阻力倍率（长度 N；空或长度 1 → 广播）。表模式下 tbp_dev / cartRhsDev 同式使用。
-static int g_drag_mode_host = 0;
-static std::vector<double> g_drag_beta_host;
 void setDragTable(double h_lo_m, double h_hi_m, const std::vector<double> &rho,
                   const std::vector<double> &beta){
     if(rho.empty()) throw std::runtime_error("setDragTable: rho 为空");
@@ -2844,11 +2912,6 @@ void gveRhsFromApBatch(const std::vector<Vector6d> &oe, const std::vector<double
     cudaFree(d0); cudaFree(da); cudaFree(do_);
 }
 
-// 表模式下若已设逐星 beta，则标量接口自动改用逐星核（beta 参数被忽略）。
-static bool _useTableBeta(int n){
-    return g_drag_mode_host == 1 && g_drag_beta_host.size() == (std::size_t)n;
-}
-
 // 设定 CUDA RBF 力场（整星共享）：中心（km）/宽度 s（km）/权重 θ。centers 空 → 关闭。
 // 中心/宽度/个数写 constant（一次），权重写 device 全局（每外环迭代调用一次即可）。
 void setRbfCuda(const std::vector<std::array<double,3>> &centers, double s,
@@ -3074,6 +3137,45 @@ void gvePropagateNoeBatchBeta(const std::vector<Vector6d> &oe0s, const std::vect
     _t = _now();
     cudaMemcpy(rv_all.data(), drv, brv, cudaMemcpyDeviceToHost);
     g_gve_d2h += _now() - _t;
+}
+
+// 外部加速度表（部署力场）多帧链式前向：ext=(nslot,n,3) m/s²，每 stride 帧一个时隙。
+void gvePropagateExtBatch(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                          const std::vector<double> &ext, int nfr, double dt, int stride,
+                          int nslot, int nthreads, std::vector<double> &rv_all){
+    (void)nthreads;
+    using clk = std::chrono::steady_clock;
+    auto _now = []{ return std::chrono::duration<double>(clk::now().time_since_epoch()).count(); };
+    const int n = (int)oe0s.size();
+    rv_all.assign((size_t)nfr * n * 6, 0.0);
+    if(n == 0 || nfr <= 0) return;
+    if(stride < 1) throw std::runtime_error("gvePropagateExtBatch: stride < 1");
+    if(!ext.empty() && (std::size_t)nslot * n * 3 != ext.size())
+        throw std::runtime_error("gvePropagateExtBatch: ext 需 (nslot,n,3)");
+    static thread_local std::vector<double> h0, hb;
+    h0.resize((size_t)n * 6); hb.resize((size_t)n);
+    for(int i = 0; i < n; ++i){
+        for(int c = 0; c < 6; ++c) h0[(size_t)i*6 + c] = oe0s[i](c);
+        hb[(size_t)i] = (betas.size() == (size_t)n) ? betas[i]
+                        : (betas.empty() ? 1.0 : betas[0]);
+    }
+    static thread_local double *d0 = nullptr, *db = nullptr, *de = nullptr, *drv = nullptr;
+    static thread_local size_t c0 = 0, cb = 0, ce = 0, crv = 0;
+    const size_t b0 = (size_t)n*6*sizeof(double), bb = (size_t)n*sizeof(double),
+                 be = ext.size()*sizeof(double), brv = (size_t)nfr*n*6*sizeof(double);
+    if(b0 > c0){ if(d0) cudaFree(d0); d0 = nullptr; cudaMalloc(&d0, b0); c0 = b0; }
+    if(bb > cb){ if(db) cudaFree(db); db = nullptr; cudaMalloc(&db, bb); cb = bb; }
+    if(be > ce){ if(de) cudaFree(de); de = nullptr; if(be) cudaMalloc(&de, be); ce = be; }
+    if(brv > crv){ if(drv) cudaFree(drv); drv = nullptr; cudaMalloc(&drv, brv); crv = brv; }
+    cudaMemcpy(d0, h0.data(), b0, cudaMemcpyHostToDevice);
+    cudaMemcpy(db, hb.data(), bb, cudaMemcpyHostToDevice);
+    if(be) cudaMemcpy(de, ext.data(), be, cudaMemcpyHostToDevice);
+    const int threads = 256, blocks = (n + threads - 1) / threads;
+    gvePropagateExtKernel<<<blocks, threads>>>(d0, db, be ? de : nullptr, n, nfr, dt,
+                                               stride, nslot, drv);
+    cudaError_t err = cudaDeviceSynchronize();
+    if(err != cudaSuccess) fprintf(stderr, "[gvePropagateExtBatch] %s\n", cudaGetErrorString(err));
+    cudaMemcpy(rv_all.data(), drv, brv, cudaMemcpyDeviceToHost);
 }
 
 // 解析两体 STM 折叠（GPU 版 stateStmFoldBatch）：rv0(n,6) + A0(n,36) → A（平铺 nfr*n*18）。
@@ -4462,7 +4564,16 @@ void gveStmDeviceGrp(const double *d_oe, int n, double dt, double beta, double *
     const int threads = 192;   // 32 星/块
     const int total = n * 6;
     const int blocks = (total + threads - 1) / threads;
-    gveStmKernelGrp<<<blocks, threads>>>(d_oe, n, dt, beta, nullptr, d_oef, d_Phi);
+    // 表模式：dyn STM 与普通帧展开共用同一组逐星 β（含 substeps 路径）。
+    static thread_local double *db = nullptr; static thread_local size_t cb = 0;
+    const double *betas = nullptr;
+    if(_useTableBeta(n)){
+        const size_t bb = (size_t)n*sizeof(double);
+        if(bb > cb){ if(db) cudaFree(db); db = nullptr; cudaMalloc(&db, bb); cb = bb; }
+        cudaMemcpy(db, g_drag_beta_host.data(), bb, cudaMemcpyHostToDevice);
+        betas = db;
+    }
+    gveStmKernelGrp<<<blocks, threads>>>(d_oe, n, dt, beta, betas, d_oef, d_Phi);
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) fprintf(stderr, "[gveStmDeviceGrp] %s\n", cudaGetErrorString(err));
 }

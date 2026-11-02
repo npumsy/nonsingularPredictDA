@@ -809,6 +809,28 @@ PYBIND11_MODULE(qoe, m)
             return O;
             }, py::arg("oe"), py::arg("betas"), py::arg("nfr"), py::arg("dt"), py::arg("nthreads")=16,
             "整弧多帧 GVE（CUDA，逐星 κ）：(n,6),(n,) → rv (nfr,n,6)");
+      m.def("gvePropagateExtFlat",
+            [&](py::array_t<double, py::array::c_style | py::array::forcecast> oe,
+                py::array_t<double, py::array::c_style | py::array::forcecast> betas,
+                py::array_t<double, py::array::c_style | py::array::forcecast> ext,
+                int nfr, double dt, int stride, int nthreads){
+            std::vector<Vector6d> v = _v6_from_np(oe, "gvePropagateExtFlat");
+            auto bb = betas.request(); auto be = ext.request();
+            std::vector<double> bv(static_cast<double*>(bb.ptr),
+                                   static_cast<double*>(bb.ptr) + bb.size);
+            std::vector<double> ev(static_cast<double*>(be.ptr),
+                                   static_cast<double*>(be.ptr) + be.size);
+            const int n = (int)v.size();
+            const int nslot = (ev.empty() || n <= 0) ? 0 : (int)(ev.size() / ((size_t)n*3));
+            std::vector<double> rv_all;
+            { py::gil_scoped_release release;
+              kep3::gvePropagateExtBatch(v, bv, ev, nfr, dt, stride, nslot, nthreads, rv_all); }
+            py::array_t<double> O({(std::size_t)nfr, (std::size_t)n, (std::size_t)6});
+            std::memcpy(O.mutable_data(), rv_all.data(), rv_all.size()*sizeof(double));
+            return O;
+            }, py::arg("oe"), py::arg("betas"), py::arg("ext"), py::arg("nfr"),
+            py::arg("dt"), py::arg("stride")=1, py::arg("nthreads")=16,
+            "整弧多帧 GVE（CUDA，逐星 κ + 外部加速度表）：(n,6),(n,),(nslot,n,3) → rv (nfr,n,6)");
       m.def("stmFoldGpuFlat",
             [&](py::array_t<double, py::array::c_style | py::array::forcecast> rv0, int nfr, double dt,
                 py::array_t<double, py::array::c_style | py::array::forcecast> A0, int nthreads){

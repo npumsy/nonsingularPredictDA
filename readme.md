@@ -7,14 +7,17 @@
 功能包括：
 
 - 使用轨道元素和笛卡尔状态
-- 经典轨道元素和非奇异轨道元素的 OE，考虑光滑轨道元素与均值元素之间的转换
-- 状态协方差，以及从元素到 r、v 向量的雅可比矩阵
-- 状态转移矩阵，采用拉格朗日解析方法
+- 状态协方差，以及从元素到 r、v 向量的雅可比矩阵, 状态转移矩阵，采用拉格朗日解析方法
+- 经典轨道元素和非奇异轨道元素的 OE，考虑OscQOE和MeanQOE之间的转换及其解析propagation
 - 基于 RK8(7) 和 RK4(5) 的 ODE 传播，支持可变步长或固定步长
-- C++ 库和 Python 库 `qoe`，可在脚本中使用
+- DACE based Taylor expension of ODE initial state's manifold 
 - 部分内容（如 dastate.cpp）基于微分代数库 [DACE](https://github.com/dacelib/dace)，用于高阶 ODE 状态误差和 STM 的传播
-- cuda实现constellation N颗卫星轨道Two-Body cart坐标的cuda单步RK4 State transform 以及STM，qoe-GVE的版本
-- pybind11返回用于pytorch接入
+- cuda实现constellation N颗卫星轨道的cuda单步RK4 State transform 以及STM，qoe-GVE的版本
+- 大规模节点相互测距的自主Orbit Determination实现，节点邻域Block划分批量优化与整体Consensus
+- BatchOptimization问题的Assembly、Baspacho优化算法接入。基于固定滞后平滑FLS、批量滑窗优化、Schur补跨窗先验信息传递
+- Batch/MultipleShooting GVE约束的Propagation及其状态Optimization
+- sensitivity OF 加速度残差模型，类似GTSAM的Bias Integration，时间分辨率固定180s，可提供Jac/DA的梯度解析反向传播
+- pybind11返回  C++ 库和 Python 库 `qoe` `qoejopt`，可在python脚本中使用用于pytorch接入, 作为Learning的core library
 - 部分内容（主要是 kepler.cpp）基于 [pykep](https://esa.github.io/pykep/)，用于轨道元素转换，并参考了刘林、侯西云等编著的南京大学《轨道力学基础》
 
 

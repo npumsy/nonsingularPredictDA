@@ -181,6 +181,12 @@ void gvePropagateNoeBatch(const std::vector<Vector6d> &oe0s, int nfr, double dt,
 void gvePropagateNoeBatchBeta(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
                               int nfr, double dt, int nthreads, std::vector<double> &rv_all);
 
+// 外部加速度表（部署力场）：`ext` 为 (nslot,n,3) 的 ECI 加速度 m/s²，第 k 个时隙在
+// 链式步进的前 `stride` 帧内保持不变（180 s = 3 帧）。`ext` 为空 → 等价于 beta 传播。
+void gvePropagateExtBatch(const std::vector<Vector6d> &oe0s, const std::vector<double> &betas,
+                          const std::vector<double> &ext, int nfr, double dt, int stride,
+                          int nslot, int nthreads, std::vector<double> &rv_all);
+
 // 多重打靶 chunk 并行前向：rv0s=(n,6, m)，L 帧一 chunk，二体解析热启动 + 全动力学推 L 帧，输出 rv (nfr,n,6)。
 void gvePropagateChunkBatch(const std::vector<Vector6d> &rv0s, int nfr, int L, double dt, double beta,
                             std::vector<double> &rv_all);
