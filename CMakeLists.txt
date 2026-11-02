@@ -96,6 +96,13 @@ target_link_libraries(qoejopt PRIVATE qoe_core OpenMP::OpenMP_CXX CUDA::cudart C
 target_include_directories(qoejopt PRIVATE ${PROJECT_SOURCE_DIR}/include)
 set_target_properties(qoejopt PROPERTIES BUILD_RPATH "$ORIGIN")
 
+
+# --- 集中式精确协方差 EKF（--ekf-central）：2 个 pybind 入口 ---
+pybind11_add_module(ekf_central src/ekf_central.cu)
+target_link_libraries(ekf_central PRIVATE qoe_core CUDA::cudart CUDA::cublas CUDA::cusolver)
+target_include_directories(ekf_central PRIVATE ${PROJECT_SOURCE_DIR}/include)
+set_target_properties(ekf_central PROPERTIES BUILD_RPATH "$ORIGIN")
+
 # qoefls：FLS 固定滞后平滑 C++ 核心（factor/滑窗/边缘化全在 C++）。
 # 链 qoe_core（GVE 核）+ torch + BaSpaCho（theseus/baspacho 构建产物）。
 list(APPEND CMAKE_PREFIX_PATH
@@ -154,6 +161,16 @@ target_link_libraries(gtest_bias dastate qoe_core dace::dace GTest::gtest GTest:
 target_link_libraries(gtest_bias OpenMP::OpenMP_CXX CUDA::cudart)
 target_include_directories(gtest_bias PRIVATE ${PROJECT_SOURCE_DIR}/include /usr/include/eigen3)
 set_target_properties(gtest_bias PROPERTIES BUILD_RPATH "${DACE_LIBDIR}")
+
+# --- 集中式精确协方差 EKF：CUDA core（gtest 用，不含 pybind）+ 单一 gtest ---
+add_library(ekf_central_core STATIC src/ekf_central.cu)
+target_compile_definitions(ekf_central_core PRIVATE EKF_CENTRAL_NO_PYBIND)
+target_link_libraries(ekf_central_core PUBLIC qoe_core CUDA::cudart CUDA::cublas CUDA::cusolver)
+target_include_directories(ekf_central_core PUBLIC ${PROJECT_SOURCE_DIR}/include)
+
+add_executable(gtest_ekf_central test/test_ekf_central_gtest.cpp)
+target_link_libraries(gtest_ekf_central ekf_central_core GTest::gtest GTest::gtest_main)
+target_include_directories(gtest_ekf_central PRIVATE ${PROJECT_SOURCE_DIR}/include /usr/include/eigen3)
 
 # --- gtest：FLS 逐星边缘核（P1'）——合成小例落盘 + 与同算法 host 参考对拍
 #     + 真实规模核计时 + 求解链（SymbolicDecomposition/add_MtM/factor/solve）耗时归因（glog 输出）---

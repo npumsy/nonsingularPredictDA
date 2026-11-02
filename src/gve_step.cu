@@ -6633,6 +6633,89 @@ __device__ __forceinline__ void inv6(const double *A, double *Ainv) {
 #pragma unroll
         for (int j = 0; j < 6; ++j) Ainv[i * 6 + j] = M[i][6 + j];
 }
+// 集中式 EKF：QOE 空间过程噪声 Q（7x7/星）+ 外部加速度一阶修正（全 GPU）。
+__global__ void qoeQKernel(const double *X, int n, double q_acc, double qb, double *Q) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double y[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = X[i * 6 + c];
+    Dual6 OD[6];
+#pragma unroll
+    for (int j = 0; j < 6; ++j) OD[j] = d6_var(y[j], j);
+    Dual6 xd[6]; oe2rv_d_dev(OD, xd);
+    double J[36], Ji[36];
+#pragma unroll
+    for (int c = 0; c < 6; ++c)
+#pragma unroll
+        for (int j = 0; j < 6; ++j) J[c * 6 + j] = xd[c].d[j];
+    inv6(J, Ji);
+    double Qrv[36] = {0.0};
+    const double dt2 = 100.0, dt3 = 1000.0, dt4 = 10000.0;
+#pragma unroll
+    for (int a = 0; a < 3; ++a) {
+        Qrv[a * 6 + a] = q_acc * dt4 / 4.0;
+        Qrv[(a + 3) * 6 + a + 3] = q_acc * dt2;
+        Qrv[a * 6 + a + 3] = Qrv[(a + 3) * 6 + a] = q_acc * dt3 / 2.0;
+    }
+    double *Qh = Q + (size_t)i * 49;
+#pragma unroll
+    for (int k = 0; k < 49; ++k) Qh[k] = 0.0;
+    for (int a = 0; a < 6; ++a)
+        for (int b = 0; b < 6; ++b) {
+            double v = 0.0;
+            for (int c = 0; c < 6; ++c)
+                for (int d = 0; d < 6; ++d) v += Ji[a * 6 + c] * Qrv[c * 6 + d] * Ji[b * 6 + d];
+            Qh[a * 7 + b] = v;
+        }
+#pragma unroll
+    for (int a = 0; a < 6; ++a) Qh[a * 7 + a] += 1e-10;
+    Qh[48] = qb;
+}
+__global__ void qoeExtKernel(double *X, const double *ext, int n, double dt) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    double y[6];
+#pragma unroll
+    for (int c = 0; c < 6; ++c) y[c] = X[i * 6 + c];
+    Dual6 OD[6];
+#pragma unroll
+    for (int j = 0; j < 6; ++j) OD[j] = d6_var(y[j], j);
+    Dual6 xd[6]; oe2rv_d_dev(OD, xd);
+    double J[36], Ji[36];
+#pragma unroll
+    for (int c = 0; c < 6; ++c)
+#pragma unroll
+        for (int j = 0; j < 6; ++j) J[c * 6 + j] = xd[c].d[j];
+    inv6(J, Ji);
+    double dr[6];
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        dr[k] = 0.5 * ext[i * 3 + k] * dt * dt;
+        dr[k + 3] = ext[i * 3 + k] * dt;
+    }
+#pragma unroll
+    for (int a = 0; a < 6; ++a) {
+        double v = 0.0;
+#pragma unroll
+        for (int b = 0; b < 6; ++b) v += Ji[a * 6 + b] * dr[b];
+        X[i * 6 + a] += v;
+    }
+}
+void qoeQIsoDevice(const double *d_oe, int n, double q_acc, double qb, double *d_Q) {
+    const int threads = 128, blocks = (n + threads - 1) / threads;
+    qoeQKernel<<<blocks, threads>>>(d_oe, n, q_acc, qb, d_Q);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) fprintf(stderr, "[qoeQIsoDevice] %s\n", cudaGetErrorString(err));
+}
+void qoeExtDevice(const double *d_oe, const double *d_ext, int n, double dt, double *d_q) {
+    const int threads = 128, blocks = (n + threads - 1) / threads;
+    qoeExtKernel<<<blocks, threads>>>(d_q, d_ext, n, dt);
+    (void)d_oe;
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) fprintf(stderr, "[qoeExtDevice] %s\n", cudaGetErrorString(err));
+}
+
 // 6×6 对称 Jacobi 特征分解（与 `_host_info_fac` 同口径）
 __device__ __forceinline__ void eigh6_sym(const double *A, double *w, double *V) {
     double a[6][6], v[6][6];

@@ -87,6 +87,11 @@ void oe2rvJacHost(const double *h_X, int n, double *h_rv, double *h_J);
 // 两体 STM 折叠：d_rv0,d_A0 -> d_A（nfr*n*18）。
 void jointStmFoldDevice(Ctx &c);
 
+// 集中式 EKF 的 GPU 侧 Q（QOE，7x7/星）与外部加速度一阶修正：
+// d_Q = Ji Qrv Ji^T（+1e-10 diag，Qh[6,6]=qb）；d_q += J^{-1}[0.5 a dt^2; a dt]。
+void qoeQIsoDevice(const double *d_oe, int n, double q_acc, double qb, double *d_Q);
+void qoeExtDevice(const double *d_oe, const double *d_ext, int n, double dt, double *d_q);
+
 // 展开 + 装配：写 A_val/b（device 指针，可空表示不写），返回 visible-ISL 残差平方和 res2。
 double jointAssembleInto(Ctx &c, double *A_val, double *b);
 
