@@ -213,7 +213,7 @@ CaseRun run_case(const Sim &s, int joseph, int do_diag, int frame = 1) {
     ekf_central::Params p = s.p; p.joseph = joseph;
     DevBuf<double> q(s.q0), b(s.b0), c(s.c0), P(s.P0z);
     ekf_central::predict(p, s.edges.data(), s.gts.data(), nullptr, q.p, b.p, c.p, P.p,
-                         1, frame, do_diag, &r.pr);
+                         nullptr, 1, frame, do_diag, &r.pr);
     P.to(r.Ppred); q.to(r.qpred);
     ekf_central::update(s.D_isl.data(), s.M_isl.data(), s.D_gts.data(), s.M_gts.data(),
                         s.Qgts.data(), frame, do_diag, &r.up);

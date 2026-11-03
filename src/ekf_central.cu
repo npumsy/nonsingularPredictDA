@@ -32,6 +32,7 @@ struct Ctx {
     double phi_b = 0.0, qb = 0.0, phi_c = 0.0, qc = 0.0;
     // state pointers (Python torch CUDA tensors)
     double *d_q = nullptr, *d_b = nullptr, *d_c = nullptr, *d_P = nullptr;
+    double *d_g = nullptr;  // 方法二规范状态（ng=0 时为空）
     // work
     double *d_Ptmp = nullptr, *d_Ptmp2 = nullptr, *d_A = nullptr, *d_H = nullptr, *d_PHt = nullptr,
            *d_PHtT = nullptr, *d_S = nullptr, *d_Kt = nullptr, *d_K = nullptr,
@@ -180,6 +181,52 @@ __global__ void fpft_kernel(int n, int M, int ns, const double *P, double *Pout,
     }
 }
 
+// 方法二：规范状态 g（末尾 ng 维）的协方差预测。F_g=I、Q_g=0；
+// 与节点/站的互协方差按该节点/站的 Fz、phi_b、phi_c 传播。
+__global__ void fpft_gauge_kernel(int n, int M, int ns, int ng, const double *P, double *Pout,
+                                  const double *Phi, double phi_b, double phi_c) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n + M) return;
+    const int g0 = ns - ng;
+    if (idx < n) {
+        const int i = idx, o = 7 * i;
+        double Fz[6][6];
+        for (int a = 0; a < 6; ++a)
+            for (int b = 0; b < 6; ++b)
+                Fz[a][b] = Phi[i * 36 + a * 6 + b] * ((b == 0) ? DU : 1.0) / ((a == 0) ? DU : 1.0);
+        for (int t = 0; t < ng; ++t) {
+            const int gc = g0 + t;
+            double v[6], w[6];
+            for (int a = 0; a < 6; ++a) {
+                double s1 = 0.0, s2 = 0.0;
+                for (int c = 0; c < 6; ++c) {
+                    s1 += Fz[a][c] * P[(o + c) + (size_t)gc * ns];
+                    s2 += Fz[a][c] * P[gc + (size_t)(o + c) * ns];
+                }
+                v[a] = s1; w[a] = s2;
+            }
+            for (int a = 0; a < 6; ++a) {
+                Pout[(o + a) + (size_t)gc * ns] = v[a];
+                Pout[gc + (size_t)(o + a) * ns] = w[a];
+            }
+            Pout[(o + 6) + (size_t)gc * ns] = phi_b * P[(o + 6) + (size_t)gc * ns];
+            Pout[gc + (size_t)(o + 6) * ns] = phi_b * P[gc + (size_t)(o + 6) * ns];
+        }
+    } else {
+        const int s = idx - n, o = 7 * n + s;
+        for (int t = 0; t < ng; ++t) {
+            const int gc = g0 + t;
+            Pout[o + (size_t)gc * ns] = phi_c * P[o + (size_t)gc * ns];
+            Pout[gc + (size_t)o * ns] = phi_c * P[gc + (size_t)o * ns];
+        }
+    }
+    if (idx == 0) {
+        for (int t = 0; t < ng; ++t)
+            for (int u = 0; u < ng; ++u)
+                Pout[(g0 + t) + (size_t)(g0 + u) * ns] = P[(g0 + t) + (size_t)(g0 + u) * ns];
+    }
+}
+
 __global__ void transpose_kernel(int rows, int cols, const double *A, double *At) {
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     int total = rows * cols;
@@ -224,6 +271,7 @@ __global__ void h_assemble_kernel(int n, int M, int E, int G, int nrows, int nst
                                   const double *Disl, const double *Misl,
                                   const double *Dgts, const double *Mgts, const double *Qgts,
                                   const double *b, const double *c,
+                                  const double *gst, int ng, double gauge_rref,
                                   double *H, double *nu, double *hval) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row >= nrows) return;
@@ -254,8 +302,19 @@ __global__ void h_assemble_kernel(int n, int M, int E, int G, int nrows, int nst
         const int k = row - E;
         if (Mgts[k] <= 0.5) { nu[row] = 0.0; return; }
         const int i = ga[k], s = gs[k];
+        // 方法二：GTS 的几何点取 r_i(q)+t_g+θ_g(z×r_i)；ISL 对 g 严格不变（旋转保距、
+        // 平移相消），故 ISL 行 g 列为 0。a_is=[u, u·(z×r_i)/R_ref]（g_4=θ·R_ref）。
+        const double zc[3] = {0.0, 0.0, 1.0};
+        double rc[3];
+        const double th = (ng > 0) ? gst[3] / gauge_rref : 0.0;
+        const double zr[3] = {zc[1] * rv[i * 6 + 2] - zc[2] * rv[i * 6 + 1],
+                              zc[2] * rv[i * 6 + 0] - zc[0] * rv[i * 6 + 2],
+                              zc[0] * rv[i * 6 + 1] - zc[1] * rv[i * 6 + 0]};
+        for (int x = 0; x < 3; ++x) {
+            rc[x] = rv[i * 6 + x] + ((ng > 0) ? gst[x] : 0.0) + th * zr[x];
+        }
         double d[3], dist = 0.0;
-        for (int x = 0; x < 3; ++x) { d[x] = rv[i * 6 + x] - Qgts[k * 3 + x]; dist += d[x] * d[x]; }
+        for (int x = 0; x < 3; ++x) { d[x] = rc[x] - Qgts[k * 3 + x]; dist += d[x] * d[x]; }
         dist = sqrt(dist); double u[3];
         for (int x = 0; x < 3; ++x) u[x] = d[x] / (dist + 1e-12);
         for (int a = 0; a < 6; ++a) {
@@ -269,6 +328,14 @@ __global__ void h_assemble_kernel(int n, int M, int E, int G, int nrows, int nst
         H[row + (7 * n + s) * nrows] = -1.0;
         hval[row * 16 + 6] = 1.0;
         hval[row * 16 + 7] = -1.0;
+        if (ng > 0) {
+            const double a4 = (u[0] * zr[0] + u[1] * zr[1] + u[2] * zr[2]) / gauge_rref;
+            for (int t = 0; t < ng; ++t) {
+                const double hv = (t < 3) ? u[t] : a4;
+                H[row + (nstate - ng + t) * nrows] = hv;
+                hval[row * 16 + 8 + t] = hv;
+            }
+        }
         nu[row] = Dgts[k] - (dist + b[i] - c[s]);
     }
 }
@@ -453,7 +520,8 @@ __global__ void add_shift_diag_kernel(int ns, double *P, double shift) {
     if (k < ns) P[k + (size_t)k * ns] += shift;
 }
 
-__global__ void state_add_kernel(int n, int M, const double *dx, double *q, double *b, double *c) {
+__global__ void state_add_kernel(int n, int M, int ng, const double *dx, double *q, double *b,
+                                 double *c, double *g) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
         // dx 在归一化 z 空间：a 分量乘回 DU（x = S z）
@@ -462,6 +530,8 @@ __global__ void state_add_kernel(int n, int M, const double *dx, double *q, doub
         b[i] += dx[7 * i + 6];
     } else if (i < n + M) {
         int s = i - n; c[s] += dx[7 * n + s];
+    } else if (i == n + M && ng > 0) {
+        for (int t = 0; t < ng; ++t) g[t] += dx[7 * n + M + t];
     }
 }
 
@@ -538,7 +608,7 @@ void _alloc_ctx() {
 }
 
 void _upload_edges(const int *edges, const int *gts) {
-    const int n = g.p.n, E = g.p.E, G = g.p.G, NR = g.p.nrows;
+    const int n = g.p.n, M = g.p.M, E = g.p.E, G = g.p.G, NR = g.p.nrows;
     std::vector<int> ei(E), ej(E), ga(G), gs(G);
     for (int k = 0; k < E; ++k) { ei[k] = edges[2 * k]; ej[k] = edges[2 * k + 1]; }
     for (int k = 0; k < G; ++k) { ga[k] = gts[2 * k]; gs[k] = gts[2 * k + 1]; }
@@ -559,6 +629,9 @@ void _upload_edges(const int *edges, const int *gts) {
         const int row = E + k, i = ga[k], s = gs[k];
         for (int a = 0; a < 7; ++a) idx[(size_t)row * 16 + a] = 7 * i + a;
         idx[(size_t)row * 16 + 7] = 7 * n + s;
+        // 方法二：GTS 行的 g 列（ISL 行恒为 0，不登记）。
+        for (int t = 0; t < g.p.ng; ++t)
+            idx[(size_t)row * 16 + 8 + t] = 7 * n + M + t;
     }
     cudaMemcpy(g.d_hidx, idx.data(), (size_t)NR * 16 * 4, cudaMemcpyHostToDevice);
 }
@@ -568,12 +641,12 @@ void _upload_edges(const int *edges, const int *gts) {
 void release() { _free_ctx(); }
 
 void predict(const Params& pin, const int* edges, const int* gts, const double* ext,
-             double* q, double* b, double* c, double* P,
+             double* q, double* b, double* c, double* P, double* gst,
              int init, int frame, int do_diag, PredictResult* out) {
     Params p = pin;
-    p.nstate = 7 * p.n + p.M; p.nrows = p.E + p.G;
+    p.nstate = 7 * p.n + p.M + p.ng; p.nrows = p.E + p.G;
     const bool dims_changed = !g.init || g.p.n != p.n || g.p.M != p.M || g.p.E != p.E ||
-                              g.p.G != p.G || g.p.fp32 != p.fp32;
+                              g.p.G != p.G || g.p.fp32 != p.fp32 || g.p.ng != p.ng;
     if (dims_changed) _free_ctx();
     g.p = p;
     g.phi_b = std::exp(-10.0 / p.tau_b);
@@ -582,7 +655,7 @@ void predict(const Params& pin, const int* edges, const int* gts, const double* 
     g.qc = p.sigma_c * p.sigma_c * (1 - g.phi_c * g.phi_c);
     if (!g.init) _alloc_ctx();
     if (init || dims_changed) _upload_edges(edges, gts);
-    g.d_q = q; g.d_b = b; g.d_c = c; g.d_P = P;
+    g.d_q = q; g.d_b = b; g.d_c = c; g.d_P = P; g.d_g = gst;
     const int n = p.n, M = p.M;
     cudaEventRecord(g.ev[0]);
     // GVE 3/8-RK4 状态 + 变分 STM：与批处理同一 tbp/RHS、同一 drag table 与逐星 β。
@@ -612,6 +685,10 @@ void predict(const Params& pin, const int* edges, const int* gts, const double* 
             fpft_kernel<<<gss, 49>>>(n, M, ns, g.d_P, g.d_Ptmp, g.d_Phi, g.d_Q,
                                      g.phi_b, g.phi_c, g.qc, n, n);
         }
+        if (p.ng > 0) {
+            fpft_gauge_kernel<<<(n + M + 127) / 128, 128>>>(
+                n, M, ns, p.ng, g.d_P, g.d_Ptmp, g.d_Phi, g.phi_b, g.phi_c);
+        }
     }
     symmetrize_kernel<<<256, 256>>>(g.p.nstate, g.d_Ptmp);
     cudaEventRecord(g.ev[2]);
@@ -627,6 +704,7 @@ void predict(const Params& pin, const int* edges, const int* gts, const double* 
     count_nonfinite_kernel<<<256, 256>>>((size_t)n * 6, g.d_q, g.d_nf);
     count_nonfinite_kernel<<<256, 256>>>((size_t)n, g.d_b, g.d_nf);
     count_nonfinite_kernel<<<256, 256>>>((size_t)M, g.d_c, g.d_nf);
+    if (g.p.ng > 0) count_nonfinite_kernel<<<1, 32>>>((size_t)g.p.ng, g.d_g, g.d_nf);
     cudaMemcpy(&snf, g.d_nf, 4, cudaMemcpyDeviceToHost);
     {
         std::vector<double> dg(g.p.nstate);
@@ -672,6 +750,7 @@ void update(const double* D_isl, const double* M_isl,
     h_assemble_kernel<<<(NR + 127) / 128, 128>>>(n, M, E, G, NR, NS,
         g.d_ei, g.d_ej, g.d_ga, g.d_gs, g.d_rv, g.d_Ap,
         g.d_Disl, g.d_Misl, g.d_Dgts, g.d_Mgts, g.d_Qgts, g.d_b, g.d_c,
+        g.d_g, g.p.ng, g.p.gauge_rref,
         g.d_H, g.d_nu, g.d_hval);
     cudaEventRecord(g.ev[1]);
     // 块稀疏：PHt[:,b] = Σ h_b,k P[:,idx_b,k]；S = H PHt（每行 14 个非零）。
@@ -801,7 +880,8 @@ void update(const double* D_isl, const double* M_isl,
     cudaEventRecord(g.ev[6]);
     if (!dx_done)
         _gemv(g.blas, CUBLAS_OP_N, NS, NR, 1.0, g.d_K, NS, g.d_nu, 1, 0.0, g.d_dx, 1, "Knu");
-    state_add_kernel<<<(n + M + 127) / 128, 128>>>(n, M, g.d_dx, g.d_q, g.d_b, g.d_c);
+    state_add_kernel<<<(n + M + 1 + 127) / 128, 128>>>(n, M, g.p.ng, g.d_dx, g.d_q, g.d_b,
+                                                       g.d_c, g.d_g);
     retract_q_kernel<<<(n + 127) / 128, 128>>>(n, g.d_q);
     if (g.p.joseph) {
         _gemm(g.blas, CUBLAS_OP_N, CUBLAS_OP_N, NS, NS, NR, 1.0, g.d_K, NS, g.d_H, NR, 0.0, g.d_A, NS, "KH");
@@ -855,6 +935,7 @@ void update(const double* D_isl, const double* M_isl,
     count_nonfinite_kernel<<<256, 256>>>((size_t)n * 6, g.d_q, g.d_nf);
     count_nonfinite_kernel<<<256, 256>>>((size_t)n, g.d_b, g.d_nf);
     count_nonfinite_kernel<<<256, 256>>>((size_t)M, g.d_c, g.d_nf);
+    if (g.p.ng > 0) count_nonfinite_kernel<<<1, 32>>>((size_t)g.p.ng, g.d_g, g.d_nf);
     cudaMemcpy(&snf, g.d_nf, 4, cudaMemcpyDeviceToHost);
     {
         std::vector<double> dg(NS);
@@ -921,9 +1002,10 @@ py::dict ekf_predict_py(int n, int M, int E, int G, py::array_t<int> edges,
                         uint64_t P_ptr, double sigma_isl, double sigma_gts,
                         double tau_b, double sigma_b, double tau_c, double sigma_c,
                         double q_acc, int joseph, int diag_every, int fp32, int init, int frame,
-                        int do_diag) {
+                        int do_diag, int ng, double gauge_rref, uint64_t g_ptr) {
     ekf_central::Params p;
     p.n = n; p.M = M; p.E = E; p.G = G;
+    p.ng = ng; p.gauge_rref = gauge_rref;
     p.sigma_isl = sigma_isl; p.sigma_gts = sigma_gts;
     p.tau_b = tau_b; p.sigma_b = sigma_b; p.tau_c = tau_c; p.sigma_c = sigma_c;
     p.q_acc = q_acc; p.joseph = joseph; p.diag_every = diag_every; p.fp32 = fp32;
@@ -941,7 +1023,8 @@ py::dict ekf_predict_py(int n, int M, int E, int G, py::array_t<int> edges,
     ekf_central::PredictResult r;
     ekf_central::predict(p, ev.data(), gv.data(), xv.empty() ? nullptr : xv.data(),
                          (double *)q_ptr, (double *)b_ptr,
-                         (double *)c_ptr, (double *)P_ptr, init, frame, do_diag, &r);
+                         (double *)c_ptr, (double *)P_ptr, (double *)g_ptr,
+                         init, frame, do_diag, &r);
     py::dict d;
     d["pred_ms"] = r.pred_ms; d["fpft_ms"] = r.fpft_ms; d["copy_ms"] = r.copy_ms;
     if (r.diag) {

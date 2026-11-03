@@ -19,6 +19,10 @@ constexpr double DU = 7.0e6;  // QOE 半长轴归一化
 
 struct Params {
     int n = 0, M = 0, E = 0, G = 0, nstate = 0, nrows = 0;
+    // 方法二：显式 4 维规范状态 g=[t_x,t_y,t_z, θ·R_ref]，附在 nstate 末尾。
+    // ng=0 时完全退化为原 7N+M 状态（默认）。gauge_rref 把 RAAN 折成米。
+    int ng = 0;
+    double gauge_rref = 7.0e6;
     double sigma_isl = 30.0, sigma_gts = 19.0;
     double tau_b = 600.0, sigma_b = 0.3, tau_c = 600.0, sigma_c = 0.3;
     double q_acc = 2.5e-11;  // Q_ACC²，Q_ACC=5e-6 m/s²（fls_marg.py）
@@ -56,7 +60,7 @@ struct UpdateResult {
 // 预测/更新入口。q,b,c,P 为设备指针（Python torch CUDA 张量），批内常驻状态由实现持有。
 // ext：可选的外部 ECI 加速度 (n,3) 主机数组（培训力场，180 s 内常值）；空指针=不加。
 void predict(const Params& p, const int* edges, const int* gts, const double* ext,
-             double* q, double* b, double* c, double* P,
+             double* q, double* b, double* c, double* P, double* g,
              int init, int frame, int do_diag, PredictResult* out);
 void update(const double* D_isl, const double* M_isl,
             const double* D_gts, const double* M_gts, const double* Q_gts,
